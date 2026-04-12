@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.py[cod]
+logs/
+bot_data.db
+.pytest_cache/
+.coverage

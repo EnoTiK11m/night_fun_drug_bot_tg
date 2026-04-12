@@ -1,6 +1,7 @@
 import aiohttp
 import random
 import json
+import logging
 from typing import Optional, Set, List, Dict
 from config import (
     API_BASE_URL,
@@ -11,6 +12,8 @@ from config import (
     DEFAULT_LIMIT,
     MAX_POSTS_PER_REQUEST
 )
+
+logger = logging.getLogger(__name__)
 
 
 class rule34API:
@@ -61,13 +64,19 @@ class rule34API:
 
         return search_tags.strip()
 
-    async def save_search_state(self, user_id: int, tags: str, blacklist: Set[str]):
+    async def save_search_state(
+        self,
+        user_id: int,
+        tags: str,
+        blacklist: Set[str],
+        current_post_id: Optional[int] = None
+    ):
         """Сохранить состояние поиска для кнопки 'ещё'"""
         self.user_search_states[user_id] = {
             'tags': tags,
             'blacklist': blacklist,
             'current_pid': 0,
-            'used_posts': set()  # ID уже показанных постов
+            'used_posts': {current_post_id} if current_post_id is not None else set()
         }
 
     async def search(
@@ -97,12 +106,12 @@ class rule34API:
             pid=pid
         )
 
-        print(f"DEBUG: Searching with tags: '{search_tags}', page: {pid}")
-        print(f"DEBUG: API URL: {API_BASE_URL}")
+        logger.debug("Searching with tags %r, page %s", search_tags, pid)
+        logger.debug("API URL: %s", API_BASE_URL)
 
         try:
             async with self.session.get(API_BASE_URL, params=params, timeout=30) as response:
-                print(f"DEBUG: Response status: {response.status}")
+                logger.debug("Response status: %s", response.status)
 
                 if response.status == 200:
                     # Получаем текст ответа
@@ -111,8 +120,11 @@ class rule34API:
                     # Пробуем распарсить как JSON
                     try:
                         data = json.loads(response_text)
-                        print(
-                            f"DEBUG: Found {len(data) if isinstance(data, list) else 0} posts on page {pid}")
+                        logger.debug(
+                            "Found %s posts on page %s",
+                            len(data) if isinstance(data, list) else 0,
+                            pid
+                        )
 
                         # API возвращает сразу массив постов
                         if isinstance(data, list):
@@ -121,62 +133,69 @@ class rule34API:
                         # Если это словарь с ошибкой
                         if isinstance(data, dict) and data.get("success") is False:
                             error_msg = data.get("message", "Unknown error")
-                            print(f"API Error: {error_msg}")
+                            logger.warning("API Error: %s", error_msg)
                             return None
 
                         return None
 
                     except json.JSONDecodeError as e:
-                        print(f"JSON decode error: {e}")
+                        logger.warning("JSON decode error: %s", e)
                         return None
 
                 else:
-                    print(f"HTTP Error: {response.status}")
+                    logger.warning("HTTP Error: %s", response.status)
                     return None
 
         except Exception as e:
-            print(f"API Error: {e}")
+            logger.exception("API Error: %s", e)
             return None
 
     async def get_random_image(
         self,
         tags: str,
-        blacklist: Set[str]
+        blacklist: Set[str],
+        excluded_post_ids: Optional[Set[int]] = None
     ) -> Optional[Dict]:
         """Получить случайное изображение (для нового поиска)"""
-        print(f"DEBUG: get_random_image called with tags: '{tags}'")
+        logger.debug("get_random_image called with tags %r", tags)
+        excluded_post_ids = excluded_post_ids or set()
 
-        # Пробуем несколько случайных страниц
-        for attempt in range(3):
-            random_pid = random.randint(0, 10)  # Страницы 0-10
+        pid = 0
+        while True:
             posts = await self.search(
                 tags=tags,
                 blacklist=blacklist,
                 limit=100,
-                pid=random_pid
+                pid=pid
             )
 
-            if posts:
-                print(f"DEBUG: Found {len(posts)} posts on page {random_pid}")
-                # Фильтруем посты с валидными file_url
-                valid_posts = [post for post in posts if post.get("file_url")]
-                if valid_posts:
-                    selected_post = random.choice(valid_posts)
-                    print(
-                        f"DEBUG: Selected post ID: {selected_post.get('id')}")
-                    return selected_post
+            if not posts:
+                logger.debug("No posts found on page %s, stopping search", pid)
+                return None
 
-        print("DEBUG: No posts found after all attempts")
-        return None
+            logger.debug("Found %s posts on page %s", len(posts), pid)
+            valid_posts = [
+                post for post in posts
+                if post.get("file_url") and post.get("id") not in excluded_post_ids
+            ]
+            if valid_posts:
+                selected_post = random.choice(valid_posts)
+                logger.debug("Selected post ID: %s", selected_post.get("id"))
+                return selected_post
+
+            logger.debug("All valid posts on page %s were already shown", pid)
+            pid += 1
 
     async def get_next_image(
         self,
         user_id: int,
         tags: str,
-        blacklist: Set[str]
+        blacklist: Set[str],
+        excluded_post_ids: Optional[Set[int]] = None
     ) -> Optional[Dict]:
         """Получить следующее изображение (для кнопки 'ещё')"""
-        print(f"DEBUG: get_next_image for user {user_id} with tags: '{tags}'")
+        logger.debug("get_next_image for user %s with tags %r", user_id, tags)
+        excluded_post_ids = excluded_post_ids or set()
 
         # Получаем или создаем состояние поиска
         search_state = self.user_search_states.get(user_id)
@@ -190,8 +209,7 @@ class rule34API:
             }
             self.user_search_states[user_id] = search_state
 
-        # Пробуем найти новый пост на текущей или следующих страницах
-        for page_attempt in range(5):  # Пробуем 5 страниц
+        while True:
             posts = await self.search(
                 tags=tags,
                 blacklist=blacklist,
@@ -199,39 +217,34 @@ class rule34API:
                 pid=search_state['current_pid']
             )
 
-            if posts:
-                # Фильтруем посты с валидными file_url и которые еще не показывались
-                valid_posts = [
-                    post for post in posts
-                    if post.get("file_url") and post.get("id") not in search_state['used_posts']
-                ]
+            if not posts:
+                logger.debug("No posts found on page %s, stopping search", search_state["current_pid"])
+                return None
 
-                if valid_posts:
-                    selected_post = random.choice(valid_posts)
-                    search_state['used_posts'].add(selected_post.get('id'))
-                    print(
-                        f"DEBUG: Selected next post ID: {selected_post.get('id')} from page {search_state['current_pid']}")
-                    return selected_post
-                else:
-                    # Все посты на этой странице уже показаны, переходим к следующей
-                    search_state['current_pid'] += 1
-                    print(
-                        f"DEBUG: All posts on page {search_state['current_pid'] - 1} used, moving to page {search_state['current_pid']}")
-            else:
-                # На этой странице нет постов, пробуем следующую
-                search_state['current_pid'] += 1
+            # Фильтруем посты с валидными file_url и которые еще не показывались
+            used_posts = search_state['used_posts'] | excluded_post_ids
+            valid_posts = [
+                post for post in posts
+                if post.get("file_url") and post.get("id") not in used_posts
+            ]
 
-        # Если ничего не нашли, сбрасываем состояние и начинаем заново
-        print("DEBUG: No new posts found, resetting search state")
-        self.user_search_states[user_id] = {
-            'tags': tags,
-            'blacklist': blacklist,
-            'current_pid': 0,
-            'used_posts': set()
-        }
+            if valid_posts:
+                selected_post = random.choice(valid_posts)
+                search_state['used_posts'].add(selected_post.get('id'))
+                logger.debug(
+                    "Selected next post ID %s from page %s",
+                    selected_post.get("id"),
+                    search_state["current_pid"]
+                )
+                return selected_post
 
-        # Пробуем найти любой случайный пост
-        return await self.get_random_image(tags, blacklist)
+            # Все посты на этой странице уже показаны, переходим к следующей
+            search_state['current_pid'] += 1
+            logger.debug(
+                "All posts on page %s used, moving to page %s",
+                search_state["current_pid"] - 1,
+                search_state["current_pid"]
+            )
 
     async def get_post_by_id(self, post_id: int) -> Optional[Dict]:
         """Получить конкретный пост по ID"""
@@ -249,10 +262,10 @@ class rule34API:
                         if isinstance(data, list) and len(data) > 0:
                             return data[0]
                     except json.JSONDecodeError:
-                        print(f"JSON decode error for post {post_id}")
+                        logger.warning("JSON decode error for post %s", post_id)
                 return None
         except Exception as e:
-            print(f"API Error in get_post_by_id: {e}")
+            logger.exception("API Error in get_post_by_id: %s", e)
             return None
 
     async def autocomplete(self, query: str) -> List[str]:
@@ -284,7 +297,7 @@ class rule34API:
                         pass
                 return []
         except Exception as e:
-            print(f"Autocomplete Error: {e}")
+            logger.exception("Autocomplete Error: %s", e)
             return []
 
 
