@@ -10,6 +10,7 @@ from telegram import (
     InputMediaPhoto,
     InputMediaVideo
 )
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -42,6 +43,9 @@ from database import (
     add_favorite,
     remove_favorite,
     get_favorites,
+    count_favorites,
+    get_favorites_page,
+    get_favorite_by_post_id,
     add_subscription_post,
     get_subscription_posts,
     remove_subscription_post
@@ -63,6 +67,7 @@ callback_payloads = {}
 user_last_search_at = {}
 CALLBACK_TTL_SECONDS = 24 * 60 * 60
 MAX_CAPTION_LENGTH = 1024
+FAVORITES_PAGE_SIZE = 10
 SUBSCRIPTION_MIN_INTERVAL = 1
 SUBSCRIPTION_MAX_INTERVAL = 120
 SUBSCRIPTION_DEFAULT_INTERVAL = 10
@@ -103,7 +108,11 @@ def cleanup_callback_payloads():
 
 
 def md_code(value) -> str:
-    return str(value).replace("\\", "").replace("`", "'")
+    return str(value).replace("\\", "\\\\").replace("`", "'")
+
+
+def md_text(value) -> str:
+    return escape_markdown(str(value), version=1)
 
 
 def clamp_caption(caption: str) -> str:
@@ -155,7 +164,7 @@ def build_subscription_gallery_caption(sub_query: str, post: dict, index: int, t
         f"🔔 Подписка: `{md_code(sub_query)}`\n"
         f"Фото {index + 1}/{total}\n"
         f"ID: `{md_code(post.get('id', 0))}`\n"
-        f"Rating: {md_code(post.get('rating', ''))} | Score: {post.get('score', 0)}\n"
+        f"Rating: {md_text(post.get('rating', ''))} | Score: {post.get('score', 0)}\n"
         f"Tags: `{md_code(tags)}`"
     )
 
@@ -169,7 +178,7 @@ def build_favorites_gallery_caption(post: dict, index: int, total: int) -> str:
         f"⭐ Избранное\n"
         f"Фото {index + 1}/{total}\n"
         f"ID: `{md_code(post.get('id', 0))}`\n"
-        f"Rating: {md_code(post.get('rating', ''))} | Score: {post.get('score', 0)}\n"
+        f"Rating: {md_text(post.get('rating', ''))} | Score: {post.get('score', 0)}\n"
         f"Tags: `{md_code(tags)}`"
     )
 
@@ -208,6 +217,93 @@ def get_favorites_gallery_keyboard(index: int, total: int, post_id: int) -> Inli
             InlineKeyboardButton("📋 Список", callback_data="fav_list")
         ]
     ])
+
+
+def get_favorites_list_keyboard(page: int, total_pages: int, page_posts: List[Dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for favorite in page_posts:
+        post_id = favorite["id"]
+        rows.append([
+            InlineKeyboardButton(f"Open {post_id}", callback_data=f"fav_open_{post_id}"),
+            InlineKeyboardButton("Delete", callback_data=f"fav_remove_{post_id}_{page}")
+        ])
+
+    if total_pages > 1:
+        prev_page = (page - 1) % total_pages
+        next_page = (page + 1) % total_pages
+        rows.append([
+            InlineKeyboardButton("<", callback_data=f"fav_list_page_{prev_page}"),
+            InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"),
+            InlineKeyboardButton(">", callback_data=f"fav_list_page_{next_page}")
+        ])
+
+    rows.append([InlineKeyboardButton("View All", callback_data="fav_all")])
+    rows.append([InlineKeyboardButton("Back", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def classify_media_send_error(error: Exception, file_url: str = "") -> str:
+    error_text = str(error).lower()
+    file_url_lower = file_url.lower()
+
+    if "timed out" in error_text or "timeout" in error_text:
+        return "Media send failed: request timed out."
+    if "network" in error_text or "connection" in error_text or "socket" in error_text:
+        return "Media send failed because of a network error."
+    if "file is too big" in error_text or "request entity too large" in error_text:
+        return "Media send failed: file is too large for Telegram."
+    if "wrong file identifier" in error_text or "failed to get http url content" in error_text:
+        return "Media send failed: source URL could not be loaded."
+    if file_url_lower.endswith(".webm"):
+        return "Media send failed: Telegram may reject .webm files."
+    return "Media send failed. Possible reasons: format, size, network, or remote server error."
+
+
+async def reply_media_or_fallback(message, post: dict, caption: str = "", keyboard=None, user_notice: bool = True) -> bool:
+    file_url = post.get("file_url", "")
+    reply_markup = keyboard or get_subscription_image_keyboard(post.get("id", 0))
+
+    try:
+        if file_url.lower().endswith(('.mp4', '.webm')):
+            await message.reply_video(
+                file_url,
+                caption=caption if caption else None,
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+        elif file_url.lower().endswith('.gif'):
+            await message.reply_animation(
+                file_url,
+                caption=caption if caption else None,
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+        else:
+            await message.reply_photo(
+                file_url,
+                caption=caption if caption else None,
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+        return True
+    except Exception as error:
+        logger.exception("Media send error for url %s: %s", file_url, error)
+        notice = classify_media_send_error(error, file_url) if user_notice else ""
+        fallback_prefix = f"⚠️ {notice}\n\n" if notice else ""
+
+        if caption:
+            await message.reply_text(
+                f"{fallback_prefix}🖼 [Открыть изображение]({file_url})\n\n{caption}",
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+        else:
+            await message.reply_text(
+                f"{fallback_prefix}🖼 [Открыть изображение]({file_url})",
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+        return False
 
 
 def get_main_keyboard() -> InlineKeyboardMarkup:
@@ -592,7 +688,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_user_setting(user_id, setting_name, not current_value)
 
         # Если отключаем описание полностью, выключаем все остальные настройки
-        if setting_name == "show_caption" and not current_value:
+        if setting_name == "show_caption" and current_value:
             await update_user_setting(user_id, "show_search_query", False)
             await update_user_setting(user_id, "show_subscription_label", False)
             await update_user_setting(user_id, "show_id", False)
@@ -600,8 +696,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_user_setting(user_id, "show_rating", False)
             await update_user_setting(user_id, "show_tags", False)
         # Если включаем описание, включаем основные настройки
-        elif setting_name == "show_caption" and current_value:
+        elif setting_name == "show_caption" and not current_value:
+            await update_user_setting(user_id, "show_search_query", True)
+            await update_user_setting(user_id, "show_subscription_label", True)
             await update_user_setting(user_id, "show_id", True)
+            await update_user_setting(user_id, "show_score", True)
+            await update_user_setting(user_id, "show_rating", True)
             await update_user_setting(user_id, "show_tags", True)
 
         # Обновляем сообщение
@@ -902,12 +1002,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     elif data.startswith("fav_remove_"):
-        post_id_text = data.replace("fav_remove_", "", 1)
-        if not post_id_text.isdigit():
+        payload = data.replace("fav_remove_", "", 1)
+        parts = payload.split("_")
+        if not parts or not parts[0].isdigit():
             await query.message.reply_text("❌ Не удалось определить пост.")
             return
 
-        removed = await remove_favorite(user_id, int(post_id_text))
+        post_id = int(parts[0])
+        page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        removed = await remove_favorite(user_id, post_id)
+        if page is not None:
+            await render_favorites_list(query.message, user_id, page=page, edit=True)
+            return
         await query.message.reply_text(
             "✅ Удалено из избранного." if removed else "❌ Пост не найден в избранном."
         )
@@ -918,17 +1024,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("❌ Не удалось определить пост.")
             return
 
-        favorites = await get_favorites(user_id, limit=1000)
-        post = next(
-            (favorite for favorite in favorites if favorite["id"] == int(post_id_text)),
-            None
-        )
+        total_favorites = await count_favorites(user_id)
+        post = await get_favorite_by_post_id(user_id, int(post_id_text))
         if not post:
             await query.message.reply_text("❌ Пост не найден в избранном.")
             return
 
-        caption = build_favorites_gallery_caption(post, favorites.index(post), len(favorites))
+        caption = build_favorites_gallery_caption(post, 0, max(total_favorites, 1))
         await send_post_media(query.message, post, caption, get_image_keyboard(post["id"]))
+
+    elif data.startswith("fav_list_page_"):
+        page_text = data.replace("fav_list_page_", "", 1)
+        if not page_text.isdigit():
+            await query.message.reply_text("Could not open favorites page.")
+            return
+
+        await render_favorites_list(query.message, user_id, page=int(page_text), edit=True)
 
     elif data == "fav_all":
         await send_favorites_gallery(query.message, user_id)
@@ -1087,6 +1198,129 @@ async def send_image(message, user_id: int, tags: str, edit: bool = False, is_mo
 
     if not is_subscription and is_rate_limited(user_id):
         await message.reply_text(
+            f"Please wait {SEARCH_COOLDOWN_SECONDS} seconds before the next search.",
+            reply_markup=get_main_keyboard()
+        )
+        return False
+
+    if not is_subscription:
+        status_msg = await message.reply_text("Searching...")
+
+    excluded_post_ids = await get_sent_post_ids(user_id)
+    if is_more:
+        result = await api.get_next_image(user_id, tags, blacklist, excluded_post_ids)
+    else:
+        result = await api.get_random_image(tags, blacklist, excluded_post_ids)
+        if result:
+            await api.save_search_state(user_id, tags, blacklist, result.get("id"))
+
+    if not is_subscription:
+        await status_msg.delete()
+
+    if not result:
+        if not is_subscription:
+            if is_more:
+                await message.reply_text(
+                    "No more posts were found for this query.\n\nTry a different query or start a new search.",
+                    reply_markup=get_main_keyboard(),
+                    parse_mode="Markdown"
+                )
+            else:
+                await message.reply_text(
+                    "Nothing was found for this query.\n\nTry another query, check spelling, or use `/tags` for suggestions.",
+                    reply_markup=get_main_keyboard(),
+                    parse_mode="Markdown"
+                )
+        return False
+
+    await save_user_query(user_id, tags)
+
+    post_id = result.get("id", 0)
+    if post_id:
+        await mark_post_sent(user_id, int(post_id))
+
+    caption = ""
+    if settings.get('show_caption', True):
+        caption = await build_caption(settings, result, tags, is_subscription)
+
+    if is_subscription:
+        keyboard = get_subscription_image_keyboard(post_id, tags)
+    else:
+        keyboard = get_image_keyboard(post_id, tags)
+
+    await reply_media_or_fallback(message, result, caption, keyboard, user_notice=True)
+    return True
+
+    blacklist = await get_user_blacklist(user_id)
+    settings = await get_user_settings(user_id)
+
+    if not is_subscription and is_rate_limited(user_id):
+        await message.reply_text(
+            f"вЏі РџРѕРґРѕР¶РґРёС‚Рµ {SEARCH_COOLDOWN_SECONDS} СЃРµРє. РїРµСЂРµРґ СЃР»РµРґСѓСЋС‰РёРј РїРѕРёСЃРєРѕРј.",
+            reply_markup=get_main_keyboard()
+        )
+        return False
+
+    if not is_subscription:
+        status_msg = await message.reply_text("рџ”Ќ РС‰Сѓ...")
+
+    excluded_post_ids = await get_sent_post_ids(user_id)
+    if is_more:
+        result = await api.get_next_image(user_id, tags, blacklist, excluded_post_ids)
+    else:
+        result = await api.get_random_image(tags, blacklist, excluded_post_ids)
+        if result:
+            await api.save_search_state(user_id, tags, blacklist, result.get("id"))
+
+    if not is_subscription:
+        await status_msg.delete()
+
+    if not result:
+        if not is_subscription:
+            if is_more:
+                await message.reply_text(
+                    "вќЊ Р‘РѕР»СЊС€Рµ РЅРµ РЅР°Р№РґРµРЅРѕ РїРѕСЃС‚РѕРІ РїРѕ СЌС‚РѕРјСѓ Р·Р°РїСЂРѕСЃСѓ.\n\n"
+                    "РџРѕРїСЂРѕР±СѓР№С‚Рµ:\n"
+                    "вЂў Р”СЂСѓРіРёРµ С‚РµРіРё\n"
+                    "вЂў РќРѕРІС‹Р№ РїРѕРёСЃРє",
+                    reply_markup=get_main_keyboard(),
+                    parse_mode="Markdown"
+                )
+            else:
+                await message.reply_text(
+                    "вќЊ РќРёС‡РµРіРѕ РЅРµ РЅР°Р№РґРµРЅРѕ РїРѕ Р·Р°РїСЂРѕСЃСѓ.\n\n"
+                    "РџРѕРїСЂРѕР±СѓР№С‚Рµ:\n"
+                    "вЂў Р”СЂСѓРіРёРµ С‚РµРіРё\n"
+                    "вЂў РџСЂРѕРІРµСЂРёС‚СЊ РїСЂР°РІРёР»СЊРЅРѕСЃС‚СЊ РЅР°РїРёСЃР°РЅРёСЏ\n"
+                    "вЂў РСЃРїРѕР»СЊР·РѕРІР°С‚СЊ `/tags` РґР»СЏ РїРѕРёСЃРєР° С‚РµРіРѕРІ",
+                    reply_markup=get_main_keyboard(),
+                    parse_mode="Markdown"
+                )
+        return False
+
+    await save_user_query(user_id, tags)
+
+    post_id = result.get("id", 0)
+    if post_id:
+        await mark_post_sent(user_id, int(post_id))
+
+    caption = ""
+    if settings.get('show_caption', True):
+        caption = await build_caption(settings, result, tags, is_subscription)
+
+    if is_subscription:
+        keyboard = get_subscription_image_keyboard(post_id, tags)
+    else:
+        keyboard = get_image_keyboard(post_id, tags)
+
+    await reply_media_or_fallback(message, result, caption, keyboard, user_notice=True)
+    return True
+
+    blacklist = await get_user_blacklist(user_id)
+    settings = await get_user_settings(user_id)
+
+    if not is_subscription and is_rate_limited(user_id):
+        await message.reply_text(
             f"⏳ Подождите {SEARCH_COOLDOWN_SECONDS} сек. перед следующим поиском.",
             reply_markup=get_main_keyboard()
         )
@@ -1201,6 +1435,9 @@ async def send_image(message, user_id: int, tags: str, edit: bool = False, is_mo
 
 
 async def send_post_media(message, post: dict, caption: str = "", keyboard=None):
+    await reply_media_or_fallback(message, post, caption, keyboard, user_notice=True)
+    return
+
     file_url = post.get("file_url", "")
     reply_markup = keyboard or get_subscription_image_keyboard(post.get("id", 0))
     if file_url.lower().endswith(('.mp4', '.webm')):
@@ -1343,6 +1580,47 @@ async def edit_favorites_gallery(query, user_id: int, index: int):
         await query.message.reply_text("❌ Не удалось обновить пост. Откройте избранное заново.")
 
 
+async def render_favorites_list(message, user_id: int, page: int = 0, edit: bool = False):
+    total = await count_favorites(user_id)
+    if total <= 0:
+        text = "в­ђ РР·Р±СЂР°РЅРЅРѕРµ РїРѕРєР° РїСѓСЃС‚РѕРµ."
+        keyboard = get_main_keyboard()
+        text = "Favorites are empty."
+        if edit:
+            await message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        else:
+            await message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        return
+
+    total_pages = max(1, (total + FAVORITES_PAGE_SIZE - 1) // FAVORITES_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    favorites = await get_favorites_page(
+        user_id,
+        limit=FAVORITES_PAGE_SIZE,
+        offset=page * FAVORITES_PAGE_SIZE
+    )
+
+    lines = []
+    start_index = page * FAVORITES_PAGE_SIZE
+    for index, favorite in enumerate(favorites, start=start_index + 1):
+        tags = favorite.get("tags", "")
+        if len(tags) > 60:
+            tags = tags[:60] + "..."
+        lines.append(
+            f"{index}. `{md_code(favorite['id'])}` rating: {md_text(favorite.get('rating', ''))} "
+            f"score: {favorite.get('score', 0)}\n`{md_code(tags)}`"
+        )
+
+    text = "в­ђ *РР·Р±СЂР°РЅРЅРѕРµ:*\n\n" + "\n".join(lines)
+    text = "*Favorites:*\n\n" + "\n".join(lines)
+    keyboard = get_favorites_list_keyboard(page, total_pages, favorites)
+
+    if edit:
+        await message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+
 async def show_history(message, user_id: int, edit: bool = False):
     history = await get_search_history(user_id)
     if not history:
@@ -1367,6 +1645,9 @@ async def show_history(message, user_id: int, edit: bool = False):
 
 
 async def show_favorites(message, user_id: int, edit: bool = False):
+    await render_favorites_list(message, user_id, page=0, edit=edit)
+    return
+
     favorites = await get_favorites(user_id, limit=1000)
     if not favorites:
         text = "⭐ Избранное пока пустое."
@@ -1631,12 +1912,17 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         file_url, caption=caption if caption else None,
                         parse_mode="Markdown", reply_markup=keyboard
                     )
+                elif file_url.lower().endswith('.gif'):
+                    await update.message.reply_animation(
+                        file_url, caption=caption if caption else None,
+                        parse_mode="Markdown", reply_markup=keyboard
+                    )
                 else:
                     await update.message.reply_photo(
                         file_url, caption=caption if caption else None,
                         parse_mode="Markdown", reply_markup=keyboard
                     )
-            except:
+            except Exception:
                 if caption:
                     await update.message.reply_text(
                         f"🖼 [Открыть]({file_url})\n\n{caption}",
@@ -1747,6 +2033,8 @@ async def process_subscriptions(app):
                                     parse_mode="Markdown",
                                     reply_markup=keyboard
                                 )
+                    else:
+                        await update_subscription_time(user_id, query)
 
                 except Exception as user_error:
                     logger.error(

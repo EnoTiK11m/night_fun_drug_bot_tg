@@ -233,7 +233,7 @@ async def get_user_settings(user_id: int) -> Dict[str, Any]:
                 try:
                     json_settings = json.loads(row[8])
                     settings.update(json_settings)
-                except:
+                except json.JSONDecodeError:
                     pass
 
             return settings
@@ -465,6 +465,62 @@ async def get_favorites(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
         ]
 
 
+async def count_favorites(user_id: int) -> int:
+    """РџРѕСЃС‡РёС‚Р°С‚СЊ РєРѕР»РёС‡РµСЃС‚РІРѕ РёР·Р±СЂР°РЅРЅС‹С… РїРѕСЃС‚РѕРІ."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM favorites WHERE user_id = ?",
+            (user_id,)
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+
+async def get_favorites_page(user_id: int, limit: int = 10, offset: int = 0) -> List[Dict[str, Any]]:
+    """РџРѕР»СѓС‡РёС‚СЊ СЃС‚СЂР°РЅРёС†Сѓ РёР·Р±СЂР°РЅРЅС‹С… РїРѕСЃС‚РѕРІ."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT post_id, file_url, tags, rating, score, added_at
+            FROM favorites
+            WHERE user_id = ?
+            ORDER BY added_at DESC
+            LIMIT ? OFFSET ?
+        """, (user_id, limit, max(0, offset)))
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": row[0],
+                "file_url": row[1],
+                "tags": row[2],
+                "rating": row[3],
+                "score": row[4],
+                "added_at": row[5],
+            }
+            for row in rows
+        ]
+
+
+async def get_favorite_by_post_id(user_id: int, post_id: int) -> Optional[Dict[str, Any]]:
+    """РџРѕР»СѓС‡РёС‚СЊ РѕРґРёРЅ РїРѕСЃС‚ РёР· РёР·Р±СЂР°РЅРЅРѕРіРѕ РїРѕ ID."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT post_id, file_url, tags, rating, score, added_at
+            FROM favorites
+            WHERE user_id = ? AND post_id = ?
+        """, (user_id, post_id))
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "file_url": row[1],
+            "tags": row[2],
+            "rating": row[3],
+            "score": row[4],
+            "added_at": row[5],
+        }
+
+
 async def add_subscription_post(user_id: int, query: str, post: Dict[str, Any]) -> bool:
     """Сохранить пост, отправленный по подписке."""
     post_id = post.get("id")
@@ -498,9 +554,6 @@ async def get_subscription_posts(user_id: int, query: str, limit: int = 50) -> L
         cursor = await db.execute("""
             SELECT sp.post_id, sp.file_url, sp.tags, sp.rating, sp.score, sp.sent_at
             FROM subscription_posts sp
-            INNER JOIN favorites f
-                ON f.user_id = sp.user_id
-                AND f.post_id = sp.post_id
             WHERE sp.user_id = ? AND sp.query = ?
             ORDER BY sp.sent_at DESC
             LIMIT ?
