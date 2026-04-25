@@ -3,6 +3,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+_CONFIG_ERRORS: list[str] = []
+
+
+def _get_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    try:
+        return int(raw_value)
+    except ValueError:
+        _CONFIG_ERRORS.append(f"{name} must be an integer")
+        return default
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # API настройки
@@ -12,7 +27,8 @@ AUTOCOMPLETE_URL = "https://api.rule34.xxx/autocomplete.php"
 # API credentials are required in .env
 API_USER_ID = os.getenv("API_USER_ID")
 API_KEY = os.getenv("API_KEY")
-SEARCH_COOLDOWN_SECONDS = int(os.getenv("SEARCH_COOLDOWN_SECONDS", "3"))
+SEARCH_COOLDOWN_SECONDS = _get_int_env("SEARCH_COOLDOWN_SECONDS", 3)
+DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 
 # Temporarily simplified blacklist for testing
 DEFAULT_BLACKLIST = {
@@ -32,4 +48,4 @@ def validate_config() -> list[str]:
         "API_USER_ID": API_USER_ID,
         "API_KEY": API_KEY,
     }
-    return [name for name, value in required.items() if not value]
+    return [name for name, value in required.items() if not value] + _CONFIG_ERRORS

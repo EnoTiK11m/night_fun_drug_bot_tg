@@ -3,6 +3,5 @@ __pycache__/
 *.py[cod]
 logs/
 bot_data.db
-tests/
 .pytest_cache/
 .coverage

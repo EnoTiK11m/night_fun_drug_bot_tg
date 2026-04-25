@@ -1,4 +1,5 @@
-import aiohttp
+﻿import aiohttp
+import asyncio
 import random
 import json
 import logging
@@ -14,12 +15,31 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+API_SEARCH_RETRIES = 2
+API_SEARCH_TIMEOUT_SECONDS = 45
+API_REQUEST_CONCURRENCY = 1
+API_MIN_REQUEST_INTERVAL_SECONDS = 1.5
+
+
+class APITemporaryError(Exception):
+    """Raised when the upstream API failed but the query should be retried later."""
 
 
 class rule34API:
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
+        self.request_semaphore = asyncio.Semaphore(API_REQUEST_CONCURRENCY)
+        self.rate_limit_lock = asyncio.Lock()
+        self.last_request_at = 0.0
         self.user_search_states = {}  # Храним состояние поиска для каждого пользователя
+
+    async def _wait_for_rate_limit(self):
+        async with self.rate_limit_lock:
+            now = asyncio.get_running_loop().time()
+            delay = API_MIN_REQUEST_INTERVAL_SECONDS - (now - self.last_request_at)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self.last_request_at = asyncio.get_running_loop().time()
 
     async def ensure_session(self):
         """Создать сессию если её нет"""
@@ -63,6 +83,13 @@ class rule34API:
                 search_tags += f" -{blocked_tag}"
 
         return search_tags.strip()
+
+    @staticmethod
+    def _post_id(post: Dict) -> Optional[int]:
+        try:
+            return int(post.get("id"))
+        except (TypeError, ValueError):
+            return None
 
     async def save_search_state(
         self,
@@ -109,46 +136,55 @@ class rule34API:
         logger.debug("Searching with tags %r, page %s", search_tags, pid)
         logger.debug("API URL: %s", API_BASE_URL)
 
-        try:
-            async with self.session.get(API_BASE_URL, params=params, timeout=30) as response:
-                logger.debug("Response status: %s", response.status)
+        for attempt in range(1, API_SEARCH_RETRIES + 2):
+            try:
+                async with self.request_semaphore:
+                    await self._wait_for_rate_limit()
+                    async with self.session.get(
+                        API_BASE_URL,
+                        params=params,
+                        timeout=API_SEARCH_TIMEOUT_SECONDS
+                    ) as response:
+                        logger.debug("Response status: %s", response.status)
+                        if response.status != 200:
+                            raise APITemporaryError(f"Rule34 API HTTP {response.status}")
+                        response_text = await response.text()
 
-                if response.status == 200:
-                    # Получаем текст ответа
-                    response_text = await response.text()
+                try:
+                    data = json.loads(response_text)
+                except json.JSONDecodeError as e:
+                    raise APITemporaryError("Rule34 API returned invalid JSON") from e
 
-                    # Пробуем распарсить как JSON
-                    try:
-                        data = json.loads(response_text)
-                        logger.debug(
-                            "Found %s posts on page %s",
-                            len(data) if isinstance(data, list) else 0,
-                            pid
-                        )
+                logger.debug(
+                    "Found %s posts on page %s",
+                    len(data) if isinstance(data, list) else 0,
+                    pid
+                )
 
-                        # API возвращает сразу массив постов
-                        if isinstance(data, list):
-                            return data
+                if isinstance(data, list):
+                    return data
 
-                        # Если это словарь с ошибкой
-                        if isinstance(data, dict) and data.get("success") is False:
-                            error_msg = data.get("message", "Unknown error")
-                            logger.warning("API Error: %s", error_msg)
-                            return None
-
-                        return None
-
-                    except json.JSONDecodeError as e:
-                        logger.warning("JSON decode error: %s", e)
-                        return None
-
-                else:
-                    logger.warning("HTTP Error: %s", response.status)
+                if isinstance(data, dict) and data.get("success") is False:
+                    error_msg = data.get("message", "Unknown error")
+                    logger.warning("API Error: %s", error_msg)
                     return None
 
-        except Exception as e:
-            logger.exception("API Error: %s", e)
-            return None
+                return None
+
+            except (asyncio.TimeoutError, aiohttp.ClientError, APITemporaryError) as e:
+                if attempt <= API_SEARCH_RETRIES:
+                    logger.warning(
+                        "Rule34 API temporary error on page %s, retry %s/%s: %s",
+                        pid,
+                        attempt,
+                        API_SEARCH_RETRIES,
+                        e,
+                    )
+                    await asyncio.sleep(attempt)
+                    continue
+
+                logger.warning("Rule34 API temporary error on page %s, giving up: %s", pid, e)
+                raise APITemporaryError("Rule34 API request failed") from e
 
     async def get_random_image(
         self,
@@ -165,7 +201,7 @@ class rule34API:
             posts = await self.search(
                 tags=tags,
                 blacklist=blacklist,
-                limit=100,
+                limit=MAX_POSTS_PER_REQUEST,
                 pid=pid
             )
 
@@ -213,7 +249,7 @@ class rule34API:
             posts = await self.search(
                 tags=tags,
                 blacklist=blacklist,
-                limit=100,
+                limit=MAX_POSTS_PER_REQUEST,
                 pid=search_state['current_pid']
             )
 
@@ -225,12 +261,14 @@ class rule34API:
             used_posts = search_state['used_posts'] | excluded_post_ids
             valid_posts = [
                 post for post in posts
-                if post.get("file_url") and post.get("id") not in used_posts
+                if post.get("file_url") and self._post_id(post) not in used_posts
             ]
 
             if valid_posts:
                 selected_post = random.choice(valid_posts)
-                search_state['used_posts'].add(selected_post.get('id'))
+                selected_post_id = self._post_id(selected_post)
+                if selected_post_id is not None:
+                    search_state['used_posts'].add(selected_post_id)
                 logger.debug(
                     "Selected next post ID %s from page %s",
                     selected_post.get("id"),
