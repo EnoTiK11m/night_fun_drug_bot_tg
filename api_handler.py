@@ -17,8 +17,14 @@ from config import (
 logger = logging.getLogger(__name__)
 API_SEARCH_RETRIES = 2
 API_SEARCH_TIMEOUT_SECONDS = 45
-API_REQUEST_CONCURRENCY = 1
-API_MIN_REQUEST_INTERVAL_SECONDS = 1.5
+INTERACTIVE_PAGE_LIMIT = 250
+INTERACTIVE_SEARCH_TIMEOUT_SECONDS = 35
+INTERACTIVE_MAX_PAGES_PER_SEARCH = 5
+SUBSCRIPTION_CACHE_SEARCH_TIMEOUT_SECONDS = 120
+INTERACTIVE_REQUEST_CONCURRENCY = 2
+BACKGROUND_REQUEST_CONCURRENCY = 1
+INTERACTIVE_MIN_REQUEST_INTERVAL_SECONDS = 0.5
+BACKGROUND_MIN_REQUEST_INTERVAL_SECONDS = 1.5
 
 
 class APITemporaryError(Exception):
@@ -28,18 +34,30 @@ class APITemporaryError(Exception):
 class rule34API:
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
-        self.request_semaphore = asyncio.Semaphore(API_REQUEST_CONCURRENCY)
-        self.rate_limit_lock = asyncio.Lock()
-        self.last_request_at = 0.0
+        self.interactive_semaphore = asyncio.Semaphore(INTERACTIVE_REQUEST_CONCURRENCY)
+        self.background_semaphore = asyncio.Semaphore(BACKGROUND_REQUEST_CONCURRENCY)
+        self.interactive_rate_limit_lock = asyncio.Lock()
+        self.background_rate_limit_lock = asyncio.Lock()
+        self.last_interactive_request_at = 0.0
+        self.last_background_request_at = 0.0
         self.user_search_states = {}  # Храним состояние поиска для каждого пользователя
 
-    async def _wait_for_rate_limit(self):
-        async with self.rate_limit_lock:
+    async def _wait_for_rate_limit(self, kind: str):
+        if kind == "background":
+            lock = self.background_rate_limit_lock
+            interval = BACKGROUND_MIN_REQUEST_INTERVAL_SECONDS
+            attr = "last_background_request_at"
+        else:
+            lock = self.interactive_rate_limit_lock
+            interval = INTERACTIVE_MIN_REQUEST_INTERVAL_SECONDS
+            attr = "last_interactive_request_at"
+
+        async with lock:
             now = asyncio.get_running_loop().time()
-            delay = API_MIN_REQUEST_INTERVAL_SECONDS - (now - self.last_request_at)
+            delay = interval - (now - getattr(self, attr))
             if delay > 0:
                 await asyncio.sleep(delay)
-            self.last_request_at = asyncio.get_running_loop().time()
+            setattr(self, attr, asyncio.get_running_loop().time())
 
     async def ensure_session(self):
         """Создать сессию если её нет"""
@@ -111,7 +129,9 @@ class rule34API:
         tags: str,
         blacklist: Set[str],
         limit: int = DEFAULT_LIMIT,
-        pid: int = 0
+        pid: int = 0,
+        timeout: int = API_SEARCH_TIMEOUT_SECONDS,
+        request_kind: str = "interactive"
     ) -> Optional[List[Dict]]:
         """
         Поиск постов
@@ -138,12 +158,17 @@ class rule34API:
 
         for attempt in range(1, API_SEARCH_RETRIES + 2):
             try:
-                async with self.request_semaphore:
-                    await self._wait_for_rate_limit()
+                semaphore = (
+                    self.background_semaphore
+                    if request_kind == "background"
+                    else self.interactive_semaphore
+                )
+                async with semaphore:
+                    await self._wait_for_rate_limit(request_kind)
                     async with self.session.get(
                         API_BASE_URL,
                         params=params,
-                        timeout=API_SEARCH_TIMEOUT_SECONDS
+                        timeout=timeout
                     ) as response:
                         logger.debug("Response status: %s", response.status)
                         if response.status != 200:
@@ -197,12 +222,15 @@ class rule34API:
         excluded_post_ids = excluded_post_ids or set()
 
         pid = 0
-        while True:
+        scanned_pages = 0
+        while scanned_pages < INTERACTIVE_MAX_PAGES_PER_SEARCH:
             posts = await self.search(
                 tags=tags,
                 blacklist=blacklist,
-                limit=MAX_POSTS_PER_REQUEST,
-                pid=pid
+                limit=INTERACTIVE_PAGE_LIMIT,
+                pid=pid,
+                timeout=INTERACTIVE_SEARCH_TIMEOUT_SECONDS,
+                request_kind="interactive"
             )
 
             if not posts:
@@ -212,7 +240,7 @@ class rule34API:
             logger.debug("Found %s posts on page %s", len(posts), pid)
             valid_posts = [
                 post for post in posts
-                if post.get("file_url") and post.get("id") not in excluded_post_ids
+                if post.get("file_url") and self._post_id(post) not in excluded_post_ids
             ]
             if valid_posts:
                 selected_post = random.choice(valid_posts)
@@ -221,6 +249,10 @@ class rule34API:
 
             logger.debug("All valid posts on page %s were already shown", pid)
             pid += 1
+            scanned_pages += 1
+
+        logger.debug("Interactive search stopped after %s pages", scanned_pages)
+        return None
 
     async def get_next_image(
         self,
@@ -233,10 +265,8 @@ class rule34API:
         logger.debug("get_next_image for user %s with tags %r", user_id, tags)
         excluded_post_ids = excluded_post_ids or set()
 
-        # Получаем или создаем состояние поиска
         search_state = self.user_search_states.get(user_id)
         if not search_state or search_state['tags'] != tags:
-            # Новый поиск, инициализируем состояние
             search_state = {
                 'tags': tags,
                 'blacklist': blacklist,
@@ -245,19 +275,21 @@ class rule34API:
             }
             self.user_search_states[user_id] = search_state
 
-        while True:
+        scanned_pages = 0
+        while scanned_pages < INTERACTIVE_MAX_PAGES_PER_SEARCH:
             posts = await self.search(
                 tags=tags,
                 blacklist=blacklist,
-                limit=MAX_POSTS_PER_REQUEST,
-                pid=search_state['current_pid']
+                limit=INTERACTIVE_PAGE_LIMIT,
+                pid=search_state['current_pid'],
+                timeout=INTERACTIVE_SEARCH_TIMEOUT_SECONDS,
+                request_kind="interactive"
             )
 
             if not posts:
                 logger.debug("No posts found on page %s, stopping search", search_state["current_pid"])
                 return None
 
-            # Фильтруем посты с валидными file_url и которые еще не показывались
             used_posts = search_state['used_posts'] | excluded_post_ids
             valid_posts = [
                 post for post in posts
@@ -276,34 +308,56 @@ class rule34API:
                 )
                 return selected_post
 
-            # Все посты на этой странице уже показаны, переходим к следующей
             search_state['current_pid'] += 1
+            scanned_pages += 1
             logger.debug(
                 "All posts on page %s used, moving to page %s",
                 search_state["current_pid"] - 1,
                 search_state["current_pid"]
             )
 
-    async def get_post_by_id(self, post_id: int) -> Optional[Dict]:
+        logger.debug("Next image search stopped after %s pages", scanned_pages)
+        return None
+
+    async def search_subscription_cache(
+        self,
+        tags: str,
+        blacklist: Set[str],
+        pid: int = 0
+    ) -> Optional[List[Dict]]:
+        return await self.search(
+            tags=tags,
+            blacklist=blacklist,
+            limit=MAX_POSTS_PER_REQUEST,
+            pid=pid,
+            timeout=SUBSCRIPTION_CACHE_SEARCH_TIMEOUT_SECONDS,
+            request_kind="background",
+        )
+
+    async def get_post_by_id(self, post_id: int, timeout: int = 8) -> Optional[Dict]:
         """Получить конкретный пост по ID"""
         await self.ensure_session()
 
         params = self._build_params(id=post_id)
 
         try:
-            async with self.session.get(API_BASE_URL, params=params, timeout=30) as response:
-                if response.status == 200:
-                    response_text = await response.text()
-                    try:
-                        data = json.loads(response_text)
-                        # API возвращает массив, даже для одного поста
-                        if isinstance(data, list) and len(data) > 0:
-                            return data[0]
-                    except json.JSONDecodeError:
-                        logger.warning("JSON decode error for post %s", post_id)
+            async with self.interactive_semaphore:
+                await self._wait_for_rate_limit("interactive")
+                async with self.session.get(
+                    API_BASE_URL, params=params, timeout=timeout
+                ) as response:
+                    if response.status == 200:
+                        response_text = await response.text()
+                        try:
+                            data = json.loads(response_text)
+                            # API возвращает массив, даже для одного поста
+                            if isinstance(data, list) and len(data) > 0:
+                                return data[0]
+                        except json.JSONDecodeError:
+                            logger.warning("JSON decode error for post %s", post_id)
                 return None
-        except Exception as e:
-            logger.exception("API Error in get_post_by_id: %s", e)
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            logger.warning("Temporary API error in get_post_by_id post=%s: %s", post_id, e)
             return None
 
     async def autocomplete(self, query: str) -> List[str]:

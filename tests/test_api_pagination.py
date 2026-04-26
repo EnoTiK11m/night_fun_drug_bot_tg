@@ -9,13 +9,13 @@ class FakeRule34API(rule34API):
         self.pages = pages
         self.requested_pids = []
 
-    async def search(self, tags, blacklist, limit=100, pid=0):
+    async def search(self, tags, blacklist, limit=100, pid=0, **kwargs):
         self.requested_pids.append(pid)
         return self.pages.get(pid)
 
 
 class ApiPaginationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_random_search_scans_until_api_returns_empty_page(self):
+    async def test_random_search_stops_after_interactive_page_limit(self):
         pages = {
             pid: [{"id": str(pid), "file_url": ""}]
             for pid in range(30)
@@ -25,10 +25,10 @@ class ApiPaginationTests(unittest.IsolatedAsyncioTestCase):
 
         result = await api.get_random_image("tag", set())
 
-        self.assertEqual(result["id"], "777")
-        self.assertEqual(api.requested_pids, list(range(31)))
+        self.assertIsNone(result)
+        self.assertEqual(api.requested_pids, list(range(5)))
 
-    async def test_next_search_scans_beyond_old_page_limit(self):
+    async def test_next_search_stops_after_interactive_page_limit(self):
         pages = {
             pid: [{"id": str(pid), "file_url": "https://example.test/old.jpg"}]
             for pid in range(30)
@@ -39,9 +39,9 @@ class ApiPaginationTests(unittest.IsolatedAsyncioTestCase):
 
         result = await api.get_next_image(1, "tag", set(), excluded)
 
-        self.assertEqual(result["id"], "888")
-        self.assertEqual(api.requested_pids, list(range(31)))
-        self.assertEqual(api.user_search_states[1]["current_pid"], 30)
+        self.assertIsNone(result)
+        self.assertEqual(api.requested_pids, list(range(5)))
+        self.assertEqual(api.user_search_states[1]["current_pid"], 5)
 
 
 if __name__ == "__main__":

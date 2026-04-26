@@ -73,5 +73,79 @@ class RetentionTests(TempDatabaseTestCase):
         self.assertEqual(await database.get_sent_post_ids(2), {100})
 
 
+class SubscriptionCacheTests(TempDatabaseTestCase):
+    async def test_replace_subscription_cache_merges_deduplicates_and_filters_invalid_posts(self):
+        saved = await database.replace_subscription_cache(1, "tag", [
+            {
+                "id": "10",
+                "file_url": "https://example.test/10.jpg",
+                "sample_url": "https://example.test/10-sample.jpg",
+                "preview_url": "https://example.test/10-preview.jpg",
+                "tags": "a",
+                "rating": "s",
+                "score": 5,
+            },
+            {"id": "10", "file_url": "https://example.test/10-dup.jpg"},
+            {"id": "11", "file_url": ""},
+            {"id": "bad", "file_url": "https://example.test/bad.jpg"},
+            {"id": "12", "file_url": "https://example.test/12.jpg"},
+        ])
+        merged = await database.replace_subscription_cache(1, "tag", [
+            {"id": "12", "file_url": "https://example.test/12-new.jpg"},
+            {"id": "13", "file_url": "https://example.test/13.jpg"},
+        ])
+
+        posts, cached_at = await database.get_subscription_cache(1, "tag")
+
+        self.assertEqual(saved, {"api": 2, "new": 2, "total": 2})
+        self.assertEqual(merged, {"api": 2, "new": 1, "total": 3})
+        self.assertIsNotNone(cached_at)
+        self.assertEqual({post["id"] for post in posts}, {10, 12, 13})
+        post_10 = next(post for post in posts if post["id"] == 10)
+        self.assertEqual(post_10["sample_url"], "https://example.test/10-sample.jpg")
+        self.assertEqual(post_10["preview_url"], "https://example.test/10-preview.jpg")
+
+    async def test_subscription_cache_stale_when_empty_or_old(self):
+        self.assertTrue(await database.is_subscription_cache_stale(1, "tag"))
+
+
+class PostCacheTests(TempDatabaseTestCase):
+    async def test_cache_post_and_favorite_preserve_fallback_urls(self):
+        post = {
+            "id": "55",
+            "file_url": "https://example.test/original.jpg",
+            "sample_url": "https://example.test/sample.jpg",
+            "preview_url": "https://example.test/preview.jpg",
+            "tags": "tag",
+            "rating": "s",
+            "score": 7,
+        }
+
+        self.assertTrue(await database.cache_post(post))
+        self.assertTrue(await database.add_favorite(1, {"id": "55"}))
+
+        cached = await database.get_cached_post(55)
+        favorite = await database.get_favorite(1, 55)
+
+        self.assertEqual(cached["sample_url"], "https://example.test/sample.jpg")
+        self.assertEqual(favorite["preview_url"], "https://example.test/preview.jpg")
+        self.assertEqual(favorite["tags"], "tag")
+
+        await database.replace_subscription_cache(1, "tag", [
+            {"id": "10", "file_url": "https://example.test/10.jpg"},
+        ])
+        self.assertFalse(await database.is_subscription_cache_stale(1, "tag"))
+
+        async with database.connect_db() as db:
+            await db.execute("""
+                UPDATE subscription_cache
+                SET cached_at = datetime('now', '-2 hours')
+                WHERE user_id = ? AND query = ?
+            """, (1, "tag"))
+            await db.commit()
+
+        self.assertTrue(await database.is_subscription_cache_stale(1, "tag"))
+
+
 if __name__ == "__main__":
     unittest.main()

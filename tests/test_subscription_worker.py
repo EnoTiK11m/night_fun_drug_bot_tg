@@ -24,7 +24,8 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "get_user_blacklist", AsyncMock(return_value=set())),
             patch.object(bot, "get_user_settings", AsyncMock(return_value={"show_caption": False})),
             patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
-            patch.object(bot.api, "get_random_image", AsyncMock(return_value=result)),
+            patch.object(bot, "get_subscription_cached_image", AsyncMock(return_value=result)),
+            patch.object(bot, "remember_and_cache_post", AsyncMock()),
             patch.object(bot, "send_post_media_to_chat", AsyncMock(return_value=True)),
             patch.object(bot, "update_subscription_time", AsyncMock(side_effect=update_time)),
             patch.object(bot, "mark_post_sent", AsyncMock(side_effect=mark_sent)),
@@ -44,7 +45,8 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "get_user_blacklist", AsyncMock(return_value=set())),
             patch.object(bot, "get_user_settings", AsyncMock(return_value={"show_caption": False})),
             patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
-            patch.object(bot.api, "get_random_image", AsyncMock(return_value=result)),
+            patch.object(bot, "get_subscription_cached_image", AsyncMock(return_value=result)),
+            patch.object(bot, "remember_and_cache_post", AsyncMock()),
             patch.object(bot, "send_post_media_to_chat", AsyncMock(return_value=False)),
             patch.object(bot, "update_subscription_time", AsyncMock()) as update_time,
             patch.object(bot, "mark_post_sent", AsyncMock()) as mark_sent,
@@ -65,7 +67,8 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "get_user_blacklist", AsyncMock(return_value=set())),
             patch.object(bot, "get_user_settings", AsyncMock(return_value={"show_caption": False})),
             patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
-            patch.object(bot.api, "get_random_image", AsyncMock(return_value=result)),
+            patch.object(bot, "get_subscription_cached_image", AsyncMock(return_value=result)),
+            patch.object(bot, "remember_and_cache_post", AsyncMock()),
             patch.object(bot, "send_post_media_to_chat", AsyncMock(return_value=True)),
             patch.object(bot, "update_subscription_time", AsyncMock(return_value=False)),
             patch.object(bot, "mark_post_sent", AsyncMock()) as mark_sent,
@@ -83,8 +86,8 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "get_user_settings", AsyncMock(return_value={"show_caption": False})),
             patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
             patch.object(
-                bot.api,
-                "get_random_image",
+                bot,
+                "get_subscription_cached_image",
                 AsyncMock(side_effect=APITemporaryError("timeout")),
             ),
             patch.object(bot, "mark_subscription_empty", AsyncMock()) as mark_empty,
@@ -98,6 +101,64 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
         update_time.assert_not_awaited()
         mark_sent.assert_not_awaited()
         release_claim.assert_awaited_once_with(1, "tag", "token")
+
+
+class SubscriptionCacheSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_refreshes_cache_and_returns_available_post(self):
+        fresh_posts = [
+            {"id": "1", "file_url": "https://example.test/1.jpg"},
+            {"id": "2", "file_url": "https://example.test/2.jpg"},
+        ]
+        cached_after_refresh = [
+            {"id": 1, "file_url": "https://example.test/1.jpg"},
+            {"id": 2, "file_url": "https://example.test/2.jpg"},
+        ]
+
+        with (
+            patch.object(bot, "get_subscription_cache", AsyncMock(side_effect=[
+                ([], None),
+                (cached_after_refresh, "now"),
+            ])),
+            patch.object(bot, "is_subscription_cache_stale", AsyncMock(return_value=True)),
+            patch.object(
+                bot.api,
+                "search_subscription_cache",
+                AsyncMock(return_value=fresh_posts),
+            ) as search,
+            patch.object(
+                bot,
+                "replace_subscription_cache",
+                AsyncMock(return_value={"api": 2, "new": 2, "total": 2}),
+            ) as replace_cache,
+            patch.object(bot.random, "choice", return_value=cached_after_refresh[1]),
+        ):
+            result = await bot.get_subscription_cached_image(1, "tag", set(), {1})
+
+        self.assertEqual(result["id"], 2)
+        search.assert_awaited_once()
+        replace_cache.assert_awaited_once_with(1, "tag", fresh_posts)
+
+    async def test_uses_stale_cache_when_refresh_times_out(self):
+        cached_posts = [
+            {"id": 10, "file_url": "https://example.test/10.jpg"},
+            {"id": 11, "file_url": "https://example.test/11.jpg"},
+        ]
+
+        with (
+            patch.object(bot, "get_subscription_cache", AsyncMock(return_value=(cached_posts, "old"))),
+            patch.object(bot, "is_subscription_cache_stale", AsyncMock(return_value=True)),
+            patch.object(
+                bot.api,
+                "search_subscription_cache",
+                AsyncMock(side_effect=APITemporaryError("timeout")),
+            ),
+            patch.object(bot, "replace_subscription_cache", AsyncMock()) as replace_cache,
+            patch.object(bot.random, "choice", return_value=cached_posts[1]),
+        ):
+            result = await bot.get_subscription_cached_image(1, "tag", set(), {10})
+
+        self.assertEqual(result["id"], 11)
+        replace_cache.assert_not_awaited()
 
 
 if __name__ == "__main__":

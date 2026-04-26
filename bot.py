@@ -2,7 +2,10 @@
 import asyncio
 import hashlib
 import time
+import random
+import os
 from html import unescape
+from logging.handlers import RotatingFileHandler
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -24,6 +27,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.helpers import escape_markdown
+from telegram.error import BadRequest
 from config import BOT_TOKEN, SEARCH_COOLDOWN_SECONDS, validate_config
 from database import (
     init_db,
@@ -47,9 +51,16 @@ from database import (
     save_user_settings,
     get_search_history,
     get_sent_post_ids,
+    get_subscription_cache,
+    is_subscription_cache_stale,
+    cache_post,
+    get_cached_post,
     mark_post_sent,
+    replace_subscription_cache,
+    SUBSCRIPTION_CACHE_MIN_AVAILABLE,
     add_favorite,
     remove_favorite,
+    get_favorite,
     get_favorites,
     count_favorites,
     add_subscription_post,
@@ -58,19 +69,74 @@ from database import (
 )
 from api_handler import api, APITemporaryError
 
-# Логирование
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record):
+        message = super().format(record)
+        if BOT_TOKEN:
+            message = message.replace(BOT_TOKEN, "<BOT_TOKEN>")
+        return message
+
+
+class ExactLevelFilter(logging.Filter):
+    def __init__(self, level):
+        super().__init__()
+        self.level = level
+
+    def filter(self, record):
+        return record.levelno == self.level
+
+
+def configure_logging():
+    os.makedirs("logs", exist_ok=True)
+    formatter = RedactingFormatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    handlers = [
+        logging.StreamHandler(),
+        RotatingFileHandler(
+            os.path.join("logs", "info.log"),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        ),
+        RotatingFileHandler(
+            os.path.join("logs", "warnings.log"),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        ),
+    ]
+    handlers[0].setLevel(logging.INFO)
+    handlers[1].setLevel(logging.INFO)
+    handlers[2].setLevel(logging.WARNING)
+    handlers[1].addFilter(ExactLevelFilter(logging.INFO))
+    for handler in handlers:
+        handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.INFO)
+    for handler in handlers:
+        root_logger.addHandler(handler)
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+configure_logging()
 logger = logging.getLogger(__name__)
+
 
 # Состояния пользователей
 user_states = {}
 # Глобальная задача для подписок
 subscription_task = None
 callback_payloads = {}
+recent_posts = {}
 user_last_search_at = {}
 CALLBACK_TTL_SECONDS = 24 * 60 * 60
+RECENT_POST_TTL_SECONDS = 6 * 60 * 60
+RECENT_POST_MAX_ITEMS = 2000
 MAX_CAPTION_LENGTH = 1024
 SUBSCRIPTION_MIN_INTERVAL = 1
 SUBSCRIPTION_MAX_INTERVAL = 120
@@ -112,6 +178,61 @@ def cleanup_callback_payloads():
     ]
     for key in expired:
         callback_payloads.pop(key, None)
+
+
+def safe_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def remember_post(post: dict):
+    post_id = safe_int(post.get("id"))
+    if post_id is None:
+        return
+
+    now = time.monotonic()
+    recent_posts[post_id] = (dict(post), now)
+
+    if len(recent_posts) > RECENT_POST_MAX_ITEMS:
+        oldest = sorted(recent_posts.items(), key=lambda item: item[1][1])
+        for old_post_id, _ in oldest[: len(recent_posts) - RECENT_POST_MAX_ITEMS]:
+            recent_posts.pop(old_post_id, None)
+
+
+def get_remembered_post(post_id: int) -> dict | None:
+    item = recent_posts.get(post_id)
+    if not item:
+        return None
+
+    post, created_at = item
+    if time.monotonic() - created_at > RECENT_POST_TTL_SECONDS:
+        recent_posts.pop(post_id, None)
+        return None
+
+    return dict(post)
+
+
+def minimal_post(post_id: int) -> dict:
+    return {
+        "id": post_id,
+        "file_url": "",
+        "sample_url": "",
+        "preview_url": "",
+        "tags": "",
+        "rating": "",
+        "score": 0,
+    }
+
+
+async def remember_and_cache_post(post: dict):
+    remember_post(post)
+    await cache_post(post)
+
+
+async def get_known_post(post_id: int) -> dict | None:
+    return get_remembered_post(post_id) or await get_cached_post(post_id)
 
 
 def md_code(value) -> str:
@@ -157,7 +278,8 @@ def clamp_page(page: int, total_items: int, page_size: int = FAVORITES_PAGE_SIZE
 
 
 def media_from_post(post: dict, caption: str = ""):
-    file_url = post.get("file_url", "")
+    candidates = get_media_url_candidates(post)
+    file_url = candidates[0][1] if candidates else ""
     media_caption = caption if caption else None
     if file_url.lower().endswith((".mp4", ".webm")):
         return InputMediaVideo(file_url, caption=media_caption, parse_mode="Markdown")
@@ -505,10 +627,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def safe_query_answer(query):
+    try:
+        await query.answer()
+    except BadRequest as exc:
+        if "Query is too old" in str(exc) or "query id is invalid" in str(exc):
+            logger.warning("Ignoring expired callback query answer: %s", exc)
+            return
+        raise
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик нажатий кнопок"""
     query = update.callback_query
-    await query.answer()
+    await safe_query_answer(query)
 
     user_id = query.from_user.id
     data = query.data
@@ -948,7 +1080,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Подписка из клавиатуры под изображением
         sub_query = get_callback_payload("subscribe", data)
         if not sub_query:
-            await query.edit_message_text(
+            await query.message.reply_text(
                 "❌ Не удалось найти запрос для подписки. Попробуйте выполнить поиск заново.",
                 parse_mode="Markdown",
             )
@@ -957,13 +1089,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         success = await add_subscription(user_id, sub_query, 10)
 
         if success:
-            await query.edit_message_text(
+            await query.message.reply_text(
                 f"✅ Подписка на `{md_code(sub_query)}` активирована!\n\n"
                 "Теперь вы будете получать новые посты каждые 10 минут.",
                 parse_mode="Markdown",
             )
         else:
-            await query.edit_message_text(
+            await query.message.reply_text(
                 "❌ Не удалось добавить подписку.", parse_mode="Markdown"
             )
 
@@ -1007,19 +1139,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("❌ Не удалось определить пост.")
             return
 
-        favorites = await get_favorites(user_id, limit=1000)
-        post = next(
-            (favorite for favorite in favorites if favorite["id"] == int(
-                post_id_text)),
-            None,
-        )
+        post = await get_favorite(user_id, int(post_id_text))
         if not post:
             await query.message.reply_text("❌ Пост не найден в избранном.")
             return
 
-        caption = build_favorites_gallery_caption(
-            post, favorites.index(post), len(favorites)
-        )
+        caption = build_favorites_gallery_caption(post, 0, 1)
         await send_post_media(
             query.message, post, caption, get_image_keyboard(post["id"])
         )
@@ -1058,12 +1183,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         post_id = int(post_id_text)
-        post = await api.get_post_by_id(post_id)
-        if not post:
-            await query.message.reply_text(
-                f"❌ Пост с ID `{md_code(post_id)}` не найден.", parse_mode="Markdown"
+        post = await get_known_post(post_id) or minimal_post(post_id)
+        if not post.get("file_url"):
+            logger.warning(
+                "Saving subscription favorite without cached media user=%s post=%s",
+                user_id,
+                post_id,
             )
-            return
 
         await add_favorite(user_id, post)
         await add_subscription_post(user_id, sub_query, post)
@@ -1079,12 +1205,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         post_id = int(post_id_text)
-        post = await api.get_post_by_id(post_id)
-        if not post:
-            await query.message.reply_text(
-                f"❌ Пост с ID `{md_code(post_id)}` не найден.", parse_mode="Markdown"
+        post = await get_known_post(post_id) or minimal_post(post_id)
+        if not post.get("file_url"):
+            logger.warning(
+                "Saving favorite without cached media user=%s post=%s",
+                user_id,
+                post_id,
             )
-            return
 
         added = await add_favorite(user_id, post)
         if added:
@@ -1188,29 +1315,40 @@ async def send_image(
         )
         return False
 
+    status_msg = None
     if not is_subscription:  # Не показываем статус для подписок
         status_msg = await message.reply_text("🔍 Ищу...")
 
     excluded_post_ids = await get_sent_post_ids(user_id)
 
-    # Если это кнопка "ещё", используем улучшенную логику
-    if is_more:
-        result = await api.get_next_image(user_id, tags, blacklist, excluded_post_ids)
-    else:
-        result = await api.get_random_image(tags, blacklist, excluded_post_ids)
-        # Сохраняем историю поиска для кнопки "ещё"
-        if result:
-            await api.save_search_state(user_id, tags, blacklist, result.get("id"))
+    try:
+        # Если это кнопка "ещё", используем улучшенную логику
+        if is_more:
+            result = await api.get_next_image(user_id, tags, blacklist, excluded_post_ids)
+        else:
+            result = await api.get_random_image(tags, blacklist, excluded_post_ids)
+            # Сохраняем историю поиска для кнопки "ещё"
+            if result:
+                await api.save_search_state(user_id, tags, blacklist, result.get("id"))
+    except APITemporaryError:
+        if status_msg:
+            await status_msg.delete()
+        logger.warning("Temporary Rule34 API error during user search user=%s tags=%r", user_id, tags)
+        if not is_subscription:
+            await message.reply_text(
+                "⚠️ Rule34 сейчас отвечает слишком долго. Попробуйте ещё раз чуть позже.",
+                reply_markup=get_main_keyboard(),
+            )
+        return False
 
-    if not is_subscription:
+    if status_msg:
         await status_msg.delete()
 
     if result:
+        await remember_and_cache_post(result)
         await save_user_query(user_id, tags)
 
         post_id = result.get("id", 0)
-        if post_id:
-            await mark_post_sent(user_id, int(post_id))
 
         # Строим описание на основе настроек
         caption = ""
@@ -1223,9 +1361,11 @@ async def send_image(
         else:
             keyboard = get_image_keyboard(post_id, tags)
 
-        await send_post_media(message, result, caption, keyboard)
+        delivered = await send_post_media(message, result, caption, keyboard)
+        if delivered and post_id:
+            await mark_post_sent(user_id, int(post_id))
 
-        return True
+        return delivered
     else:
         if not is_subscription:
             if is_more:
@@ -1250,49 +1390,106 @@ async def send_image(
         return False
 
 
+def get_media_url_candidates(post: dict) -> list[tuple[str, str]]:
+    candidates = []
+    for key in ("file_url", "sample_url", "preview_url"):
+        url = post.get(key)
+        if url and all(url != existing_url for _, existing_url in candidates):
+            candidates.append((key, url))
+    return candidates
+
+
+async def reply_media_url(message, url: str, caption: str, reply_markup):
+    if url.lower().endswith((".mp4", ".webm")):
+        await message.reply_video(
+            url,
+            caption=caption if caption else None,
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+    elif url.lower().endswith(".gif"):
+        await message.reply_animation(
+            url,
+            caption=caption if caption else None,
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+    else:
+        await message.reply_photo(
+            url,
+            caption=caption if caption else None,
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+
+
+async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup):
+    if url.lower().endswith((".mp4", ".webm")):
+        await bot.send_video(
+            chat_id=chat_id,
+            video=url,
+            caption=caption if caption else None,
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+    elif url.lower().endswith(".gif"):
+        await bot.send_animation(
+            chat_id=chat_id,
+            animation=url,
+            caption=caption if caption else None,
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+    else:
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=url,
+            caption=caption if caption else None,
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+
+
 async def send_post_media(message, post: dict, caption: str = "", keyboard=None):
-    file_url = post.get("file_url", "")
-    reply_markup = keyboard or get_subscription_image_keyboard(
-        post.get("id", 0))
-    for attempt in range(1, MEDIA_SEND_RETRIES + 1):
-        try:
-            if file_url.lower().endswith((".mp4", ".webm")):
-                await message.reply_video(
-                    file_url,
-                    caption=caption if caption else None,
-                    parse_mode="Markdown",
-                    reply_markup=reply_markup,
+    reply_markup = keyboard or get_subscription_image_keyboard(post.get("id", 0))
+    candidates = get_media_url_candidates(post)
+    fallback_url = candidates[0][1] if candidates else ""
+    if not fallback_url:
+        await message.reply_text(
+            "⚠️ У этого поста нет сохранённой ссылки на файл. "
+            "Попробуйте открыть свежий пост или найти его через `/id`.",
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+        logger.warning("Media fallback missing url post=%s", post.get("id"))
+        return False
+
+    for url_kind, media_url in candidates:
+        for attempt in range(1, MEDIA_SEND_RETRIES + 1):
+            try:
+                await reply_media_url(message, media_url, caption, reply_markup)
+                logger.info(
+                    "Media send ok post=%s url_kind=%s",
+                    post.get("id"),
+                    url_kind,
                 )
-            elif file_url.lower().endswith(".gif"):
-                await message.reply_animation(
-                    file_url,
-                    caption=caption if caption else None,
-                    parse_mode="Markdown",
-                    reply_markup=reply_markup,
+                return True
+            except Exception as exc:
+                logger.warning(
+                    "Media send failed post=%s url_kind=%s attempt=%s/%s: %s",
+                    post.get("id"),
+                    url_kind,
+                    attempt,
+                    MEDIA_SEND_RETRIES,
+                    exc,
                 )
-            else:
-                await message.reply_photo(
-                    file_url,
-                    caption=caption if caption else None,
-                    parse_mode="Markdown",
-                    reply_markup=reply_markup,
-                )
-            return True
-        except Exception as exc:
-            logger.warning(
-                "Media send failed on attempt %s/%s for post %s: %s",
-                attempt,
-                MEDIA_SEND_RETRIES,
-                post.get("id"),
-                exc,
-            )
-            if attempt < MEDIA_SEND_RETRIES:
-                await asyncio.sleep(1)
+                if attempt < MEDIA_SEND_RETRIES:
+                    await asyncio.sleep(1)
 
     fallback = (
         "⚠️ Не удалось отправить файл напрямую. "
         "Возможна проблема с размером, форматом, сетью или сервером.\n"
-        f"Открыть файл: {md_text(file_url)}"
+        f"Открыть файл: {md_text(fallback_url)}"
     )
     if caption:
         fallback += f"\n\n{caption}"
@@ -1301,55 +1498,59 @@ async def send_post_media(message, post: dict, caption: str = "", keyboard=None)
         parse_mode="Markdown",
         reply_markup=reply_markup,
     )
-    return False
+    logger.warning("Media fallback sent post=%s", post.get("id"))
+    return True
 
 
 async def send_post_media_to_chat(bot, chat_id: int, post: dict, caption: str = "", keyboard=None):
-    file_url = post.get("file_url", "")
     reply_markup = keyboard or get_subscription_image_keyboard(post.get("id", 0))
-    for attempt in range(1, MEDIA_SEND_RETRIES + 1):
-        try:
-            if file_url.lower().endswith((".mp4", ".webm")):
-                await bot.send_video(
-                    chat_id=chat_id,
-                    video=file_url,
-                    caption=caption if caption else None,
-                    parse_mode="Markdown",
-                    reply_markup=reply_markup,
+    candidates = get_media_url_candidates(post)
+    fallback_url = candidates[0][1] if candidates else ""
+    if not fallback_url:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⚠️ У этого поста нет сохранённой ссылки на файл. "
+                "Попробуйте открыть свежий пост или найти его через `/id`."
+            ),
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+        logger.warning(
+            "Subscription media fallback missing url user=%s post=%s",
+            chat_id,
+            post.get("id"),
+        )
+        return False
+
+    for url_kind, media_url in candidates:
+        for attempt in range(1, MEDIA_SEND_RETRIES + 1):
+            try:
+                await send_media_url(bot, chat_id, media_url, caption, reply_markup)
+                logger.info(
+                    "Subscription media send ok user=%s post=%s url_kind=%s",
+                    chat_id,
+                    post.get("id"),
+                    url_kind,
                 )
-            elif file_url.lower().endswith(".gif"):
-                await bot.send_animation(
-                    chat_id=chat_id,
-                    animation=file_url,
-                    caption=caption if caption else None,
-                    parse_mode="Markdown",
-                    reply_markup=reply_markup,
+                return True
+            except Exception as exc:
+                logger.warning(
+                    "Subscription media send failed user=%s post=%s url_kind=%s attempt=%s/%s: %s",
+                    chat_id,
+                    post.get("id"),
+                    url_kind,
+                    attempt,
+                    MEDIA_SEND_RETRIES,
+                    exc,
                 )
-            else:
-                await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=file_url,
-                    caption=caption if caption else None,
-                    parse_mode="Markdown",
-                    reply_markup=reply_markup,
-                )
-            return True
-        except Exception as exc:
-            logger.warning(
-                "Subscription media send failed on attempt %s/%s for user %s post %s: %s",
-                attempt,
-                MEDIA_SEND_RETRIES,
-                chat_id,
-                post.get("id"),
-                exc,
-            )
-            if attempt < MEDIA_SEND_RETRIES:
-                await asyncio.sleep(1)
+                if attempt < MEDIA_SEND_RETRIES:
+                    await asyncio.sleep(1)
 
     fallback = (
         "⚠️ Не удалось отправить файл напрямую. "
         "Возможна проблема с размером, форматом, сетью или сервером.\n"
-        f"Открыть файл: {md_text(file_url)}"
+        f"Открыть файл: {md_text(fallback_url)}"
     )
     if caption:
         fallback += f"\n\n{caption}"
@@ -1358,6 +1559,11 @@ async def send_post_media_to_chat(bot, chat_id: int, post: dict, caption: str = 
         text=fallback,
         parse_mode="Markdown",
         reply_markup=reply_markup,
+    )
+    logger.warning(
+        "Subscription media fallback sent user=%s post=%s",
+        chat_id,
+        post.get("id"),
     )
     return True
 
@@ -1462,9 +1668,7 @@ async def edit_subscription_gallery(
         )
     except Exception as e:
         logger.error(f"Ошибка обновления галереи подписки: {e}")
-        await query.message.reply_text(
-            "❌ Не удалось обновить пост. Откройте просмотр заново."
-        )
+        await send_post_media(query.message, post, caption, keyboard)
 
 
 async def send_favorites_gallery(message, user_id: int, index: int = 0):
@@ -1502,9 +1706,7 @@ async def edit_favorites_gallery(query, user_id: int, index: int):
         )
     except Exception as e:
         logger.error(f"Ошибка обновления галереи избранного: {e}")
-        await query.message.reply_text(
-            "❌ Не удалось обновить пост. Откройте избранное заново."
-        )
+        await send_post_media(query.message, post, caption, keyboard)
 
 
 async def show_history(message, user_id: int, edit: bool = False):
@@ -1798,7 +2000,11 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         status_msg = await update.message.reply_text("🔍 Ищу...")
 
-        result = await api.get_post_by_id(post_id)
+        result = await get_known_post(post_id)
+        if not result or not get_media_url_candidates(result):
+            result = await api.get_post_by_id(post_id)
+            if result:
+                await remember_and_cache_post(result)
 
         await status_msg.delete()
 
@@ -1849,9 +2055,12 @@ async def process_one_subscription(app, subscription):
         blacklist = await get_user_blacklist(user_id)
         settings = await get_user_settings(user_id)
         excluded_post_ids = await get_sent_post_ids(user_id)
-        result = await api.get_random_image(query, blacklist, excluded_post_ids)
+        result = await get_subscription_cached_image(
+            user_id, query, blacklist, excluded_post_ids
+        )
 
         if result:
+            await remember_and_cache_post(result)
             post_id = result.get("id", 0)
             keyboard = get_subscription_image_keyboard(post_id, query)
 
@@ -1909,6 +2118,57 @@ async def process_one_subscription(app, subscription):
     except Exception:
         await release_subscription_claim(user_id, query, processing_token)
         logger.exception("Subscription processing error for user %s", user_id)
+
+
+async def get_subscription_cached_image(user_id: int, query: str, blacklist: set, excluded_post_ids: set):
+    cached_posts, _ = await get_subscription_cache(user_id, query)
+    available_posts = [
+        post for post in cached_posts
+        if post.get("file_url") and post.get("id") not in excluded_post_ids
+    ]
+    should_refresh = (
+        await is_subscription_cache_stale(user_id, query)
+        or len(available_posts) < SUBSCRIPTION_CACHE_MIN_AVAILABLE
+    )
+
+    if should_refresh:
+        try:
+            fresh_posts = await api.search_subscription_cache(
+                query,
+                blacklist,
+                pid=0,
+            )
+        except APITemporaryError:
+            if available_posts:
+                logger.warning(
+                    "Using stale subscription cache after API error user=%s query=%r available=%s",
+                    user_id,
+                    query,
+                    len(available_posts),
+                )
+                return random.choice(available_posts)
+            raise
+
+        if fresh_posts:
+            cache_stats = await replace_subscription_cache(user_id, query, fresh_posts)
+            cached_posts, _ = await get_subscription_cache(user_id, query)
+            available_posts = [
+                post for post in cached_posts
+                if post.get("file_url") and post.get("id") not in excluded_post_ids
+            ]
+            logger.info(
+                "Refreshed subscription cache user=%s query=%r api=%s new=%s total=%s available=%s",
+                user_id,
+                query,
+                cache_stats["api"],
+                cache_stats["new"],
+                cache_stats["total"],
+                len(available_posts),
+            )
+
+    if not available_posts:
+        return None
+    return random.choice(available_posts)
 
 
 async def process_subscriptions(app):
@@ -1983,6 +2243,19 @@ async def post_shutdown(application):
     await api.close()
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    error = context.error
+    if isinstance(error, BadRequest) and (
+        "Query is too old" in str(error) or "query id is invalid" in str(error)
+    ):
+        logger.warning("Ignoring expired callback query: %s", error)
+        return
+    logger.error(
+        "Unhandled Telegram handler error",
+        exc_info=(type(error), error, error.__traceback__),
+    )
+
+
 def main():
     """Запуск бота"""
     missing_config = validate_config()
@@ -2016,6 +2289,7 @@ def main():
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler)
     )
+    application.add_error_handler(error_handler)
 
     logger.info("Бот запущен!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

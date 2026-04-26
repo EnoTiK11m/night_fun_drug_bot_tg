@@ -14,6 +14,8 @@ SUBSCRIPTION_EMPTY_BACKOFF_MINUTES = (60, 120, 240, 480, 720)
 SENT_POSTS_RETENTION_PER_USER = 5000
 SEARCH_HISTORY_RETENTION_PER_USER = 200
 SUBSCRIPTION_CLAIM_MINUTES = 5
+SUBSCRIPTION_CACHE_TTL_MINUTES = 60
+SUBSCRIPTION_CACHE_MIN_AVAILABLE = 20
 
 
 @asynccontextmanager
@@ -50,6 +52,30 @@ async def ensure_subscription_columns(db):
             datetime(last_sent, '+' || interval_minutes || ' minutes')
         )
     """)
+
+
+async def ensure_subscription_cache_columns(db):
+    cursor = await db.execute("PRAGMA table_info(subscription_cache)")
+    columns = {row[1] for row in await cursor.fetchall()}
+    column_defs = {
+        "sample_url": "TEXT DEFAULT ''",
+        "preview_url": "TEXT DEFAULT ''",
+    }
+    for column, definition in column_defs.items():
+        if column not in columns:
+            await db.execute(f"ALTER TABLE subscription_cache ADD COLUMN {column} {definition}")
+
+
+async def ensure_media_post_columns(db, table_name: str):
+    cursor = await db.execute(f"PRAGMA table_info({table_name})")
+    columns = {row[1] for row in await cursor.fetchall()}
+    column_defs = {
+        "sample_url": "TEXT DEFAULT ''",
+        "preview_url": "TEXT DEFAULT ''",
+    }
+    for column, definition in column_defs.items():
+        if column not in columns:
+            await db.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} {definition}")
 
 
 def get_empty_backoff_minutes(empty_count: int, interval_minutes: int) -> int:
@@ -105,6 +131,8 @@ async def init_db():
                 user_id INTEGER,
                 post_id INTEGER,
                 file_url TEXT,
+                sample_url TEXT DEFAULT '',
+                preview_url TEXT DEFAULT '',
                 tags TEXT DEFAULT '',
                 rating TEXT DEFAULT '',
                 score INTEGER DEFAULT 0,
@@ -128,10 +156,41 @@ async def init_db():
                 query TEXT,
                 post_id INTEGER,
                 file_url TEXT,
+                sample_url TEXT DEFAULT '',
+                preview_url TEXT DEFAULT '',
                 tags TEXT DEFAULT '',
                 rating TEXT DEFAULT '',
                 score INTEGER DEFAULT 0,
                 sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, query, post_id)
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS post_cache (
+                post_id INTEGER PRIMARY KEY,
+                file_url TEXT DEFAULT '',
+                sample_url TEXT DEFAULT '',
+                preview_url TEXT DEFAULT '',
+                tags TEXT DEFAULT '',
+                rating TEXT DEFAULT '',
+                score INTEGER DEFAULT 0,
+                cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS subscription_cache (
+                user_id INTEGER,
+                query TEXT,
+                post_id INTEGER,
+                file_url TEXT,
+                sample_url TEXT DEFAULT '',
+                preview_url TEXT DEFAULT '',
+                tags TEXT DEFAULT '',
+                rating TEXT DEFAULT '',
+                score INTEGER DEFAULT 0,
+                cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (user_id, query, post_id)
             )
         """)
@@ -183,6 +242,17 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_subscription_posts_user_query_sent
             ON subscription_posts (user_id, query, sent_at)
         """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_subscription_cache_lookup
+            ON subscription_cache (user_id, query, cached_at)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_post_cache_cached
+            ON post_cache (cached_at)
+        """)
+        await ensure_media_post_columns(db, "favorites")
+        await ensure_media_post_columns(db, "subscription_posts")
+        await ensure_subscription_cache_columns(db)
 
         await db.commit()
 
@@ -283,6 +353,187 @@ async def mark_post_sent(user_id: int, post_id: int):
               )
         """, (user_id, user_id, SENT_POSTS_RETENTION_PER_USER))
         await db.commit()
+
+
+def _post_from_row(row) -> Dict[str, Any]:
+    return {
+        "id": row[0],
+        "file_url": row[1],
+        "sample_url": row[2] or "",
+        "preview_url": row[3] or "",
+        "tags": row[4] or "",
+        "rating": row[5] or "",
+        "score": row[6] or 0,
+    }
+
+
+def _normalize_post(post: Dict[str, Any]) -> Optional[tuple[int, str, str, str, str, str, int]]:
+    try:
+        post_id = int(post.get("id"))
+    except (TypeError, ValueError):
+        return None
+
+    return (
+        post_id,
+        post.get("file_url", "") or "",
+        post.get("sample_url", "") or "",
+        post.get("preview_url", "") or "",
+        post.get("tags", "") or "",
+        post.get("rating", "") or "",
+        int(post.get("score") or 0),
+    )
+
+
+async def cache_post(post: Dict[str, Any]) -> bool:
+    normalized = _normalize_post(post)
+    if normalized is None:
+        return False
+
+    async with connect_db() as db:
+        await db.execute("""
+            INSERT INTO post_cache
+            (post_id, file_url, sample_url, preview_url, tags, rating, score, cached_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(post_id) DO UPDATE SET
+                file_url = COALESCE(NULLIF(excluded.file_url, ''), post_cache.file_url),
+                sample_url = COALESCE(NULLIF(excluded.sample_url, ''), post_cache.sample_url),
+                preview_url = COALESCE(NULLIF(excluded.preview_url, ''), post_cache.preview_url),
+                tags = COALESCE(NULLIF(excluded.tags, ''), post_cache.tags),
+                rating = COALESCE(NULLIF(excluded.rating, ''), post_cache.rating),
+                score = CASE WHEN excluded.score != 0 THEN excluded.score ELSE post_cache.score END,
+                cached_at = CURRENT_TIMESTAMP
+        """, normalized)
+        await db.commit()
+        return True
+
+
+async def get_cached_post(post_id: int) -> Optional[Dict[str, Any]]:
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            SELECT post_id, file_url, sample_url, preview_url, tags, rating, score
+            FROM post_cache
+            WHERE post_id = ?
+        """, (post_id,))
+        row = await cursor.fetchone()
+        return _post_from_row(row) if row else None
+
+
+async def get_subscription_cache(
+    user_id: int, query: str
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            SELECT post_id, file_url, sample_url, preview_url, tags, rating, score
+            FROM subscription_cache
+            WHERE user_id = ? AND query = ?
+        """, (user_id, query.strip()))
+        posts = [_post_from_row(row) for row in await cursor.fetchall()]
+
+        cursor = await db.execute("""
+            SELECT MIN(cached_at)
+            FROM subscription_cache
+            WHERE user_id = ? AND query = ?
+        """, (user_id, query.strip()))
+        row = await cursor.fetchone()
+        return posts, row[0] if row and row[0] else None
+
+
+async def is_subscription_cache_stale(user_id: int, query: str) -> bool:
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            SELECT 1
+            FROM subscription_cache
+            WHERE user_id = ?
+              AND query = ?
+              AND datetime(cached_at) >= datetime('now', '-' || ? || ' minutes')
+            LIMIT 1
+        """, (user_id, query.strip(), SUBSCRIPTION_CACHE_TTL_MINUTES))
+        return await cursor.fetchone() is None
+
+
+async def replace_subscription_cache(
+    user_id: int, query: str, posts: List[Dict[str, Any]]
+) -> Dict[str, int]:
+    query = query.strip()
+    seen_post_ids: set[int] = set()
+    rows = []
+    for post in posts:
+        try:
+            post_id = int(post.get("id"))
+        except (TypeError, ValueError):
+            continue
+
+        file_url = post.get("file_url")
+        if not file_url or post_id in seen_post_ids:
+            continue
+
+        seen_post_ids.add(post_id)
+        rows.append((
+            user_id,
+            query,
+            post_id,
+            file_url,
+            post.get("sample_url", "") or "",
+            post.get("preview_url", "") or "",
+            post.get("tags", "") or "",
+            post.get("rating", "") or "",
+            int(post.get("score") or 0),
+        ))
+
+    async with connect_db() as db:
+        existing_ids: set[int] = set()
+        if rows:
+            cursor = await db.execute("""
+                SELECT post_id
+                FROM subscription_cache
+                WHERE user_id = ? AND query = ?
+            """, (user_id, query))
+            existing_ids = {int(row[0]) for row in await cursor.fetchall()}
+
+        if rows:
+            await db.executemany("""
+                INSERT OR REPLACE INTO subscription_cache
+                (user_id, query, post_id, file_url, sample_url, preview_url, tags, rating, score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+            await db.executemany("""
+                INSERT INTO post_cache
+                (post_id, file_url, sample_url, preview_url, tags, rating, score, cached_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(post_id) DO UPDATE SET
+                    file_url = COALESCE(NULLIF(excluded.file_url, ''), post_cache.file_url),
+                    sample_url = COALESCE(NULLIF(excluded.sample_url, ''), post_cache.sample_url),
+                    preview_url = COALESCE(NULLIF(excluded.preview_url, ''), post_cache.preview_url),
+                    tags = COALESCE(NULLIF(excluded.tags, ''), post_cache.tags),
+                    rating = COALESCE(NULLIF(excluded.rating, ''), post_cache.rating),
+                    score = CASE WHEN excluded.score != 0 THEN excluded.score ELSE post_cache.score END,
+                    cached_at = CURRENT_TIMESTAMP
+            """, [
+                (post_id, file_url, sample_url, preview_url, tags, rating, score)
+                for (
+                    _user_id,
+                    _query,
+                    post_id,
+                    file_url,
+                    sample_url,
+                    preview_url,
+                    tags,
+                    rating,
+                    score,
+                ) in rows
+            ])
+        cursor = await db.execute("""
+            SELECT COUNT(*)
+            FROM subscription_cache
+            WHERE user_id = ? AND query = ?
+        """, (user_id, query))
+        row = await cursor.fetchone()
+        await db.commit()
+        return {
+            "api": len(rows),
+            "new": sum(1 for row in rows if row[2] not in existing_ids),
+            "total": int(row[0] or 0),
+        }
 
 
 async def get_search_history(user_id: int, limit: int = 10) -> List[str]:
@@ -613,22 +864,39 @@ async def toggle_subscription(user_id: int, query: str) -> Optional[bool]:
 
 
 async def add_favorite(user_id: int, post: Dict[str, Any]) -> bool:
-    post_id = post.get("id")
-    if post_id is None:
+    normalized = _normalize_post(post)
+    if normalized is None:
         return False
+    post_id, file_url, sample_url, preview_url, tags, rating, score = normalized
 
     async with connect_db() as db:
         try:
             await db.execute("""
-                INSERT INTO favorites (user_id, post_id, file_url, tags, rating, score)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO post_cache
+                (post_id, file_url, sample_url, preview_url, tags, rating, score, cached_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(post_id) DO UPDATE SET
+                    file_url = COALESCE(NULLIF(excluded.file_url, ''), post_cache.file_url),
+                    sample_url = COALESCE(NULLIF(excluded.sample_url, ''), post_cache.sample_url),
+                    preview_url = COALESCE(NULLIF(excluded.preview_url, ''), post_cache.preview_url),
+                    tags = COALESCE(NULLIF(excluded.tags, ''), post_cache.tags),
+                    rating = COALESCE(NULLIF(excluded.rating, ''), post_cache.rating),
+                    score = CASE WHEN excluded.score != 0 THEN excluded.score ELSE post_cache.score END,
+                    cached_at = CURRENT_TIMESTAMP
+            """, normalized)
+            await db.execute("""
+                INSERT INTO favorites
+                (user_id, post_id, file_url, sample_url, preview_url, tags, rating, score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 user_id,
-                int(post_id),
-                post.get("file_url", ""),
-                post.get("tags", ""),
-                post.get("rating", ""),
-                int(post.get("score", 0) or 0),
+                post_id,
+                file_url,
+                sample_url,
+                preview_url,
+                tags,
+                rating,
+                score,
             ))
             await db.commit()
             return True
@@ -651,24 +919,52 @@ async def get_favorites(
 ) -> List[Dict[str, Any]]:
     async with connect_db() as db:
         cursor = await db.execute("""
-            SELECT post_id, file_url, tags, rating, score, added_at
+            SELECT
+                f.post_id,
+                COALESCE(NULLIF(pc.file_url, ''), f.file_url),
+                COALESCE(NULLIF(pc.sample_url, ''), f.sample_url),
+                COALESCE(NULLIF(pc.preview_url, ''), f.preview_url),
+                COALESCE(NULLIF(pc.tags, ''), f.tags),
+                COALESCE(NULLIF(pc.rating, ''), f.rating),
+                COALESCE(pc.score, f.score),
+                f.added_at
             FROM favorites
+            f LEFT JOIN post_cache pc ON pc.post_id = f.post_id
             WHERE user_id = ?
             ORDER BY added_at DESC
             LIMIT ? OFFSET ?
         """, (user_id, limit, offset))
         rows = await cursor.fetchall()
-        return [
-            {
-                "id": row[0],
-                "file_url": row[1],
-                "tags": row[2],
-                "rating": row[3],
-                "score": row[4],
-                "added_at": row[5],
-            }
-            for row in rows
-        ]
+        posts = []
+        for row in rows:
+            post = _post_from_row(row)
+            post["added_at"] = row[7]
+            posts.append(post)
+        return posts
+
+
+async def get_favorite(user_id: int, post_id: int) -> Optional[Dict[str, Any]]:
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            SELECT
+                f.post_id,
+                COALESCE(NULLIF(pc.file_url, ''), f.file_url),
+                COALESCE(NULLIF(pc.sample_url, ''), f.sample_url),
+                COALESCE(NULLIF(pc.preview_url, ''), f.preview_url),
+                COALESCE(NULLIF(pc.tags, ''), f.tags),
+                COALESCE(NULLIF(pc.rating, ''), f.rating),
+                COALESCE(pc.score, f.score),
+                f.added_at
+            FROM favorites f
+            LEFT JOIN post_cache pc ON pc.post_id = f.post_id
+            WHERE f.user_id = ? AND f.post_id = ?
+        """, (user_id, post_id))
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        post = _post_from_row(row)
+        post["added_at"] = row[7]
+        return post
 
 
 async def count_favorites(user_id: int) -> int:
@@ -682,24 +978,40 @@ async def count_favorites(user_id: int) -> int:
 
 
 async def add_subscription_post(user_id: int, query: str, post: Dict[str, Any]) -> bool:
-    post_id = post.get("id")
-    if post_id is None:
+    normalized = _normalize_post(post)
+    if normalized is None:
         return False
+    post_id, file_url, sample_url, preview_url, tags, rating, score = normalized
 
     async with connect_db() as db:
         try:
             await db.execute("""
+                INSERT INTO post_cache
+                (post_id, file_url, sample_url, preview_url, tags, rating, score, cached_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(post_id) DO UPDATE SET
+                    file_url = COALESCE(NULLIF(excluded.file_url, ''), post_cache.file_url),
+                    sample_url = COALESCE(NULLIF(excluded.sample_url, ''), post_cache.sample_url),
+                    preview_url = COALESCE(NULLIF(excluded.preview_url, ''), post_cache.preview_url),
+                    tags = COALESCE(NULLIF(excluded.tags, ''), post_cache.tags),
+                    rating = COALESCE(NULLIF(excluded.rating, ''), post_cache.rating),
+                    score = CASE WHEN excluded.score != 0 THEN excluded.score ELSE post_cache.score END,
+                    cached_at = CURRENT_TIMESTAMP
+            """, normalized)
+            await db.execute("""
                 INSERT INTO subscription_posts
-                (user_id, query, post_id, file_url, tags, rating, score)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (user_id, query, post_id, file_url, sample_url, preview_url, tags, rating, score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 user_id,
                 query.strip(),
-                int(post_id),
-                post.get("file_url", ""),
-                post.get("tags", ""),
-                post.get("rating", ""),
-                int(post.get("score", 0) or 0),
+                post_id,
+                file_url,
+                sample_url,
+                preview_url,
+                tags,
+                rating,
+                score,
             ))
             await db.commit()
             return True
@@ -710,27 +1022,31 @@ async def add_subscription_post(user_id: int, query: str, post: Dict[str, Any]) 
 async def get_subscription_posts(user_id: int, query: str, limit: int = 50) -> List[Dict[str, Any]]:
     async with connect_db() as db:
         cursor = await db.execute("""
-            SELECT sp.post_id, sp.file_url, sp.tags, sp.rating, sp.score, sp.sent_at
+            SELECT
+                sp.post_id,
+                COALESCE(NULLIF(pc.file_url, ''), sp.file_url),
+                COALESCE(NULLIF(pc.sample_url, ''), sp.sample_url),
+                COALESCE(NULLIF(pc.preview_url, ''), sp.preview_url),
+                COALESCE(NULLIF(pc.tags, ''), sp.tags),
+                COALESCE(NULLIF(pc.rating, ''), sp.rating),
+                COALESCE(pc.score, sp.score),
+                sp.sent_at
             FROM subscription_posts sp
             INNER JOIN favorites f
                 ON f.user_id = sp.user_id
                 AND f.post_id = sp.post_id
+            LEFT JOIN post_cache pc ON pc.post_id = sp.post_id
             WHERE sp.user_id = ? AND sp.query = ?
             ORDER BY sp.sent_at DESC
             LIMIT ?
         """, (user_id, query.strip(), limit))
         rows = await cursor.fetchall()
-        return [
-            {
-                "id": row[0],
-                "file_url": row[1],
-                "tags": row[2],
-                "rating": row[3],
-                "score": row[4],
-                "sent_at": row[5],
-            }
-            for row in rows
-        ]
+        posts = []
+        for row in rows:
+            post = _post_from_row(row)
+            post["sent_at"] = row[7]
+            posts.append(post)
+        return posts
 
 
 async def remove_subscription_post(user_id: int, query: str, post_id: int) -> bool:
