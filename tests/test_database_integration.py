@@ -47,6 +47,34 @@ class SubscriptionClaimTests(TempDatabaseTestCase):
         self.assertTrue(await database.update_subscription_time(1, "tag", token))
         self.assertIsNone(await database.claim_due_subscription(1, "tag"))
 
+    async def test_pause_all_active_subscriptions_defers_due_work(self):
+        self.assertTrue(await database.add_subscription(1, "tag-a", 10))
+        self.assertTrue(await database.add_subscription(1, "tag-b", 10))
+        self.assertTrue(await database.add_subscription(2, "other-user", 10))
+
+        paused = await database.pause_all_active_subscriptions(1, 60)
+
+        self.assertEqual(paused, 2)
+        due = await database.get_due_subscriptions()
+        self.assertNotIn((1, "tag-a", 10, 0), due)
+        self.assertNotIn((1, "tag-b", 10, 0), due)
+        self.assertIn((2, "other-user", 10, 0), due)
+
+    async def test_new_subscription_inherits_active_pause_until_resume(self):
+        paused = await database.pause_all_active_subscriptions(1, 60)
+        self.assertEqual(paused, 0)
+        self.assertIsNotNone(await database.get_subscription_pause_until(1))
+
+        self.assertTrue(await database.add_subscription(1, "paused-new", 10))
+        due = await database.get_due_subscriptions()
+        self.assertNotIn((1, "paused-new", 10, 0), due)
+
+        resumed = await database.resume_all_active_subscriptions(1)
+        self.assertEqual(resumed, 1)
+        self.assertIsNone(await database.get_subscription_pause_until(1))
+        due = await database.get_due_subscriptions()
+        self.assertIn((1, "paused-new", 10, 0), due)
+
 
 class RetentionTests(TempDatabaseTestCase):
     async def test_search_history_retention_is_per_user(self):
@@ -145,6 +173,34 @@ class PostCacheTests(TempDatabaseTestCase):
             await db.commit()
 
         self.assertTrue(await database.is_subscription_cache_stale(1, "tag"))
+
+    async def test_get_favorites_without_limit_returns_all_saved_posts(self):
+        for post_id in range(12):
+            self.assertTrue(await database.add_favorite(1, {
+                "id": post_id,
+                "file_url": f"https://example.test/{post_id}.jpg",
+                "tags": "keep",
+            }))
+
+        favorites = await database.get_favorites(1, limit=None)
+        tagged = await database.get_favorites(1, limit=None, tag_filter="keep")
+
+        self.assertEqual(len(favorites), 12)
+        self.assertEqual(len(tagged), 12)
+
+    async def test_get_subscription_posts_without_limit_returns_all_saved_posts(self):
+        for post_id in range(55):
+            post = {
+                "id": post_id,
+                "file_url": f"https://example.test/{post_id}.jpg",
+                "tags": "subtag",
+            }
+            self.assertTrue(await database.add_favorite(1, post))
+            self.assertTrue(await database.add_subscription_post(1, "sub", post))
+
+        posts = await database.get_subscription_posts(1, "sub")
+
+        self.assertEqual(len(posts), 55)
 
 
 if __name__ == "__main__":

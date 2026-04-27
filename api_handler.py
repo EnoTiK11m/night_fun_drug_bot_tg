@@ -20,6 +20,10 @@ API_SEARCH_TIMEOUT_SECONDS = 45
 INTERACTIVE_PAGE_LIMIT = 250
 INTERACTIVE_SEARCH_TIMEOUT_SECONDS = 35
 INTERACTIVE_MAX_PAGES_PER_SEARCH = 5
+GLOBAL_RANDOM_PAGE_LIMIT = 50
+GLOBAL_RANDOM_MAX_PAGE = 200
+GLOBAL_RANDOM_MAX_ATTEMPTS = 3
+GLOBAL_RANDOM_TIMEOUT_SECONDS = 15
 SUBSCRIPTION_CACHE_SEARCH_TIMEOUT_SECONDS = 120
 INTERACTIVE_REQUEST_CONCURRENCY = 2
 BACKGROUND_REQUEST_CONCURRENCY = 1
@@ -86,9 +90,14 @@ class rule34API:
         params.update(kwargs)
         return params
 
-    def _build_search_tags(self, tags: str, blacklist: Set[str]) -> str:
-        """Построить строку тегов с учётом blacklist"""
-        if not tags.strip():
+    def _build_search_tags(
+        self,
+        tags: str,
+        blacklist: Set[str],
+        allow_blacklist_only: bool = False
+    ) -> str:
+        """Построить строку тегов с учётом blacklist."""
+        if not tags.strip() and not allow_blacklist_only:
             return ""
 
         # Комбинируем пользовательский blacklist с дефолтным
@@ -131,7 +140,8 @@ class rule34API:
         limit: int = DEFAULT_LIMIT,
         pid: int = 0,
         timeout: int = API_SEARCH_TIMEOUT_SECONDS,
-        request_kind: str = "interactive"
+        request_kind: str = "interactive",
+        allow_blacklist_only: bool = False
     ) -> Optional[List[Dict]]:
         """
         Поиск постов
@@ -141,10 +151,16 @@ class rule34API:
         # Ограничиваем лимит
         limit = min(limit, MAX_POSTS_PER_REQUEST)
 
-        search_tags = self._build_search_tags(tags, blacklist)
+        search_tags = self._build_search_tags(
+            tags,
+            blacklist,
+            allow_blacklist_only=allow_blacklist_only,
+        )
 
         # Если после blacklist не осталось тегов для поиска
-        if not search_tags or search_tags.startswith('-'):
+        if not search_tags or (
+            search_tags.startswith('-') and not allow_blacklist_only
+        ):
             return None
 
         params = self._build_params(
@@ -230,7 +246,8 @@ class rule34API:
                 limit=INTERACTIVE_PAGE_LIMIT,
                 pid=pid,
                 timeout=INTERACTIVE_SEARCH_TIMEOUT_SECONDS,
-                request_kind="interactive"
+                request_kind="interactive",
+                allow_blacklist_only=not tags.strip(),
             )
 
             if not posts:
@@ -252,6 +269,59 @@ class rule34API:
             scanned_pages += 1
 
         logger.debug("Interactive search stopped after %s pages", scanned_pages)
+        return None
+
+    async def get_global_random_image(
+        self,
+        blacklist: Set[str],
+        excluded_post_ids: Optional[Set[int]] = None
+    ) -> Optional[Dict]:
+        """Получить лёгкий случайный пост без поисковых тегов."""
+        logger.debug("get_global_random_image called")
+        excluded_post_ids = excluded_post_ids or set()
+
+        tried_pids: Set[int] = set()
+        for attempt in range(GLOBAL_RANDOM_MAX_ATTEMPTS):
+            pid = random.randint(0, GLOBAL_RANDOM_MAX_PAGE)
+            while pid in tried_pids and len(tried_pids) <= GLOBAL_RANDOM_MAX_PAGE:
+                pid = random.randint(0, GLOBAL_RANDOM_MAX_PAGE)
+            tried_pids.add(pid)
+
+            posts = await self.search(
+                tags="",
+                blacklist=blacklist,
+                limit=GLOBAL_RANDOM_PAGE_LIMIT,
+                pid=pid,
+                timeout=GLOBAL_RANDOM_TIMEOUT_SECONDS,
+                request_kind="interactive",
+                allow_blacklist_only=True,
+            )
+
+            if not posts:
+                logger.debug("No global random posts found on page %s", pid)
+                continue
+
+            valid_posts = [
+                post for post in posts
+                if post.get("file_url") and self._post_id(post) not in excluded_post_ids
+            ]
+            if valid_posts:
+                selected_post = random.choice(valid_posts)
+                logger.debug(
+                    "Selected global random post ID %s from page %s attempt %s/%s",
+                    selected_post.get("id"),
+                    pid,
+                    attempt + 1,
+                    GLOBAL_RANDOM_MAX_ATTEMPTS,
+                )
+                return selected_post
+
+            logger.debug("All global random posts on page %s were already shown", pid)
+
+        logger.debug(
+            "Global random search stopped after %s attempts",
+            GLOBAL_RANDOM_MAX_ATTEMPTS,
+        )
         return None
 
     async def get_next_image(

@@ -92,6 +92,38 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         query.edit_message_text.assert_not_awaited()
         query.message.reply_text.assert_awaited_once()
 
+    async def test_post_tags_button_replies_with_full_tags(self):
+        post = {"id": "123", "tags": "alpha beta gamma"}
+        update, query = make_callback_update("post_tags_123")
+
+        with patch.object(bot, "get_known_post", AsyncMock(return_value=post)):
+            await bot.button_handler(update, SimpleNamespace())
+
+        query.message.reply_text.assert_awaited_once()
+        text = query.message.reply_text.await_args.args[0]
+        self.assertIn("• `alpha`", text)
+        self.assertIn("• `beta`", text)
+
+    def test_tags_button_can_be_hidden_from_image_keyboard(self):
+        visible_keyboard = bot.get_image_keyboard(123, show_tags_button=True)
+        hidden_keyboard = bot.get_image_keyboard(123, show_tags_button=False)
+
+        visible_callbacks = [
+            button.callback_data
+            for row in visible_keyboard.inline_keyboard
+            for button in row
+            if button.callback_data
+        ]
+        hidden_callbacks = [
+            button.callback_data
+            for row in hidden_keyboard.inline_keyboard
+            for button in row
+            if button.callback_data
+        ]
+
+        self.assertIn("post_tags_123", visible_callbacks)
+        self.assertNotIn("post_tags_123", hidden_callbacks)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,7 @@ import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiosqlite
@@ -16,6 +17,8 @@ SEARCH_HISTORY_RETENTION_PER_USER = 200
 SUBSCRIPTION_CLAIM_MINUTES = 5
 SUBSCRIPTION_CACHE_TTL_MINUTES = 60
 SUBSCRIPTION_CACHE_MIN_AVAILABLE = 20
+SUBSCRIPTION_PAUSE_SETTING = "subscription_pause_until"
+SQLITE_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 @asynccontextmanager
@@ -576,6 +579,7 @@ async def get_user_settings(user_id: int) -> Dict[str, Any]:
                 except json.JSONDecodeError:
                     logger.warning("Invalid settings JSON for user %s", user_id)
 
+            settings.setdefault("show_tags_button", True)
             return settings
 
         default_settings = {
@@ -586,6 +590,7 @@ async def get_user_settings(user_id: int) -> Dict[str, Any]:
             "show_score": True,
             "show_rating": True,
             "show_tags": True,
+            "show_tags_button": True,
         }
         await save_user_settings(user_id, default_settings)
         return default_settings
@@ -638,9 +643,62 @@ async def update_user_setting(user_id: int, setting_name: str, value: Any):
     await save_user_settings(user_id, settings)
 
 
+def _parse_sqlite_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, SQLITE_TIMESTAMP_FORMAT)
+    except ValueError:
+        logger.warning("Invalid SQLite timestamp value: %s", value)
+        return None
+
+
+async def _get_settings_json(db, user_id: int) -> Dict[str, Any]:
+    cursor = await db.execute(
+        "SELECT settings_json FROM user_settings WHERE user_id = ?",
+        (user_id,),
+    )
+    row = await cursor.fetchone()
+    if not row or not row[0]:
+        return {}
+    try:
+        return json.loads(row[0])
+    except json.JSONDecodeError:
+        logger.warning("Invalid settings JSON for user %s", user_id)
+        return {}
+
+
+async def _save_settings_json(db, user_id: int, settings_json: Dict[str, Any]):
+    await db.execute("""
+        INSERT INTO user_settings (user_id, settings_json)
+        VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET settings_json = excluded.settings_json
+    """, (user_id, json.dumps(settings_json)))
+
+
+async def _get_active_subscription_pause_until(db, user_id: int) -> Optional[str]:
+    settings_json = await _get_settings_json(db, user_id)
+    pause_until = settings_json.get(SUBSCRIPTION_PAUSE_SETTING)
+    pause_until_dt = _parse_sqlite_timestamp(pause_until)
+    if pause_until_dt and pause_until_dt > datetime.now(UTC).replace(tzinfo=None):
+        return pause_until
+    if pause_until:
+        settings_json.pop(SUBSCRIPTION_PAUSE_SETTING, None)
+        await _save_settings_json(db, user_id, settings_json)
+    return None
+
+
+async def get_subscription_pause_until(user_id: int) -> Optional[str]:
+    async with connect_db() as db:
+        pause_until = await _get_active_subscription_pause_until(db, user_id)
+        await db.commit()
+        return pause_until
+
+
 async def add_subscription(user_id: int, query: str, interval_minutes: int = 10) -> bool:
     async with connect_db() as db:
         try:
+            pause_until = await _get_active_subscription_pause_until(db, user_id)
             await db.execute("""
                 INSERT OR REPLACE INTO subscriptions
                 (
@@ -648,8 +706,11 @@ async def add_subscription(user_id: int, query: str, interval_minutes: int = 10)
                     no_new_posts_count, last_empty_at, next_check_at, exhausted_notified,
                     processing_until, processing_token
                 )
-                VALUES (?, ?, ?, 1, datetime('now', '-1 hour'), 0, NULL, datetime('now'), 0, NULL, NULL)
-            """, (user_id, query.strip(), interval_minutes))
+                VALUES (
+                    ?, ?, ?, 1, datetime('now', '-1 hour'), 0, NULL,
+                    COALESCE(?, datetime('now')), 0, NULL, NULL
+                )
+            """, (user_id, query.strip(), interval_minutes, pause_until))
             await db.commit()
             return True
         except Exception as e:
@@ -773,6 +834,48 @@ async def update_subscription_interval(user_id: int, query: str, interval_minute
         """, (interval_minutes, interval_minutes, user_id, query.strip()))
         await db.commit()
         return cursor.rowcount > 0
+
+
+async def pause_all_active_subscriptions(user_id: int, pause_minutes: int) -> int:
+    async with connect_db() as db:
+        pause_until = (
+            datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=pause_minutes)
+        ).strftime(SQLITE_TIMESTAMP_FORMAT)
+        settings_json = await _get_settings_json(db, user_id)
+        settings_json[SUBSCRIPTION_PAUSE_SETTING] = pause_until
+        await _save_settings_json(db, user_id, settings_json)
+        cursor = await db.execute("""
+            UPDATE subscriptions
+            SET next_check_at = CASE
+                    WHEN datetime(COALESCE(next_check_at, last_sent)) >
+                         datetime(?)
+                    THEN next_check_at
+                    ELSE ?
+                END,
+                processing_until = NULL,
+                processing_token = NULL
+            WHERE user_id = ?
+              AND is_active = 1
+        """, (pause_until, pause_until, user_id))
+        await db.commit()
+        return cursor.rowcount
+
+
+async def resume_all_active_subscriptions(user_id: int) -> int:
+    async with connect_db() as db:
+        settings_json = await _get_settings_json(db, user_id)
+        settings_json.pop(SUBSCRIPTION_PAUSE_SETTING, None)
+        await _save_settings_json(db, user_id, settings_json)
+        cursor = await db.execute("""
+            UPDATE subscriptions
+            SET next_check_at = datetime('now'),
+                processing_until = NULL,
+                processing_token = NULL
+            WHERE user_id = ?
+              AND is_active = 1
+        """, (user_id,))
+        await db.commit()
+        return cursor.rowcount
 
 
 async def get_due_subscriptions() -> List[Tuple[int, str, int, int]]:
@@ -915,10 +1018,28 @@ async def remove_favorite(user_id: int, post_id: int) -> bool:
 
 
 async def get_favorites(
-    user_id: int, limit: int = 10, offset: int = 0
+    user_id: int,
+    limit: Optional[int] = 10,
+    offset: int = 0,
+    tag_filter: str = "",
 ) -> List[Dict[str, Any]]:
+    tag_filter = tag_filter.strip().lower()
+    tag_where = ""
+    params: list[Any] = [user_id]
+    if tag_filter:
+        tag_where = """
+            AND lower(' ' || COALESCE(NULLIF(pc.tags, ''), f.tags) || ' ')
+                LIKE ?
+        """
+        params.append(f"% {tag_filter} %")
+
+    limit_clause = ""
+    if limit is not None:
+        limit_clause = "LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
     async with connect_db() as db:
-        cursor = await db.execute("""
+        cursor = await db.execute(f"""
             SELECT
                 f.post_id,
                 COALESCE(NULLIF(pc.file_url, ''), f.file_url),
@@ -931,9 +1052,10 @@ async def get_favorites(
             FROM favorites
             f LEFT JOIN post_cache pc ON pc.post_id = f.post_id
             WHERE user_id = ?
+            {tag_where}
             ORDER BY added_at DESC
-            LIMIT ? OFFSET ?
-        """, (user_id, limit, offset))
+            {limit_clause}
+        """, tuple(params))
         rows = await cursor.fetchall()
         posts = []
         for row in rows:
@@ -967,12 +1089,25 @@ async def get_favorite(user_id: int, post_id: int) -> Optional[Dict[str, Any]]:
         return post
 
 
-async def count_favorites(user_id: int) -> int:
+async def count_favorites(user_id: int, tag_filter: str = "") -> int:
+    tag_filter = tag_filter.strip().lower()
+    tag_where = ""
+    params: list[Any] = [user_id]
+    if tag_filter:
+        tag_where = """
+            AND lower(' ' || COALESCE(NULLIF(pc.tags, ''), f.tags) || ' ')
+                LIKE ?
+        """
+        params.append(f"% {tag_filter} %")
+
     async with connect_db() as db:
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM favorites WHERE user_id = ?",
-            (user_id,),
-        )
+        cursor = await db.execute(f"""
+            SELECT COUNT(*)
+            FROM favorites f
+            LEFT JOIN post_cache pc ON pc.post_id = f.post_id
+            WHERE user_id = ?
+            {tag_where}
+        """, tuple(params))
         row = await cursor.fetchone()
         return int(row[0] or 0)
 
@@ -1019,9 +1154,17 @@ async def add_subscription_post(user_id: int, query: str, post: Dict[str, Any]) 
             return False
 
 
-async def get_subscription_posts(user_id: int, query: str, limit: int = 50) -> List[Dict[str, Any]]:
+async def get_subscription_posts(
+    user_id: int, query: str, limit: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    params: list[Any] = [user_id, query.strip()]
+    limit_clause = ""
+    if limit is not None:
+        limit_clause = "LIMIT ?"
+        params.append(limit)
+
     async with connect_db() as db:
-        cursor = await db.execute("""
+        cursor = await db.execute(f"""
             SELECT
                 sp.post_id,
                 COALESCE(NULLIF(pc.file_url, ''), sp.file_url),
@@ -1038,8 +1181,8 @@ async def get_subscription_posts(user_id: int, query: str, limit: int = 50) -> L
             LEFT JOIN post_cache pc ON pc.post_id = sp.post_id
             WHERE sp.user_id = ? AND sp.query = ?
             ORDER BY sp.sent_at DESC
-            LIMIT ?
-        """, (user_id, query.strip(), limit))
+            {limit_clause}
+        """, tuple(params))
         rows = await cursor.fetchall()
         posts = []
         for row in rows:

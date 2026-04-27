@@ -1,6 +1,6 @@
 import unittest
 
-from bot import md_code, md_text
+from bot import build_full_tags_messages, md_code, md_text
 
 
 class MarkdownEscapingTests(unittest.TestCase):
@@ -29,6 +29,16 @@ class MarkdownEscapingTests(unittest.TestCase):
 
     def test_md_text_decodes_html_entities_before_escaping(self):
         self.assertEqual(md_text("girls&#039;_frontline"), r"girls'\_frontline")
+
+    def test_full_tags_message_splits_tags_line_by_line(self):
+        messages = build_full_tags_messages(
+            {"id": 123, "tags": "tag_one girls&#039;_frontline bad`tag"}
+        )
+
+        self.assertEqual(len(messages), 1)
+        self.assertIn("• `tag_one`", messages[0])
+        self.assertIn("• `girls'_frontline`", messages[0])
+        self.assertIn("• `bad'tag`", messages[0])
 
 
 if __name__ == "__main__":
