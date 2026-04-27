@@ -19,6 +19,25 @@ SUBSCRIPTION_CACHE_TTL_MINUTES = 60
 SUBSCRIPTION_CACHE_MIN_AVAILABLE = 20
 SUBSCRIPTION_PAUSE_SETTING = "subscription_pause_until"
 SQLITE_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+MAIN_SETTING_FIELDS = (
+    "show_caption",
+    "show_search_query",
+    "show_subscription_label",
+    "show_id",
+    "show_score",
+    "show_rating",
+    "show_tags",
+)
+DEFAULT_USER_SETTINGS = {
+    "show_caption": True,
+    "show_search_query": True,
+    "show_subscription_label": True,
+    "show_id": True,
+    "show_score": True,
+    "show_rating": True,
+    "show_tags": True,
+    "show_tags_button": True,
+}
 
 
 @asynccontextmanager
@@ -216,6 +235,16 @@ async def init_db():
                 show_rating BOOLEAN DEFAULT 1,
                 show_tags BOOLEAN DEFAULT 1,
                 settings_json TEXT DEFAULT '{}'
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS callback_payloads (
+                action TEXT NOT NULL,
+                token TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (action, token)
             )
         """)
 
@@ -562,7 +591,8 @@ async def get_user_settings(user_id: int) -> Dict[str, Any]:
         row = await cursor.fetchone()
 
         if row:
-            settings = {
+            settings = DEFAULT_USER_SETTINGS.copy()
+            settings.update({
                 "show_caption": bool(row[1]),
                 "show_search_query": bool(row[2]),
                 "show_subscription_label": bool(row[3]),
@@ -570,7 +600,7 @@ async def get_user_settings(user_id: int) -> Dict[str, Any]:
                 "show_score": bool(row[5]),
                 "show_rating": bool(row[6]),
                 "show_tags": bool(row[7]),
-            }
+            })
 
             if row[8]:
                 try:
@@ -579,60 +609,59 @@ async def get_user_settings(user_id: int) -> Dict[str, Any]:
                 except json.JSONDecodeError:
                     logger.warning("Invalid settings JSON for user %s", user_id)
 
-            settings.setdefault("show_tags_button", True)
             return settings
 
-        default_settings = {
-            "show_caption": True,
-            "show_search_query": True,
-            "show_subscription_label": True,
-            "show_id": True,
-            "show_score": True,
-            "show_rating": True,
-            "show_tags": True,
-            "show_tags_button": True,
-        }
+        default_settings = DEFAULT_USER_SETTINGS.copy()
         await save_user_settings(user_id, default_settings)
         return default_settings
 
 
 async def save_user_settings(user_id: int, settings: Dict[str, Any]):
     async with connect_db() as db:
-        main_settings = {}
-        json_settings = {}
-        main_fields = [
-            "show_caption",
-            "show_search_query",
-            "show_subscription_label",
-            "show_id",
-            "show_score",
-            "show_rating",
-            "show_tags",
-        ]
+        merged_settings = DEFAULT_USER_SETTINGS.copy()
+        cursor = await db.execute(
+            "SELECT * FROM user_settings WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        if row:
+            merged_settings.update({
+                "show_caption": bool(row[1]),
+                "show_search_query": bool(row[2]),
+                "show_subscription_label": bool(row[3]),
+                "show_id": bool(row[4]),
+                "show_score": bool(row[5]),
+                "show_rating": bool(row[6]),
+                "show_tags": bool(row[7]),
+            })
+            if row[8]:
+                try:
+                    merged_settings.update(json.loads(row[8]))
+                except json.JSONDecodeError:
+                    logger.warning("Invalid settings JSON for user %s", user_id)
 
-        for key, value in settings.items():
-            if key in main_fields:
-                main_settings[key] = value
-            else:
-                json_settings[key] = value
-
-        if main_settings:
-            await db.execute("""
-                INSERT OR REPLACE INTO user_settings
-                (user_id, show_caption, show_search_query, show_subscription_label,
-                 show_id, show_score, show_rating, show_tags, settings_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                user_id,
-                main_settings.get("show_caption", True),
-                main_settings.get("show_search_query", True),
-                main_settings.get("show_subscription_label", True),
-                main_settings.get("show_id", True),
-                main_settings.get("show_score", True),
-                main_settings.get("show_rating", True),
-                main_settings.get("show_tags", True),
-                json.dumps(json_settings),
-            ))
+        merged_settings.update(settings)
+        json_settings = {
+            key: value
+            for key, value in merged_settings.items()
+            if key not in MAIN_SETTING_FIELDS
+        }
+        await db.execute("""
+            INSERT OR REPLACE INTO user_settings
+            (user_id, show_caption, show_search_query, show_subscription_label,
+             show_id, show_score, show_rating, show_tags, settings_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            bool(merged_settings["show_caption"]),
+            bool(merged_settings["show_search_query"]),
+            bool(merged_settings["show_subscription_label"]),
+            bool(merged_settings["show_id"]),
+            bool(merged_settings["show_score"]),
+            bool(merged_settings["show_rating"]),
+            bool(merged_settings["show_tags"]),
+            json.dumps(json_settings),
+        ))
 
         await db.commit()
 
@@ -1053,7 +1082,7 @@ async def get_favorites(
             f LEFT JOIN post_cache pc ON pc.post_id = f.post_id
             WHERE user_id = ?
             {tag_where}
-            ORDER BY added_at DESC
+            ORDER BY added_at DESC, f.post_id DESC
             {limit_clause}
         """, tuple(params))
         rows = await cursor.fetchall()
@@ -1063,6 +1092,20 @@ async def get_favorites(
             post["added_at"] = row[7]
             posts.append(post)
         return posts
+
+
+async def get_favorite_by_index(
+    user_id: int,
+    index: int,
+    tag_filter: str = "",
+) -> Optional[Dict[str, Any]]:
+    posts = await get_favorites(
+        user_id,
+        limit=1,
+        offset=max(0, index),
+        tag_filter=tag_filter,
+    )
+    return posts[0] if posts else None
 
 
 async def get_favorite(user_id: int, post_id: int) -> Optional[Dict[str, Any]]:
@@ -1155,13 +1198,16 @@ async def add_subscription_post(user_id: int, query: str, post: Dict[str, Any]) 
 
 
 async def get_subscription_posts(
-    user_id: int, query: str, limit: Optional[int] = None
+    user_id: int,
+    query: str,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> List[Dict[str, Any]]:
     params: list[Any] = [user_id, query.strip()]
     limit_clause = ""
     if limit is not None:
-        limit_clause = "LIMIT ?"
-        params.append(limit)
+        limit_clause = "LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
 
     async with connect_db() as db:
         cursor = await db.execute(f"""
@@ -1180,7 +1226,7 @@ async def get_subscription_posts(
                 AND f.post_id = sp.post_id
             LEFT JOIN post_cache pc ON pc.post_id = sp.post_id
             WHERE sp.user_id = ? AND sp.query = ?
-            ORDER BY sp.sent_at DESC
+            ORDER BY sp.sent_at DESC, sp.post_id DESC
             {limit_clause}
         """, tuple(params))
         rows = await cursor.fetchall()
@@ -1190,6 +1236,50 @@ async def get_subscription_posts(
             post["sent_at"] = row[7]
             posts.append(post)
         return posts
+
+
+async def count_subscription_posts(user_id: int, query: str) -> int:
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            SELECT COUNT(*)
+            FROM subscription_posts sp
+            INNER JOIN favorites f
+                ON f.user_id = sp.user_id
+                AND f.post_id = sp.post_id
+            WHERE sp.user_id = ? AND sp.query = ?
+        """, (user_id, query.strip()))
+        row = await cursor.fetchone()
+        return int(row[0] or 0)
+
+
+async def get_subscription_queries_for_post(user_id: int, post_id: int) -> List[str]:
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            SELECT DISTINCT sc.query
+            FROM subscription_cache sc
+            INNER JOIN subscriptions s
+                ON s.user_id = sc.user_id
+                AND s.query = sc.query
+            WHERE sc.user_id = ?
+              AND sc.post_id = ?
+            ORDER BY sc.query
+        """, (user_id, post_id))
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+
+async def get_subscription_post_by_index(
+    user_id: int,
+    query: str,
+    index: int,
+) -> Optional[Dict[str, Any]]:
+    posts = await get_subscription_posts(
+        user_id,
+        query,
+        limit=1,
+        offset=max(0, index),
+    )
+    return posts[0] if posts else None
 
 
 async def remove_subscription_post(user_id: int, query: str, post_id: int) -> bool:

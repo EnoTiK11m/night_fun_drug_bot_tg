@@ -124,6 +124,5 @@ class SearchFlowTests(unittest.IsolatedAsyncioTestCase):
         save_user_query.assert_not_awaited()
         mark_sent.assert_awaited_once_with(1, 123)
 
-
 if __name__ == "__main__":
     unittest.main()

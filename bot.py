@@ -1,11 +1,8 @@
 ﻿import logging
 import asyncio
-import hashlib
 import time
 import random
 import os
-from datetime import UTC, datetime
-from html import unescape
 from logging.handlers import RotatingFileHandler
 from telegram import (
     Update,
@@ -27,9 +24,32 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.helpers import escape_markdown
 from telegram.error import BadRequest
 from config import BOT_TOKEN, SEARCH_COOLDOWN_SECONDS, validate_config
+from bot_formatting import (
+    FAVORITES_PAGE_SIZE,
+    SQLITE_TIMESTAMP_FORMAT,
+    build_caption,
+    build_favorites_gallery_caption,
+    build_full_tags_messages,
+    build_subscription_gallery_caption,
+    clamp_page,
+    format_pause_duration,
+    format_remaining_pause,
+    md_code,
+    md_text,
+    parse_pause_minutes,
+    parse_subscription_interval,
+)
+from bot_state import (
+    get_callback_payload,
+    get_callback_payload_by_token,
+    get_remembered_post,
+    minimal_post,
+    recent_posts,
+    remember_post,
+    store_callback_payload,
+)
 from database import (
     init_db,
     get_user_blacklist,
@@ -66,9 +86,13 @@ from database import (
     remove_favorite,
     get_favorite,
     get_favorites,
+    get_favorite_by_index,
     count_favorites,
     add_subscription_post,
     get_subscription_posts,
+    count_subscription_posts,
+    get_subscription_queries_for_post,
+    get_subscription_post_by_index,
     remove_subscription_post,
 )
 from api_handler import api, APITemporaryError
@@ -135,100 +159,9 @@ logger = logging.getLogger(__name__)
 user_states = {}
 # Глобальная задача для подписок
 subscription_task = None
-callback_payloads = {}
-recent_posts = {}
 user_last_search_at = {}
-CALLBACK_TTL_SECONDS = 24 * 60 * 60
-RECENT_POST_TTL_SECONDS = 6 * 60 * 60
-RECENT_POST_MAX_ITEMS = 2000
-MAX_CAPTION_LENGTH = 1024
-SUBSCRIPTION_MIN_INTERVAL = 1
-SUBSCRIPTION_MAX_INTERVAL = 120
-SUBSCRIPTION_DEFAULT_INTERVAL = 10
-FAVORITES_PAGE_SIZE = 10
 MEDIA_SEND_RETRIES = 2
 SUBSCRIPTION_CONCURRENCY = 5
-SQLITE_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
-
-
-def store_callback_payload(action: str, payload: str) -> str:
-    """Store large callback payloads behind compact Telegram callback_data."""
-    cleanup_callback_payloads()
-    token = hashlib.blake2s(
-        f"{action}:{payload}".encode("utf-8"), digest_size=8
-    ).hexdigest()
-    callback_payloads[(action, token)] = (payload, time.monotonic())
-    return f"{action}_{token}"
-
-
-def get_callback_payload(action: str, data: str) -> str:
-    cleanup_callback_payloads()
-    token = data.replace(f"{action}_", "", 1)
-    stored = callback_payloads.get((action, token))
-    return stored[0] if stored else ""
-
-
-def get_callback_payload_by_token(action: str, token: str) -> str:
-    cleanup_callback_payloads()
-    stored = callback_payloads.get((action, token))
-    return stored[0] if stored else ""
-
-
-def cleanup_callback_payloads():
-    now = time.monotonic()
-    expired = [
-        key
-        for key, (_, created_at) in callback_payloads.items()
-        if now - created_at > CALLBACK_TTL_SECONDS
-    ]
-    for key in expired:
-        callback_payloads.pop(key, None)
-
-
-def safe_int(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def remember_post(post: dict):
-    post_id = safe_int(post.get("id"))
-    if post_id is None:
-        return
-
-    now = time.monotonic()
-    recent_posts[post_id] = (dict(post), now)
-
-    if len(recent_posts) > RECENT_POST_MAX_ITEMS:
-        oldest = sorted(recent_posts.items(), key=lambda item: item[1][1])
-        for old_post_id, _ in oldest[: len(recent_posts) - RECENT_POST_MAX_ITEMS]:
-            recent_posts.pop(old_post_id, None)
-
-
-def get_remembered_post(post_id: int) -> dict | None:
-    item = recent_posts.get(post_id)
-    if not item:
-        return None
-
-    post, created_at = item
-    if time.monotonic() - created_at > RECENT_POST_TTL_SECONDS:
-        recent_posts.pop(post_id, None)
-        return None
-
-    return dict(post)
-
-
-def minimal_post(post_id: int) -> dict:
-    return {
-        "id": post_id,
-        "file_url": "",
-        "sample_url": "",
-        "preview_url": "",
-        "tags": "",
-        "rating": "",
-        "score": 0,
-    }
 
 
 async def remember_and_cache_post(post: dict):
@@ -238,20 +171,6 @@ async def remember_and_cache_post(post: dict):
 
 async def get_known_post(post_id: int) -> dict | None:
     return get_remembered_post(post_id) or await get_cached_post(post_id)
-
-
-def md_code(value) -> str:
-    return unescape(str(value)).replace("`", "'")
-
-
-def md_text(value) -> str:
-    return escape_markdown(unescape(str(value)), version=1)
-
-
-def clamp_caption(caption: str) -> str:
-    if len(caption) <= MAX_CAPTION_LENGTH:
-        return caption
-    return caption[: MAX_CAPTION_LENGTH - 3].rstrip() + "..."
 
 
 def is_rate_limited(user_id: int) -> bool:
@@ -265,98 +184,6 @@ def is_rate_limited(user_id: int) -> bool:
 
     user_last_search_at[user_id] = now
     return False
-
-
-def parse_subscription_interval(value: str) -> int:
-    if not value.isdigit():
-        return SUBSCRIPTION_DEFAULT_INTERVAL
-
-    interval = int(value)
-    return max(SUBSCRIPTION_MIN_INTERVAL, min(interval, SUBSCRIPTION_MAX_INTERVAL))
-
-
-def parse_pause_minutes(value: str) -> int:
-    parts = value.strip().lower().replace(",", ".").split()
-    if not parts:
-        return 60
-
-    raw_number = parts[0]
-    raw_unit = parts[1] if len(parts) > 1 else ""
-    suffixes = (
-        ("минут", 1),
-        ("мин", 1),
-        ("m", 1),
-        ("час", 60),
-        ("ч", 60),
-        ("h", 60),
-        ("день", 1440),
-        ("ден", 1440),
-        ("д", 1440),
-        ("d", 1440),
-    )
-
-    for suffix, multiplier in suffixes:
-        if raw_number.endswith(suffix):
-            raw_unit = suffix
-            raw_number = raw_number[: -len(suffix)]
-            break
-
-    try:
-        amount = float(raw_number)
-    except (TypeError, ValueError):
-        return 60
-
-    multiplier = 1
-    for suffix, candidate in suffixes:
-        if raw_unit.startswith(suffix):
-            multiplier = candidate
-            break
-
-    pause_minutes = round(amount * multiplier)
-    return max(1, min(pause_minutes, 10080))
-
-
-def format_pause_duration(minutes: int) -> str:
-    if minutes % 1440 == 0:
-        days = minutes // 1440
-        return f"{days} дн."
-    if minutes % 60 == 0:
-        hours = minutes // 60
-        return f"{hours} ч."
-    return f"{minutes} мин."
-
-
-def parse_pause_until(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.strptime(value, SQLITE_TIMESTAMP_FORMAT)
-    except ValueError:
-        logger.warning("Invalid subscription pause timestamp: %s", value)
-        return None
-
-
-def format_remaining_pause(pause_until: str | None) -> str:
-    pause_until_dt = parse_pause_until(pause_until)
-    if not pause_until_dt:
-        return ""
-
-    now = datetime.now(UTC).replace(tzinfo=None)
-    remaining_seconds = int((pause_until_dt - now).total_seconds())
-    if remaining_seconds <= 0:
-        return ""
-
-    minutes = max(1, (remaining_seconds + 59) // 60)
-    days, minutes = divmod(minutes, 1440)
-    hours, minutes = divmod(minutes, 60)
-    parts = []
-    if days:
-        parts.append(f"{days} дн.")
-    if hours:
-        parts.append(f"{hours} ч.")
-    if minutes and not days:
-        parts.append(f"{minutes} мин.")
-    return " ".join(parts)
 
 
 async def build_main_menu_text(user_id: int) -> str:
@@ -384,13 +211,6 @@ async def build_subscription_added_text(query: str, interval: int, user_id: int)
     return text
 
 
-def clamp_page(page: int, total_items: int, page_size: int = FAVORITES_PAGE_SIZE) -> int:
-    if total_items <= 0:
-        return 0
-    max_page = (total_items - 1) // page_size
-    return max(0, min(page, max_page))
-
-
 def media_from_post(post: dict, caption: str = ""):
     candidates = get_media_url_candidates(post)
     file_url = candidates[0][1] if candidates else ""
@@ -404,44 +224,101 @@ def media_from_post(post: dict, caption: str = ""):
     return InputMediaPhoto(file_url, caption=media_caption, parse_mode="Markdown")
 
 
-def build_subscription_gallery_caption(
-    sub_query: str, post: dict, index: int, total: int
-) -> str:
-    tags = post.get("tags", "")
-    if len(tags) > 120:
-        tags = tags[:120] + "..."
-
-    return clamp_caption(
-        f"🔔 Подписка: `{md_code(sub_query)}`\n"
-        f"Фото {index + 1}/{total}\n"
-        f"ID: `{md_code(post.get('id', 0))}`\n"
-        f"Rating: {md_text(post.get('rating', ''))} | Score: {post.get('score', 0)}\n"
-        f"Tags: `{md_code(tags)}`"
-    )
-
-
-def build_favorites_gallery_caption(post: dict, index: int, total: int) -> str:
-    tags = post.get("tags", "")
-    if len(tags) > 120:
-        tags = tags[:120] + "..."
-
-    return clamp_caption(
-        f"⭐ Избранное\n"
-        f"Фото {index + 1}/{total}\n"
-        f"ID: `{md_code(post.get('id', 0))}`\n"
-        f"Rating: {md_text(post.get('rating', ''))} | Score: {post.get('score', 0)}\n"
-        f"Tags: `{md_code(tags)}`"
-    )
-
-
 def should_show_tags_button(settings: dict | None = None) -> bool:
     if settings is None:
         return True
     return bool(settings.get("show_tags_button", True))
 
 
+CAPTION_SETTING_ELEMENTS = [
+    ("show_search_query", "Запрос поиска"),
+    ("show_subscription_label", "Метка подписки"),
+    ("show_id", "ID поста"),
+    ("show_score", "Очки (score)"),
+    ("show_rating", "Рейтинг"),
+    ("show_tags", "Теги"),
+    ("show_tags_button", "Кнопка всех тегов"),
+]
+
+DEFAULT_CAPTION_SETTINGS = {
+    "show_caption": True,
+    "show_search_query": True,
+    "show_subscription_label": True,
+    "show_id": True,
+    "show_score": True,
+    "show_rating": True,
+    "show_tags": True,
+    "show_tags_button": True,
+}
+
+
+def build_caption_settings_text(settings: dict) -> str:
+    text = "📝 *Настройки описания картинок*\n\n"
+
+    if not settings.get("show_caption", True):
+        return (
+            text
+            + "❌ Описание *полностью отключено*\n\n"
+            "Нажмите '✅ Показывать описание' чтобы включить"
+        )
+
+    text += "✅ Описание *включено*\n\n"
+    enabled = []
+    disabled = []
+    for setting_key, element_name in CAPTION_SETTING_ELEMENTS:
+        if settings.get(setting_key, True):
+            enabled.append(f"✅ {element_name}")
+        else:
+            disabled.append(f"❌ {element_name}")
+
+    if enabled:
+        text += "*Включено:*\n" + "\n".join(enabled) + "\n\n"
+    if disabled:
+        text += "*Выключено:*\n" + "\n".join(disabled)
+    return text
+
+
 def get_tags_button(post_id: int) -> InlineKeyboardButton:
     return InlineKeyboardButton("🏷 Все теги", callback_data=f"post_tags_{post_id}")
+
+
+def get_site_button(post_id: int) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        "🌐 Открыть на сайте",
+        url=f"https://rule34.xxx/index.php?page=post&s=view&id={post_id}",
+    )
+
+
+def get_favorite_button(post_id: int, sub_query: str = "") -> InlineKeyboardButton:
+    favorite_callback = f"sub_fav_{post_id}" if sub_query else f"fav_{post_id}"
+    return InlineKeyboardButton("⭐ В избранное", callback_data=favorite_callback)
+
+
+def build_post_keyboard(
+    post_id: int,
+    action_rows: list[list[InlineKeyboardButton]] | None = None,
+    query: str = "",
+    sub_query: str = "",
+    show_tags_button: bool = True,
+) -> InlineKeyboardMarkup:
+    keyboard = []
+    if query:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "🔔 Подписаться",
+                    callback_data=store_callback_payload("subscribe", query),
+                )
+            ]
+        )
+    if action_rows:
+        keyboard.extend(action_rows)
+
+    keyboard.append([get_favorite_button(post_id, sub_query)])
+    if show_tags_button:
+        keyboard.append([get_tags_button(post_id)])
+    keyboard.append([get_site_button(post_id)])
+    return InlineKeyboardMarkup(keyboard)
 
 
 def get_subscription_gallery_keyboard(
@@ -672,38 +549,17 @@ def get_image_keyboard(
     show_tags_button: bool = True,
 ) -> InlineKeyboardMarkup:
     """Клавиатура под изображением"""
-    keyboard = [
-        [
-            InlineKeyboardButton("🔄 Ещё", callback_data="more"),
-            InlineKeyboardButton("🔍 Новый поиск", callback_data="search"),
-        ],
-        [InlineKeyboardButton(
-            "⭐ В избранное", callback_data=f"fav_{post_id}")],
-    ]
-    if show_tags_button:
-        keyboard.append([get_tags_button(post_id)])
-    keyboard.append(
-        [
-            InlineKeyboardButton(
-                "🌐 Открыть на сайте",
-                url=f"https://rule34.xxx/index.php?page=post&s=view&id={post_id}",
-            )
-        ]
-    )
-
-    # Добавляем кнопку подписки если есть запрос
-    if query:
-        keyboard.insert(
-            0,
+    return build_post_keyboard(
+        post_id,
+        action_rows=[
             [
-                InlineKeyboardButton(
-                    "🔔 Подписаться",
-                    callback_data=store_callback_payload("subscribe", query),
-                )
-            ],
-        )
-
-    return InlineKeyboardMarkup(keyboard)
+                InlineKeyboardButton("🔄 Ещё", callback_data="more"),
+                InlineKeyboardButton("🔍 Новый поиск", callback_data="search"),
+            ]
+        ],
+        query=query,
+        show_tags_button=show_tags_button,
+    )
 
 
 def get_random_image_keyboard(
@@ -711,24 +567,16 @@ def get_random_image_keyboard(
     show_tags_button: bool = True,
 ) -> InlineKeyboardMarkup:
     """Клавиатура под случайным изображением без поисковых тегов."""
-    keyboard = [
-        [
-            InlineKeyboardButton("🎲 Ещё рандом", callback_data="random"),
-            InlineKeyboardButton("🔍 Новый поиск", callback_data="search"),
+    return build_post_keyboard(
+        post_id,
+        action_rows=[
+            [
+                InlineKeyboardButton("🎲 Ещё рандом", callback_data="random"),
+                InlineKeyboardButton("🔍 Новый поиск", callback_data="search"),
+            ]
         ],
-        [InlineKeyboardButton("⭐ В избранное", callback_data=f"fav_{post_id}")],
-    ]
-    if show_tags_button:
-        keyboard.append([get_tags_button(post_id)])
-    keyboard.append(
-        [
-            InlineKeyboardButton(
-                "🌐 Открыть на сайте",
-                url=f"https://rule34.xxx/index.php?page=post&s=view&id={post_id}",
-            )
-        ]
+        show_tags_button=show_tags_button,
     )
-    return InlineKeyboardMarkup(keyboard)
 
 
 def get_subscription_image_keyboard(
@@ -737,94 +585,11 @@ def get_subscription_image_keyboard(
     show_tags_button: bool = True,
 ) -> InlineKeyboardMarkup:
     """Клавиатура под постом из подписки."""
-    favorite_callback = (
-        store_callback_payload("sub_fav", f"{post_id}\n{sub_query}")
-        if sub_query
-        else f"fav_{post_id}"
+    return build_post_keyboard(
+        post_id,
+        sub_query=sub_query,
+        show_tags_button=show_tags_button,
     )
-    keyboard = [
-        [InlineKeyboardButton(
-            "⭐ В избранное", callback_data=favorite_callback)],
-    ]
-    if show_tags_button:
-        keyboard.append([get_tags_button(post_id)])
-    keyboard.append(
-        [
-            InlineKeyboardButton(
-                "🌐 Открыть на сайте",
-                url=f"https://rule34.xxx/index.php?page=post&s=view&id={post_id}",
-            )
-        ]
-    )
-    return InlineKeyboardMarkup(keyboard)
-
-
-async def build_caption(
-    settings: dict, result: dict, query: str = "", is_subscription: bool = False
-) -> str:
-    """Построить описание на основе настроек"""
-    caption_parts = []
-
-    # Заголовок для подписки
-    if is_subscription and settings.get("show_subscription_label", True):
-        caption_parts.append("🔔 *Автоматическая рассылка*")
-
-    # Запрос поиска
-    if query and settings.get("show_search_query", True):
-        caption_parts.append(f"Запрос: `{md_code(query)}`")
-
-    # Основная информация о посте
-    if settings.get("show_id", True):
-        caption_parts.append(f"🆔 ID: `{md_code(result.get('id', 0))}`")
-
-    if settings.get("show_score", True):
-        caption_parts.append(f"📊 Score: {result.get('score', 0)}")
-
-    if settings.get("show_rating", True):
-        caption_parts.append(
-            f"🏷 Rating: {md_text(result.get('rating', 'unknown'))}")
-
-    # Теги
-    if settings.get("show_tags", True):
-        post_tags = result.get("tags", "")
-        if len(post_tags) > 150:
-            post_tags = post_tags[:150] + "..."
-        caption_parts.append(f"🔖 Tags: `{md_code(post_tags)}`")
-
-    # Если все описание выключено, возвращаем пустую строку
-    if not caption_parts:
-        return ""
-
-    # Собираем все части
-    if len(caption_parts) == 1:
-        return clamp_caption(caption_parts[0])
-    elif len(caption_parts) == 2:
-        return clamp_caption(f"{caption_parts[0]}\n{caption_parts[1]}")
-    else:
-        # Первый элемент как заголовок, остальные как список
-        return clamp_caption(f"{caption_parts[0]}\n" + "\n".join(caption_parts[1:]))
-
-
-def build_full_tags_messages(post: dict) -> list[str]:
-    post_id = post.get("id", 0)
-    tags = [tag for tag in str(post.get("tags", "")).split() if tag]
-    if not tags:
-        return [f"🏷 У поста `{md_code(post_id)}` нет сохранённых тегов."]
-
-    header = f"🏷 *Все теги поста* `{md_code(post_id)}`:\n\n"
-    messages: list[str] = []
-    current = header
-    for tag in tags:
-        line = f"• `{md_code(tag)}`\n"
-        if len(current) + len(line) > 3900:
-            messages.append(current.rstrip())
-            current = line
-        else:
-            current += line
-
-    if current.strip():
-        messages.append(current.rstrip())
-    return messages
 
 
 async def send_full_post_tags(message, post_id: int):
@@ -1013,42 +778,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "settings_caption":
         settings = await get_user_settings(user_id)
-
-        # Формируем текст
-        text = "📝 *Настройки описания картинок*\n\n"
-
-        if settings.get("show_caption", True):
-            text += "✅ Описание *включено*\n\n"
-
-            # Собираем включенные и выключенные элементы
-            elements = [
-                ("show_search_query", "Запрос поиска"),
-                ("show_subscription_label", "Метка подписки"),
-                ("show_id", "ID поста"),
-                ("show_score", "Очки (score)"),
-                ("show_rating", "Рейтинг"),
-                ("show_tags", "Теги"),
-                ("show_tags_button", "Кнопка всех тегов"),
-            ]
-
-            enabled = []
-            disabled = []
-
-            for setting_key, element_name in elements:
-                if settings.get(setting_key, True):
-                    enabled.append(f"✅ {element_name}")
-                else:
-                    disabled.append(f"❌ {element_name}")
-
-            if enabled:
-                text += "*Включено:*\n" + "\n".join(enabled) + "\n\n"
-
-            if disabled:
-                text += "*Выключено:*\n" + "\n".join(disabled)
-        else:
-            text += "❌ Описание *полностью отключено*\n\nНажмите '✅ Показывать описание' чтобы включить"
-
-        # Получаем клавиатуру настроек
+        text = build_caption_settings_text(settings)
         keyboard = await get_caption_settings_keyboard(user_id)
 
         try:
@@ -1062,18 +792,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     elif data == "settings_reset":
-        # Сбрасываем настройки к значениям по умолчанию
-        default_settings = {
-            "show_caption": True,
-            "show_search_query": True,
-            "show_subscription_label": True,
-            "show_id": True,
-            "show_score": True,
-            "show_rating": True,
-            "show_tags": True,
-            "show_tags_button": True,
-        }
-        await save_user_settings(user_id, default_settings)
+        await save_user_settings(user_id, DEFAULT_CAPTION_SETTINGS)
         await query.edit_message_text(
             "✅ Настройки сброшены к значениям по умолчанию!",
             reply_markup=get_settings_keyboard(),
@@ -1129,41 +848,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Обновляем сообщение
         await save_user_settings(user_id, settings)
 
-        # Формируем текст
-        text = "📝 *Настройки описания картинок*\n\n"
-
-        if settings.get("show_caption", True):
-            text += "✅ Описание *включено*\n\n"
-
-            # Собираем включенные и выключенные элементы
-            elements = [
-                ("show_search_query", "Запрос поиска"),
-                ("show_subscription_label", "Метка подписки"),
-                ("show_id", "ID поста"),
-                ("show_score", "Очки (score)"),
-                ("show_rating", "Рейтинг"),
-                ("show_tags", "Теги"),
-                ("show_tags_button", "Кнопка всех тегов"),
-            ]
-
-            enabled = []
-            disabled = []
-
-            for setting_key, element_name in elements:
-                if settings.get(setting_key, True):
-                    enabled.append(f"✅ {element_name}")
-                else:
-                    disabled.append(f"❌ {element_name}")
-
-            if enabled:
-                text += "*Включено:*\n" + "\n".join(enabled) + "\n\n"
-
-            if disabled:
-                text += "*Выключено:*\n" + "\n".join(disabled)
-        else:
-            text += "❌ Описание *полностью отключено*\n\nНажмите '✅ Показывать описание' чтобы включить"
-
-        # Получаем обновленную клавиатуру
+        text = build_caption_settings_text(settings)
         keyboard = await get_caption_settings_keyboard(user_id)
 
         try:
@@ -1490,12 +1175,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_favorites_gallery(query, user_id, index)
 
     elif data.startswith("sub_fav_"):
-        payload = get_callback_payload("sub_fav", data)
-        if not payload or "\n" not in payload:
-            await query.message.reply_text("❌ Не удалось определить пост подписки.")
-            return
+        payload = data.replace("sub_fav_", "", 1)
+        sub_query = ""
+        if payload.isdigit():
+            post_id_text = payload
+        else:
+            legacy_payload = get_callback_payload("sub_fav", data)
+            if not legacy_payload or "\n" not in legacy_payload:
+                await query.message.reply_text("❌ Не удалось определить пост подписки.")
+                return
+            post_id_text, sub_query = legacy_payload.split("\n", 1)
 
-        post_id_text, sub_query = payload.split("\n", 1)
         if not post_id_text.isdigit():
             await query.message.reply_text("❌ Не удалось определить пост подписки.")
             return
@@ -1510,11 +1200,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         await add_favorite(user_id, post)
-        await add_subscription_post(user_id, sub_query, post)
-        await query.message.reply_text(
-            f"⭐ Пост `{md_code(post_id)}` добавлен в избранное подписки `{md_code(sub_query)}`.",
-            parse_mode="Markdown",
-        )
+        sub_queries = [sub_query] if sub_query else await get_subscription_queries_for_post(user_id, post_id)
+        for known_sub_query in sub_queries:
+            await add_subscription_post(user_id, known_sub_query, post)
+
+        if sub_queries:
+            await query.message.reply_text(
+                f"⭐ Пост `{md_code(post_id)}` добавлен в избранное подписки.",
+                parse_mode="Markdown",
+            )
+        else:
+            await query.message.reply_text(
+                f"⭐ Пост `{md_code(post_id)}` добавлен в избранное.",
+                parse_mode="Markdown",
+            )
+            logger.warning(
+                "Subscription favorite saved without matching subscription user=%s post=%s",
+                user_id,
+                post_id,
+            )
 
     elif data.startswith("fav_"):
         post_id_text = data.replace("fav_", "", 1)
@@ -1636,11 +1340,22 @@ async def send_random_image(message, user_id: int):
     status_msg = await message.reply_text("🎲 Ищу случайную картинку...")
     excluded_post_ids = await get_sent_post_ids(user_id)
 
+    started_at = time.monotonic()
     try:
         result = await api.get_global_random_image(blacklist, excluded_post_ids)
+        logger.info(
+            "Random post source=api user=%s post=%s elapsed=%.3fs",
+            user_id,
+            result.get("id") if result else None,
+            time.monotonic() - started_at,
+        )
     except APITemporaryError:
         await status_msg.delete()
-        logger.warning("Temporary Rule34 API error during random search user=%s", user_id)
+        logger.warning(
+            "Temporary Rule34 API error during random search user=%s elapsed=%.3fs",
+            user_id,
+            time.monotonic() - started_at,
+        )
         await message.reply_text(
             "⚠️ Rule34 сейчас отвечает слишком долго. Попробуйте ещё раз чуть позже.",
             reply_markup=get_main_keyboard(),
@@ -1650,6 +1365,11 @@ async def send_random_image(message, user_id: int):
     await status_msg.delete()
 
     if not result:
+        logger.info(
+            "Random post source=api_empty user=%s post=None elapsed=%.3fs",
+            user_id,
+            time.monotonic() - started_at,
+        )
         await message.reply_text(
             "❌ Не удалось найти случайную картинку с учётом blacklist.",
             reply_markup=get_main_keyboard(),
@@ -1703,6 +1423,7 @@ async def send_image(
 
     excluded_post_ids = await get_sent_post_ids(user_id)
 
+    started_at = time.monotonic()
     try:
         # Если это кнопка "ещё", используем улучшенную логику
         if is_more:
@@ -1712,10 +1433,24 @@ async def send_image(
             # Сохраняем историю поиска для кнопки "ещё"
             if result:
                 await api.save_search_state(user_id, tags, blacklist, result.get("id"))
+        logger.info(
+            "Search post source=api user=%s tags=%r post=%s elapsed=%.3fs more=%s subscription=%s",
+            user_id,
+            tags,
+            result.get("id") if result else None,
+            time.monotonic() - started_at,
+            is_more,
+            is_subscription,
+        )
     except APITemporaryError:
         if status_msg:
             await status_msg.delete()
-        logger.warning("Temporary Rule34 API error during user search user=%s tags=%r", user_id, tags)
+        logger.warning(
+            "Temporary Rule34 API error during user search user=%s tags=%r elapsed=%.3fs",
+            user_id,
+            tags,
+            time.monotonic() - started_at,
+        )
         if not is_subscription:
             await message.reply_text(
                 "⚠️ Rule34 сейчас отвечает слишком долго. Попробуйте ещё раз чуть позже.",
@@ -1958,8 +1693,9 @@ async def send_post_media_to_chat(bot, chat_id: int, post: dict, caption: str = 
 async def show_subscription_posts_menu(
     message, user_id: int, sub_query: str, token: str, edit: bool = True
 ):
-    posts = await get_subscription_posts(user_id, sub_query)
-    if not posts:
+    total = await count_subscription_posts(user_id, sub_query)
+    posts = await get_subscription_posts(user_id, sub_query, limit=20)
+    if total <= 0:
         text = (
             f"⭐ Для подписки `{md_code(sub_query)}` пока нет избранных постов.\n\n"
             "Нажмите `⭐ В избранное` под постом из этой подписки, и он появится здесь."
@@ -1968,11 +1704,14 @@ async def show_subscription_posts_menu(
             [[InlineKeyboardButton("◀️ Назад", callback_data="sub_manage")]]
         )
     else:
-        text = f"⭐ *Избранное подписки* `{md_code(sub_query)}`\n\nВыберите номер или откройте просмотр всех."
+        text = (
+            f"⭐ *Избранное подписки* `{md_code(sub_query)}`: {total}\n\n"
+            "Выберите номер или откройте просмотр всех."
+        )
         rows = []
-        for row_start in range(0, min(len(posts), 20), 5):
+        for row_start in range(0, len(posts), 5):
             row = []
-            for index in range(row_start, min(row_start + 5, len(posts), 20)):
+            for index in range(row_start, min(row_start + 5, len(posts))):
                 row.append(
                     InlineKeyboardButton(
                         str(index + 1), callback_data=f"sub_one_{token}_{index}"
@@ -1997,15 +1736,19 @@ async def show_subscription_posts_menu(
 async def send_subscription_post_by_index(
     message, user_id: int, sub_query: str, index: int
 ):
-    posts = await get_subscription_posts(user_id, sub_query)
-    if index < 0 or index >= len(posts):
+    total = await count_subscription_posts(user_id, sub_query)
+    if index < 0 or index >= total:
         await message.reply_text("❌ Пост не найден. Откройте список заново.")
         return
 
-    post = posts[index]
+    post = await get_subscription_post_by_index(user_id, sub_query, index)
+    if not post:
+        await message.reply_text("❌ Пост не найден. Откройте список заново.")
+        return
+
     settings = await get_user_settings(user_id)
     caption = build_subscription_gallery_caption(
-        sub_query, post, index, len(posts))
+        sub_query, post, index, total)
     await send_post_media(
         message, post, caption, get_subscription_image_keyboard(
             post.get("id", 0),
@@ -2017,16 +1760,20 @@ async def send_subscription_post_by_index(
 async def send_subscription_gallery(
     message, user_id: int, sub_query: str, token: str, index: int = 0
 ):
-    posts = await get_subscription_posts(user_id, sub_query)
-    if not posts:
+    total = await count_subscription_posts(user_id, sub_query)
+    if total <= 0:
         await message.reply_text("❌ Для этой подписки пока нет избранных постов.")
         return
 
-    index = max(0, min(index, len(posts) - 1))
-    post = posts[index]
+    index = max(0, min(index, total - 1))
+    post = await get_subscription_post_by_index(user_id, sub_query, index)
+    if not post:
+        await message.reply_text("❌ Для этой подписки пока нет избранных постов.")
+        return
+
     settings = await get_user_settings(user_id)
     caption = build_subscription_gallery_caption(
-        sub_query, post, index, len(posts))
+        sub_query, post, index, total)
     await send_post_media(
         message,
         post,
@@ -2034,7 +1781,7 @@ async def send_subscription_gallery(
         get_subscription_gallery_keyboard(
             token,
             index,
-            len(posts),
+            total,
             post.get("id", 0),
             should_show_tags_button(settings),
         ),
@@ -2044,22 +1791,28 @@ async def send_subscription_gallery(
 async def edit_subscription_gallery(
     query, user_id: int, sub_query: str, token: str, index: int
 ):
-    posts = await get_subscription_posts(user_id, sub_query)
-    if not posts:
+    total = await count_subscription_posts(user_id, sub_query)
+    if total <= 0:
         await query.message.reply_text(
             "❌ Для этой подписки больше нет избранных постов."
         )
         return
 
-    index = max(0, min(index, len(posts) - 1))
-    post = posts[index]
+    index = max(0, min(index, total - 1))
+    post = await get_subscription_post_by_index(user_id, sub_query, index)
+    if not post:
+        await query.message.reply_text(
+            "❌ Для этой подписки больше нет избранных постов."
+        )
+        return
+
     settings = await get_user_settings(user_id)
     caption = build_subscription_gallery_caption(
-        sub_query, post, index, len(posts))
+        sub_query, post, index, total)
     keyboard = get_subscription_gallery_keyboard(
         token,
         index,
-        len(posts),
+        total,
         post.get("id", 0),
         should_show_tags_button(settings),
     )
@@ -2073,22 +1826,26 @@ async def edit_subscription_gallery(
 
 
 async def send_favorites_gallery(message, user_id: int, index: int = 0):
-    favorites = await get_favorites(user_id, limit=None)
-    if not favorites:
+    total = await count_favorites(user_id)
+    if total <= 0:
         await message.reply_text("❌ Избранное пока пустое.")
         return
 
-    index = max(0, min(index, len(favorites) - 1))
-    post = favorites[index]
+    index = max(0, min(index, total - 1))
+    post = await get_favorite_by_index(user_id, index)
+    if not post:
+        await message.reply_text("❌ Избранное пока пустое.")
+        return
+
     settings = await get_user_settings(user_id)
-    caption = build_favorites_gallery_caption(post, index, len(favorites))
+    caption = build_favorites_gallery_caption(post, index, total)
     await send_post_media(
         message,
         post,
         caption,
         get_favorites_gallery_keyboard(
             index,
-            len(favorites),
+            total,
             post.get("id", 0),
             should_show_tags_button(settings),
         ),
@@ -2096,18 +1853,22 @@ async def send_favorites_gallery(message, user_id: int, index: int = 0):
 
 
 async def edit_favorites_gallery(query, user_id: int, index: int):
-    favorites = await get_favorites(user_id, limit=None)
-    if not favorites:
+    total = await count_favorites(user_id)
+    if total <= 0:
         await query.message.reply_text("❌ В избранном больше нет постов.")
         return
 
-    index = max(0, min(index, len(favorites) - 1))
-    post = favorites[index]
+    index = max(0, min(index, total - 1))
+    post = await get_favorite_by_index(user_id, index)
+    if not post:
+        await query.message.reply_text("❌ В избранном больше нет постов.")
+        return
+
     settings = await get_user_settings(user_id)
-    caption = build_favorites_gallery_caption(post, index, len(favorites))
+    caption = build_favorites_gallery_caption(post, index, total)
     keyboard = get_favorites_gallery_keyboard(
         index,
-        len(favorites),
+        total,
         post.get("id", 0),
         should_show_tags_button(settings),
     )

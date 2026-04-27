@@ -188,6 +188,20 @@ class PostCacheTests(TempDatabaseTestCase):
         self.assertEqual(len(favorites), 12)
         self.assertEqual(len(tagged), 12)
 
+    async def test_get_favorite_by_index_returns_single_saved_post(self):
+        for post_id in range(3):
+            self.assertTrue(await database.add_favorite(1, {
+                "id": post_id,
+                "file_url": f"https://example.test/{post_id}.jpg",
+                "tags": "keep" if post_id != 1 else "skip",
+            }))
+
+        newest = await database.get_favorite_by_index(1, 0)
+        filtered = await database.get_favorite_by_index(1, 1, tag_filter="keep")
+
+        self.assertEqual(newest["id"], 2)
+        self.assertEqual(filtered["id"], 0)
+
     async def test_get_subscription_posts_without_limit_returns_all_saved_posts(self):
         for post_id in range(55):
             post = {
@@ -201,6 +215,61 @@ class PostCacheTests(TempDatabaseTestCase):
         posts = await database.get_subscription_posts(1, "sub")
 
         self.assertEqual(len(posts), 55)
+
+    async def test_get_subscription_post_by_index_and_count(self):
+        for post_id in range(4):
+            post = {
+                "id": post_id,
+                "file_url": f"https://example.test/{post_id}.jpg",
+                "tags": "subtag",
+            }
+            self.assertTrue(await database.add_favorite(1, post))
+            self.assertTrue(await database.add_subscription_post(1, "sub", post))
+
+        self.assertEqual(await database.count_subscription_posts(1, "sub"), 4)
+        post = await database.get_subscription_post_by_index(1, "sub", 2)
+
+        self.assertEqual(post["id"], 1)
+
+    async def test_get_subscription_queries_for_post_uses_subscription_cache(self):
+        self.assertTrue(await database.add_subscription(1, "tag-a", 10))
+        self.assertTrue(await database.add_subscription(1, "tag-b", 10))
+        self.assertTrue(await database.add_subscription(2, "other-user", 10))
+
+        post = {
+            "id": 42,
+            "file_url": "https://example.test/42.jpg",
+            "tags": "subtag",
+        }
+        await database.replace_subscription_cache(1, "tag-a", [post])
+        await database.replace_subscription_cache(1, "tag-b", [post])
+        await database.replace_subscription_cache(2, "other-user", [post])
+
+        queries = await database.get_subscription_queries_for_post(1, 42)
+
+        self.assertEqual(queries, ["tag-a", "tag-b"])
+
+
+class UserSettingsTests(TempDatabaseTestCase):
+    async def test_partial_save_preserves_existing_settings(self):
+        await database.save_user_settings(1, {
+            "show_caption": False,
+            "show_score": False,
+            "show_tags_button": False,
+        })
+        await database.save_user_settings(1, {"show_rating": False})
+
+        settings = await database.get_user_settings(1)
+
+        self.assertFalse(settings["show_caption"])
+        self.assertFalse(settings["show_score"])
+        self.assertFalse(settings["show_rating"])
+        self.assertFalse(settings["show_tags_button"])
+
+    async def test_new_settings_include_tags_button_default(self):
+        settings = await database.get_user_settings(1)
+
+        self.assertTrue(settings["show_tags_button"])
 
 
 if __name__ == "__main__":
