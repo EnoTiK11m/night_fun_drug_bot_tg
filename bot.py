@@ -41,6 +41,23 @@ from bot_formatting import (
     parse_pause_minutes,
     parse_subscription_interval,
 )
+from bot_keyboards import (
+    get_blacklist_keyboard,
+    get_caption_settings_keyboard,
+    get_favorites_gallery_keyboard,
+    get_image_keyboard,
+    get_main_keyboard,
+    get_random_image_keyboard,
+    get_settings_keyboard,
+    get_subscription_gallery_keyboard,
+    get_subscription_image_keyboard,
+    get_subscriptions_keyboard,
+)
+from bot_media import (
+    get_media_url_candidates,
+    send_post_media as send_post_media_with_retries,
+    send_post_media_to_chat as send_post_media_to_chat_with_retries,
+)
 from bot_state import (
     get_callback_payload,
     get_callback_payload_by_token,
@@ -276,320 +293,6 @@ def build_caption_settings_text(settings: dict) -> str:
     if disabled:
         text += "*Выключено:*\n" + "\n".join(disabled)
     return text
-
-
-def get_tags_button(post_id: int) -> InlineKeyboardButton:
-    return InlineKeyboardButton("🏷 Все теги", callback_data=f"post_tags_{post_id}")
-
-
-def get_site_button(post_id: int) -> InlineKeyboardButton:
-    return InlineKeyboardButton(
-        "🌐 Открыть на сайте",
-        url=f"https://rule34.xxx/index.php?page=post&s=view&id={post_id}",
-    )
-
-
-def get_favorite_button(post_id: int, sub_query: str = "") -> InlineKeyboardButton:
-    favorite_callback = f"sub_fav_{post_id}" if sub_query else f"fav_{post_id}"
-    return InlineKeyboardButton("⭐ В избранное", callback_data=favorite_callback)
-
-
-def build_post_keyboard(
-    post_id: int,
-    action_rows: list[list[InlineKeyboardButton]] | None = None,
-    query: str = "",
-    sub_query: str = "",
-    show_tags_button: bool = True,
-) -> InlineKeyboardMarkup:
-    keyboard = []
-    if query:
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    "🔔 Подписаться",
-                    callback_data=store_callback_payload("subscribe", query),
-                )
-            ]
-        )
-    if action_rows:
-        keyboard.extend(action_rows)
-
-    keyboard.append([get_favorite_button(post_id, sub_query)])
-    if show_tags_button:
-        keyboard.append([get_tags_button(post_id)])
-    keyboard.append([get_site_button(post_id)])
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_subscription_gallery_keyboard(
-    token: str,
-    index: int,
-    total: int,
-    post_id: int,
-    show_tags_button: bool = True,
-) -> InlineKeyboardMarkup:
-    prev_index = (index - 1) % total
-    next_index = (index + 1) % total
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "◀️", callback_data=f"sub_page_{token}_{prev_index}"
-            ),
-            InlineKeyboardButton(
-                f"{index + 1}/{total}", callback_data="noop"),
-            InlineKeyboardButton(
-                "▶️", callback_data=f"sub_page_{token}_{next_index}"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ Удалить",
-                callback_data=f"sub_post_del_{token}_{post_id}_{index}",
-            )
-        ],
-    ]
-    if show_tags_button:
-        keyboard.append([get_tags_button(post_id)])
-    keyboard.append(
-        [
-            InlineKeyboardButton(
-                "📋 Список", callback_data=f"sub_list_posts_{token}"
-            )
-        ]
-    )
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_favorites_gallery_keyboard(
-    index: int,
-    total: int,
-    post_id: int,
-    show_tags_button: bool = True,
-) -> InlineKeyboardMarkup:
-    prev_index = (index - 1) % total
-    next_index = (index + 1) % total
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "◀️", callback_data=f"fav_page_{prev_index}"),
-            InlineKeyboardButton(
-                f"{index + 1}/{total}", callback_data="noop"),
-            InlineKeyboardButton(
-                "▶️", callback_data=f"fav_page_{next_index}"),
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ Удалить", callback_data=f"fav_del_{post_id}_{index}"
-            )
-        ],
-    ]
-    if show_tags_button:
-        keyboard.append([get_tags_button(post_id)])
-    keyboard.append([InlineKeyboardButton("📋 Список", callback_data="fav_list")])
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_main_keyboard() -> InlineKeyboardMarkup:
-    """Главная клавиатура"""
-    keyboard = [
-        [InlineKeyboardButton("🔍 Поиск", callback_data="search")],
-        [InlineKeyboardButton("🎲 Рандомная картинка", callback_data="random")],
-        [InlineKeyboardButton("🔄 Ещё", callback_data="more")],
-        [
-            InlineKeyboardButton("🚫 Blacklist", callback_data="blacklist"),
-            InlineKeyboardButton("📋 Подписки", callback_data="subscriptions"),
-        ],
-        [
-            InlineKeyboardButton("🕘 История", callback_data="history"),
-            InlineKeyboardButton("⭐ Избранное", callback_data="favorites"),
-        ],
-        [
-            InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
-            InlineKeyboardButton("❓ Помощь", callback_data="help"),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_blacklist_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура blacklist"""
-    keyboard = [
-        [InlineKeyboardButton("➕ Добавить тег", callback_data="bl_add")],
-        [InlineKeyboardButton("➖ Удалить тег", callback_data="bl_remove")],
-        [InlineKeyboardButton("📋 Показать список", callback_data="bl_show")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_subscriptions_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура подписок"""
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "➕ Подписаться на текущий поиск", callback_data="sub_add_current"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "➕ Подписаться на новый поиск", callback_data="sub_add_new"
-            )
-        ],
-        [InlineKeyboardButton("📋 Мои подписки", callback_data="sub_list")],
-        [InlineKeyboardButton("⚙️ Управление подписками",
-                              callback_data="sub_manage")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_settings_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура настроек"""
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "📝 Настройки описания", callback_data="settings_caption"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⏸ Остановить все подписки на время",
-                callback_data="settings_pause_subscriptions",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "▶️ Возобновить подписки",
-                callback_data="settings_resume_subscriptions",
-            )
-        ],
-        [InlineKeyboardButton("🔄 Сброс настроек",
-                              callback_data="settings_reset")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-async def get_caption_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Асинхронно получить клавиатуру настроек описания"""
-    settings = await get_user_settings(user_id)
-
-    # Создаем кнопки с текущим состоянием
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                (
-                    "✅ Показывать описание"
-                    if settings.get("show_caption", True)
-                    else "❌ Скрыть описание"
-                ),
-                callback_data="toggle_show_caption",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                (
-                    "✅ Запрос поиска"
-                    if settings.get("show_search_query", True)
-                    else "❌ Запрос поиска"
-                ),
-                callback_data="toggle_show_search_query",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                (
-                    "✅ Метка подписки"
-                    if settings.get("show_subscription_label", True)
-                    else "❌ Метка подписки"
-                ),
-                callback_data="toggle_show_subscription_label",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "✅ ID поста" if settings.get(
-                    "show_id", True) else "❌ ID поста",
-                callback_data="toggle_show_id",
-            ),
-            InlineKeyboardButton(
-                "✅ Рейтинг" if settings.get(
-                    "show_rating", True) else "❌ Рейтинг",
-                callback_data="toggle_show_rating",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "✅ Очки" if settings.get("show_score", True) else "❌ Очки",
-                callback_data="toggle_show_score",
-            ),
-            InlineKeyboardButton(
-                "✅ Теги" if settings.get("show_tags", True) else "❌ Теги",
-                callback_data="toggle_show_tags",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                (
-                    "✅ Кнопка всех тегов"
-                    if settings.get("show_tags_button", True)
-                    else "❌ Кнопка всех тегов"
-                ),
-                callback_data="toggle_show_tags_button",
-            )
-        ],
-        [InlineKeyboardButton("◀️ Назад", callback_data="settings")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_image_keyboard(
-    post_id: int,
-    query: str = "",
-    show_tags_button: bool = True,
-) -> InlineKeyboardMarkup:
-    """Клавиатура под изображением"""
-    return build_post_keyboard(
-        post_id,
-        action_rows=[
-            [
-                InlineKeyboardButton("🔄 Ещё", callback_data="more"),
-                InlineKeyboardButton("🔍 Новый поиск", callback_data="search"),
-            ]
-        ],
-        query=query,
-        show_tags_button=show_tags_button,
-    )
-
-
-def get_random_image_keyboard(
-    post_id: int,
-    show_tags_button: bool = True,
-) -> InlineKeyboardMarkup:
-    """Клавиатура под случайным изображением без поисковых тегов."""
-    return build_post_keyboard(
-        post_id,
-        action_rows=[
-            [
-                InlineKeyboardButton("🎲 Ещё рандом", callback_data="random"),
-                InlineKeyboardButton("🔍 Новый поиск", callback_data="search"),
-            ]
-        ],
-        show_tags_button=show_tags_button,
-    )
-
-
-def get_subscription_image_keyboard(
-    post_id: int,
-    sub_query: str = "",
-    show_tags_button: bool = True,
-) -> InlineKeyboardMarkup:
-    """Клавиатура под постом из подписки."""
-    return build_post_keyboard(
-        post_id,
-        sub_query=sub_query,
-        show_tags_button=show_tags_button,
-    )
 
 
 async def send_full_post_tags(message, post_id: int):
@@ -1512,182 +1215,25 @@ async def send_image(
         return False
 
 
-def get_media_url_candidates(post: dict) -> list[tuple[str, str]]:
-    candidates = []
-    for key in ("file_url", "sample_url", "preview_url"):
-        url = post.get(key)
-        if url and all(url != existing_url for _, existing_url in candidates):
-            candidates.append((key, url))
-    return candidates
-
-
-async def reply_media_url(message, url: str, caption: str, reply_markup):
-    if url.lower().endswith((".mp4", ".webm")):
-        await message.reply_video(
-            url,
-            caption=caption if caption else None,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-        )
-    elif url.lower().endswith(".gif"):
-        await message.reply_animation(
-            url,
-            caption=caption if caption else None,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-        )
-    else:
-        await message.reply_photo(
-            url,
-            caption=caption if caption else None,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-        )
-
-
-async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup):
-    if url.lower().endswith((".mp4", ".webm")):
-        await bot.send_video(
-            chat_id=chat_id,
-            video=url,
-            caption=caption if caption else None,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-        )
-    elif url.lower().endswith(".gif"):
-        await bot.send_animation(
-            chat_id=chat_id,
-            animation=url,
-            caption=caption if caption else None,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-        )
-    else:
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=url,
-            caption=caption if caption else None,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-        )
-
-
 async def send_post_media(message, post: dict, caption: str = "", keyboard=None):
-    reply_markup = keyboard or get_subscription_image_keyboard(post.get("id", 0))
-    candidates = get_media_url_candidates(post)
-    fallback_url = candidates[0][1] if candidates else ""
-    if not fallback_url:
-        await message.reply_text(
-            "⚠️ У этого поста нет сохранённой ссылки на файл. "
-            "Попробуйте открыть свежий пост или найти его через `/id`.",
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-        )
-        logger.warning("Media fallback missing url post=%s", post.get("id"))
-        return False
-
-    for url_kind, media_url in candidates:
-        for attempt in range(1, MEDIA_SEND_RETRIES + 1):
-            try:
-                await reply_media_url(message, media_url, caption, reply_markup)
-                logger.info(
-                    "Media send ok post=%s url_kind=%s",
-                    post.get("id"),
-                    url_kind,
-                )
-                return True
-            except Exception as exc:
-                logger.warning(
-                    "Media send failed post=%s url_kind=%s attempt=%s/%s: %s",
-                    post.get("id"),
-                    url_kind,
-                    attempt,
-                    MEDIA_SEND_RETRIES,
-                    exc,
-                )
-                if attempt < MEDIA_SEND_RETRIES:
-                    await asyncio.sleep(1)
-
-    fallback = (
-        "⚠️ Не удалось отправить файл напрямую. "
-        "Возможна проблема с размером, форматом, сетью или сервером.\n"
-        f"Открыть файл: {md_text(fallback_url)}"
+    return await send_post_media_with_retries(
+        message,
+        post,
+        caption,
+        keyboard,
+        retries=MEDIA_SEND_RETRIES,
     )
-    if caption:
-        fallback += f"\n\n{caption}"
-    await message.reply_text(
-        fallback,
-        parse_mode="Markdown",
-        reply_markup=reply_markup,
-    )
-    logger.warning("Media fallback sent post=%s", post.get("id"))
-    return True
 
 
 async def send_post_media_to_chat(bot, chat_id: int, post: dict, caption: str = "", keyboard=None):
-    reply_markup = keyboard or get_subscription_image_keyboard(post.get("id", 0))
-    candidates = get_media_url_candidates(post)
-    fallback_url = candidates[0][1] if candidates else ""
-    if not fallback_url:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "⚠️ У этого поста нет сохранённой ссылки на файл. "
-                "Попробуйте открыть свежий пост или найти его через `/id`."
-            ),
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-        )
-        logger.warning(
-            "Subscription media fallback missing url user=%s post=%s",
-            chat_id,
-            post.get("id"),
-        )
-        return False
-
-    for url_kind, media_url in candidates:
-        for attempt in range(1, MEDIA_SEND_RETRIES + 1):
-            try:
-                await send_media_url(bot, chat_id, media_url, caption, reply_markup)
-                logger.info(
-                    "Subscription media send ok user=%s post=%s url_kind=%s",
-                    chat_id,
-                    post.get("id"),
-                    url_kind,
-                )
-                return True
-            except Exception as exc:
-                logger.warning(
-                    "Subscription media send failed user=%s post=%s url_kind=%s attempt=%s/%s: %s",
-                    chat_id,
-                    post.get("id"),
-                    url_kind,
-                    attempt,
-                    MEDIA_SEND_RETRIES,
-                    exc,
-                )
-                if attempt < MEDIA_SEND_RETRIES:
-                    await asyncio.sleep(1)
-
-    fallback = (
-        "⚠️ Не удалось отправить файл напрямую. "
-        "Возможна проблема с размером, форматом, сетью или сервером.\n"
-        f"Открыть файл: {md_text(fallback_url)}"
-    )
-    if caption:
-        fallback += f"\n\n{caption}"
-    await bot.send_message(
-        chat_id=chat_id,
-        text=fallback,
-        parse_mode="Markdown",
-        reply_markup=reply_markup,
-    )
-    logger.warning(
-        "Subscription media fallback sent user=%s post=%s",
+    return await send_post_media_to_chat_with_retries(
+        bot,
         chat_id,
-        post.get("id"),
+        post,
+        caption,
+        keyboard,
+        retries=MEDIA_SEND_RETRIES,
     )
-    return True
 
 
 async def show_subscription_posts_menu(

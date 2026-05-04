@@ -9,6 +9,8 @@ bot_data.db
 bot_data.db-*
 .pytest_cache/
 .coverage
+.agents/
+skills-lock.json
 .venv/
 venv/
 env/
