@@ -3,7 +3,13 @@ import asyncio
 import time
 import random
 import os
+import sys
+import tempfile
+import zipfile
 from logging.handlers import RotatingFileHandler
+from urllib.parse import urlparse
+
+import aiohttp
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -25,7 +31,17 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import BadRequest
-from config import BOT_TOKEN, SEARCH_COOLDOWN_SECONDS, validate_config
+from config import (
+    ALLOW_GROUP_CHATS,
+    ALLOWED_CHAT_IDS,
+    ALLOWED_USER_IDS,
+    ADMIN_USER_IDS,
+    API_KEY,
+    API_USER_ID,
+    BOT_TOKEN,
+    SEARCH_COOLDOWN_SECONDS,
+    validate_config,
+)
 from bot_formatting import (
     FAVORITES_PAGE_SIZE,
     SQLITE_TIMESTAMP_FORMAT,
@@ -116,10 +132,18 @@ from api_handler import api, APITemporaryError
 
 
 class RedactingFormatter(logging.Formatter):
+    SECRET_PLACEHOLDERS = (
+        ("BOT_TOKEN", "<BOT_TOKEN>"),
+        ("API_KEY", "<API_KEY>"),
+        ("API_USER_ID", "<API_USER_ID>"),
+    )
+
     def format(self, record):
         message = super().format(record)
-        if BOT_TOKEN:
-            message = message.replace(BOT_TOKEN, "<BOT_TOKEN>")
+        for attr_name, placeholder in self.SECRET_PLACEHOLDERS:
+            secret = globals().get(attr_name)
+            if secret:
+                message = message.replace(str(secret), placeholder)
         return message
 
 
@@ -176,9 +200,20 @@ logger = logging.getLogger(__name__)
 user_states = {}
 # Глобальная задача для подписок
 subscription_task = None
+heartbeat_task = None
 user_last_search_at = {}
 MEDIA_SEND_RETRIES = 2
 SUBSCRIPTION_CONCURRENCY = 5
+HEARTBEAT_INTERVAL_SECONDS = 5 * 60
+FAVORITES_EXPORT_ZIP_LIMIT_BYTES = 45 * 1024 * 1024
+FAVORITES_EXPORT_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+FAVORITES_EXPORT_TIMEOUT_SECONDS = 30
+FAVORITES_EXPORT_COOLDOWN_SECONDS = 5 * 60
+RESTART_EXIT_CODE = 42
+restart_requested = False
+RESTART_TEXT_COMMANDS = {"restart", "рестарт"}
+favorites_export_users: set[int] = set()
+favorites_export_last_finished_at: dict[int, float] = {}
 
 
 async def remember_and_cache_post(post: dict):
@@ -322,7 +357,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ *Настройки описания:*\n"
         "Вы можете выбрать какие элементы показывать в описании:\n"
         "- Запрос поиска\n- ID поста\n- Очки (score)\n- Рейтинг\n- Теги\n- Метку подписки\n\n"
-        "⚠️ Бот предназначен для пользователей"
+        "⚠️ Бот предназначен только для пользователей 18+."
         f"{pause_text}",
         reply_markup=get_main_keyboard(),
         parse_mode="Markdown",
@@ -337,6 +372,46 @@ async def safe_query_answer(query):
             logger.warning("Ignoring expired callback query answer: %s", exc)
             return
         raise
+
+
+def is_access_allowed(update: Update) -> bool:
+    user = update.effective_user
+    chat = update.effective_chat
+    user_id = user.id if user else None
+    chat_id = chat.id if chat else None
+    chat_type = getattr(chat, "type", None)
+
+    if user_id in ADMIN_USER_IDS:
+        return True
+    if chat_id in ALLOWED_CHAT_IDS:
+        return True
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        return False
+    if chat_type in {"group", "supergroup", "channel"}:
+        return ALLOW_GROUP_CHATS
+    return True
+
+
+async def send_access_denied(update: Update):
+    text = "Доступ к боту ограничен."
+    if update.callback_query:
+        await update.callback_query.answer(text, show_alert=True)
+        return
+    if update.effective_message:
+        await update.effective_message.reply_text(text)
+
+
+def require_access(handler):
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_access_allowed(update):
+            user_id = update.effective_user.id if update.effective_user else None
+            chat_id = update.effective_chat.id if update.effective_chat else None
+            logger.warning("Access denied user=%s chat=%s", user_id, chat_id)
+            await send_access_denied(update)
+            return
+        return await handler(update, context)
+
+    return wrapped
 
 
 def schedule_background_task(context: ContextTypes.DEFAULT_TYPE, coroutine):
@@ -418,6 +493,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пример: `blonde_hair`",
             parse_mode="Markdown",
         )
+
+    elif data == "fav_export":
+        schedule_background_task(context, start_favorites_zip_export(query.message, user_id))
 
     elif data.startswith("fav_list_page_"):
         page_text = data.replace("fav_list_page_", "", 1)
@@ -1236,6 +1314,174 @@ async def send_post_media_to_chat(bot, chat_id: int, post: dict, caption: str = 
     )
 
 
+def image_extension_from_url(url: str) -> str:
+    path = urlparse(url).path.lower()
+    _, extension = os.path.splitext(path)
+    if extension in FAVORITES_EXPORT_IMAGE_EXTENSIONS:
+        return extension
+    return ""
+
+
+def is_exportable_image_url(url: str) -> bool:
+    return bool(image_extension_from_url(url))
+
+
+async def ensure_favorite_original_url(post: dict) -> dict:
+    if post.get("file_url"):
+        return post
+
+    try:
+        post_id = int(post.get("id"))
+    except (TypeError, ValueError):
+        return post
+
+    fresh_post = await api.get_post_by_id(post_id)
+    if fresh_post:
+        await remember_and_cache_post(fresh_post)
+        return fresh_post
+    return post
+
+
+async def download_original_favorite_image(
+    session: aiohttp.ClientSession,
+    post: dict,
+) -> tuple[str, bytes] | None:
+    post = await ensure_favorite_original_url(post)
+    url = post.get("file_url", "")
+    extension = image_extension_from_url(url)
+    if not extension:
+        return None
+
+    post_id = post.get("id", "unknown")
+    filename = f"{post_id}{extension}"
+    async with session.get(url, timeout=FAVORITES_EXPORT_TIMEOUT_SECONDS) as response:
+        if response.status != 200:
+            logger.warning(
+                "Favorite export download failed post=%s status=%s",
+                post_id,
+                response.status,
+            )
+            return None
+
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > FAVORITES_EXPORT_ZIP_LIMIT_BYTES:
+            logger.warning("Favorite export skipped oversized image post=%s", post_id)
+            return None
+
+        data = await response.read()
+        if len(data) > FAVORITES_EXPORT_ZIP_LIMIT_BYTES:
+            logger.warning("Favorite export skipped oversized image post=%s", post_id)
+            return None
+
+    return filename, data
+
+
+async def send_favorites_zip_export(message, user_id: int):
+    total = await count_favorites(user_id)
+    if total <= 0:
+        await message.reply_text("⭐ Избранное пока пустое.")
+        return
+
+    await message.reply_text(
+        f"📦 Собираю ZIP из избранного: {total} постов. Беру только оригинальные картинки."
+    )
+
+    favorites = await get_favorites(user_id, limit=None)
+    exported = 0
+    skipped = 0
+    part = 1
+
+    with tempfile.TemporaryDirectory(prefix=f"favorites_{user_id}_") as tempdir:
+        archive_path = os.path.join(tempdir, f"favorites_{part}.zip")
+        archive = zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED)
+        archive_size = 0
+        archive_count = 0
+        sent_parts = 0
+
+        async with aiohttp.ClientSession() as session:
+            for favorite in favorites:
+                downloaded = None
+                try:
+                    downloaded = await download_original_favorite_image(session, favorite)
+                except Exception as exc:
+                    logger.warning(
+                        "Favorite export failed post=%s: %s",
+                        favorite.get("id"),
+                        exc,
+                    )
+
+                if not downloaded:
+                    skipped += 1
+                    continue
+
+                filename, data = downloaded
+                if archive_count and archive_size + len(data) > FAVORITES_EXPORT_ZIP_LIMIT_BYTES:
+                    archive.close()
+                    with open(archive_path, "rb") as document:
+                        await message.reply_document(
+                            document=document,
+                            filename=os.path.basename(archive_path),
+                            caption=f"📦 Избранное, часть {part}",
+                        )
+                    sent_parts += 1
+                    part += 1
+                    archive_path = os.path.join(tempdir, f"favorites_{part}.zip")
+                    archive = zipfile.ZipFile(
+                        archive_path,
+                        "w",
+                        compression=zipfile.ZIP_DEFLATED,
+                    )
+                    archive_size = 0
+                    archive_count = 0
+
+                archive.writestr(filename, data)
+                archive_size += len(data)
+                archive_count += 1
+                exported += 1
+
+        archive.close()
+        if archive_count:
+            with open(archive_path, "rb") as document:
+                await message.reply_document(
+                    document=document,
+                    filename=os.path.basename(archive_path),
+                    caption=f"📦 Избранное, часть {part}",
+                )
+            sent_parts += 1
+
+    if exported:
+        await message.reply_text(
+            f"✅ Готово: {exported} картинок в {sent_parts} ZIP. Пропущено: {skipped}."
+        )
+    else:
+        await message.reply_text(
+            "❌ Не нашлось оригинальных картинок для архива. GIF, видео и посты без доступного file_url пропущены."
+        )
+
+
+async def start_favorites_zip_export(message, user_id: int):
+    if user_id in favorites_export_users:
+        await message.reply_text("📦 Архив избранного уже собирается.")
+        return
+
+    now = time.monotonic()
+    last_finished_at = favorites_export_last_finished_at.get(user_id, 0)
+    remaining = FAVORITES_EXPORT_COOLDOWN_SECONDS - (now - last_finished_at)
+    if remaining > 0:
+        minutes = max(1, int((remaining + 59) // 60))
+        await message.reply_text(
+            f"📦 Экспорт уже недавно запускался. Попробуйте через {minutes} мин."
+        )
+        return
+
+    favorites_export_users.add(user_id)
+    try:
+        await send_favorites_zip_export(message, user_id)
+    finally:
+        favorites_export_users.discard(user_id)
+        favorites_export_last_finished_at[user_id] = time.monotonic()
+
+
 async def show_subscription_posts_menu(
     message, user_id: int, sub_query: str, token: str, edit: bool = True
 ):
@@ -1467,6 +1713,7 @@ async def show_favorites(message, user_id: int, edit: bool = False):
                 [InlineKeyboardButton("🖼 Галерея", callback_data="fav_gallery")],
                 [InlineKeyboardButton("📋 Список", callback_data="fav_list")],
                 [InlineKeyboardButton("🔎 Найти по тегу", callback_data="fav_find")],
+                [InlineKeyboardButton("📦 Скачать ZIP", callback_data="fav_export")],
                 [InlineKeyboardButton("◀️ Назад", callback_data="back")],
             ]
         )
@@ -1553,6 +1800,10 @@ async def show_favorites_list(
         keyboard_rows.append(
             [InlineKeyboardButton("🖼 Галерея", callback_data="fav_gallery")]
         )
+        if not tag_filter:
+            keyboard_rows.append(
+                [InlineKeyboardButton("📦 Скачать ZIP", callback_data="fav_export")]
+            )
         keyboard_rows.append(
             [InlineKeyboardButton("◀️ Назад", callback_data="favorites")])
         keyboard = InlineKeyboardMarkup(keyboard_rows)
@@ -1569,7 +1820,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     state = user_states.get(user_id)
 
-    if state == "waiting_search":
+    if text.lower() in RESTART_TEXT_COMMANDS:
+        await request_restart(update, context)
+
+    elif state == "waiting_search":
         user_states.pop(user_id, None)
         schedule_background_task(context, send_image(update.message, user_id, text))
 
@@ -1763,6 +2017,26 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_settings_keyboard(),
         parse_mode="Markdown",
     )
+
+
+async def request_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global restart_requested
+
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ Недостаточно прав.")
+        logger.warning("Unauthorized restart attempt user=%s", user_id)
+        return
+
+    restart_requested = True
+    await update.message.reply_text("♻️ Перезапускаюсь...")
+    logger.warning("Restart requested by admin user=%s", user_id)
+    context.application.stop_running()
+
+
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only command to restart the bot via the launcher."""
+    await request_restart(update, context)
 
 
 async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1995,8 +2269,26 @@ async def process_subscriptions(app):
             await asyncio.sleep(60)
 
 
+async def heartbeat_loop():
+    started_at = time.monotonic()
+    while True:
+        try:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            logger.info(
+                "Heartbeat alive uptime=%ss user_states=%s recent_posts=%s export_jobs=%s",
+                int(time.monotonic() - started_at),
+                len(user_states),
+                len(recent_posts),
+                len(favorites_export_users),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Heartbeat loop error")
+
+
 async def post_init(application):
-    global subscription_task
+    global subscription_task, heartbeat_task
 
     bot = application.bot
 
@@ -2032,15 +2324,26 @@ async def post_init(application):
             process_subscriptions(application))
         logger.info("Фоновая задача подписок запущена")
 
+    if heartbeat_task is None or heartbeat_task.done():
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
+        logger.info("Heartbeat task started")
+
 
 async def post_shutdown(application):
     """Очистка при завершении"""
     # Останавливаем фоновую задачу
-    global subscription_task
+    global subscription_task, heartbeat_task
     if subscription_task and not subscription_task.done():
         subscription_task.cancel()
         try:
             await subscription_task
+        except asyncio.CancelledError:
+            pass
+
+    if heartbeat_task and not heartbeat_task.done():
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
         except asyncio.CancelledError:
             pass
 
@@ -2080,25 +2383,28 @@ def main():
     )
 
     # Регистрация обработчиков
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("search", search_command))
-    application.add_handler(CommandHandler("random", random_command))
-    application.add_handler(CommandHandler("blacklist", blacklist_command))
+    application.add_handler(CommandHandler("start", require_access(start)))
+    application.add_handler(CommandHandler("search", require_access(search_command)))
+    application.add_handler(CommandHandler("random", require_access(random_command)))
+    application.add_handler(CommandHandler("blacklist", require_access(blacklist_command)))
     application.add_handler(CommandHandler(
-        "subscriptions", subscriptions_command))
-    application.add_handler(CommandHandler("history", history_command))
-    application.add_handler(CommandHandler("favorites", favorites_command))
-    application.add_handler(CommandHandler("settings", settings_command))
-    application.add_handler(CommandHandler("tags", tags_command))
-    application.add_handler(CommandHandler("id", id_command))
-    application.add_handler(CallbackQueryHandler(button_handler))
+        "subscriptions", require_access(subscriptions_command)))
+    application.add_handler(CommandHandler("history", require_access(history_command)))
+    application.add_handler(CommandHandler("favorites", require_access(favorites_command)))
+    application.add_handler(CommandHandler("settings", require_access(settings_command)))
+    application.add_handler(CommandHandler("restart", require_access(restart_command)))
+    application.add_handler(CommandHandler("tags", require_access(tags_command)))
+    application.add_handler(CommandHandler("id", require_access(id_command)))
+    application.add_handler(CallbackQueryHandler(require_access(button_handler)))
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, require_access(message_handler))
     )
     application.add_error_handler(error_handler)
 
     logger.info("Бот запущен!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+    if restart_requested:
+        sys.exit(RESTART_EXIT_CODE)
 
 
 if __name__ == "__main__":

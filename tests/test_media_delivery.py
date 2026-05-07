@@ -66,22 +66,29 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(delivered)
         message.reply_text.assert_awaited_once()
 
-    def test_redacting_formatter_masks_bot_token(self):
+    def test_redacting_formatter_masks_known_secrets(self):
         formatter = bot.RedactingFormatter("%(message)s")
         record = logging.LogRecord(
             "test",
             logging.INFO,
             __file__,
             1,
-            "https://api.telegram.org/botsecret-token/getMe",
+            "token=secret-token key=secret-key uid=secret-user",
             (),
             None,
         )
 
-        with patch.object(bot, "BOT_TOKEN", "secret-token"):
+        with (
+            patch.object(bot, "BOT_TOKEN", "secret-token"),
+            patch.object(bot, "API_KEY", "secret-key"),
+            patch.object(bot, "API_USER_ID", "secret-user"),
+        ):
             message = formatter.format(record)
 
-        self.assertEqual(message, "https://api.telegram.org/bot<BOT_TOKEN>/getMe")
+        self.assertEqual(
+            message,
+            "token=<BOT_TOKEN> key=<API_KEY> uid=<API_USER_ID>",
+        )
 
 
 if __name__ == "__main__":

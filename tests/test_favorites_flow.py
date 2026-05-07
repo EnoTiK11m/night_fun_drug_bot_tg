@@ -3,7 +3,7 @@ import shutil
 import unittest
 import uuid
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import bot
 import bot_state
@@ -17,7 +17,13 @@ def make_callback_update(data: str, user_id: int = 1):
         answer=AsyncMock(),
         edit_message_text=AsyncMock(),
     )
-    return SimpleNamespace(callback_query=query), query
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=user_id, type="private"),
+        effective_message=query.message,
+    )
+    return update, query
 
 
 class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -34,6 +40,8 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         bot_state.DB_PATH = self.old_payload_db_path
         shutil.rmtree(self.tempdir, ignore_errors=True)
         bot.user_states.pop(1, None)
+        bot.favorites_export_users.clear()
+        bot.favorites_export_last_finished_at.clear()
 
     async def test_favorite_button_uses_cached_post_without_api_lookup(self):
         post = {
@@ -198,6 +206,89 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("fav_gallery", callbacks)
         self.assertIn("fav_list", callbacks)
         self.assertIn("fav_find", callbacks)
+        self.assertIn("fav_export", callbacks)
+
+    async def test_export_button_schedules_zip_export(self):
+        update, _query = make_callback_update("fav_export")
+        context = SimpleNamespace()
+        export_job = object()
+
+        with (
+            patch.object(bot, "start_favorites_zip_export", new=lambda message, user_id: export_job),
+            patch.object(bot, "schedule_background_task") as schedule_task,
+        ):
+            await bot.button_handler(update, context)
+
+        schedule_task.assert_called_once_with(context, export_job)
+
+    async def test_export_fetches_missing_original_url_by_id(self):
+        fresh_post = {"id": 123, "file_url": "https://example.test/original.jpg"}
+
+        with (
+            patch.object(bot.api, "get_post_by_id", AsyncMock(return_value=fresh_post)) as get_post,
+            patch.object(bot, "remember_and_cache_post", AsyncMock()) as cache_post,
+        ):
+            post = await bot.ensure_favorite_original_url({"id": 123, "file_url": ""})
+
+        self.assertEqual(post, fresh_post)
+        get_post.assert_awaited_once_with(123)
+        cache_post.assert_awaited_once_with(fresh_post)
+
+    def test_export_uses_only_static_original_images(self):
+        self.assertTrue(bot.is_exportable_image_url("https://example.test/1.jpg"))
+        self.assertTrue(bot.is_exportable_image_url("https://example.test/2.PNG?download=1"))
+        self.assertFalse(bot.is_exportable_image_url("https://example.test/3.gif"))
+        self.assertFalse(bot.is_exportable_image_url("https://example.test/4.mp4"))
+
+    async def test_zip_export_sends_downloaded_static_images_and_skips_others(self):
+        class FakeClientSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        message = SimpleNamespace(reply_text=AsyncMock(), reply_document=AsyncMock())
+        favorites = [
+            {"id": 1, "file_url": "https://example.test/1.jpg"},
+            {"id": 2, "file_url": "https://example.test/2.gif"},
+            {"id": 3, "file_url": "https://example.test/3.png"},
+        ]
+
+        async def fake_download(_session, favorite):
+            if favorite["id"] == 2:
+                return None
+            return f"{favorite['id']}.jpg", b"image-data"
+
+        with (
+            patch.object(bot, "count_favorites", AsyncMock(return_value=3)),
+            patch.object(bot, "get_favorites", AsyncMock(return_value=favorites)),
+            patch.object(bot, "download_original_favorite_image", AsyncMock(side_effect=fake_download)),
+            patch.object(bot.aiohttp, "ClientSession", return_value=FakeClientSession()),
+        ):
+            await bot.send_favorites_zip_export(message, 1)
+
+        message.reply_document.assert_awaited_once()
+        final_text = message.reply_text.await_args_list[-1].args[0]
+        self.assertIn("2", final_text)
+        self.assertIn("1", final_text)
+
+    async def test_zip_export_rejects_parallel_export_for_same_user(self):
+        bot.favorites_export_users.add(1)
+        message = SimpleNamespace(reply_text=AsyncMock())
+
+        await bot.start_favorites_zip_export(message, 1)
+
+        message.reply_text.assert_awaited_once_with("📦 Архив избранного уже собирается.")
+
+    async def test_zip_export_uses_cooldown_after_success(self):
+        message = SimpleNamespace(reply_text=AsyncMock())
+        bot.favorites_export_last_finished_at[1] = bot.time.monotonic()
+
+        await bot.start_favorites_zip_export(message, 1)
+
+        text = message.reply_text.await_args.args[0]
+        self.assertIn("Экспорт уже недавно запускался", text)
 
     async def test_favorites_gallery_loads_single_post_by_index(self):
         message = SimpleNamespace(reply_text=AsyncMock())
@@ -261,6 +352,104 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
             tag_filter="solo",
         )
         self.assertNotIn(1, bot.user_states)
+
+    async def test_restart_command_rejects_non_admin(self):
+        old_restart_requested = bot.restart_requested
+        bot.restart_requested = False
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        context = SimpleNamespace(application=SimpleNamespace(stop_running=Mock()))
+
+        try:
+            with patch.object(bot, "ADMIN_USER_IDS", {2}):
+                await bot.restart_command(update, context)
+        finally:
+            bot.restart_requested = old_restart_requested
+
+        update.message.reply_text.assert_awaited_once_with("❌ Недостаточно прав.")
+        context.application.stop_running.assert_not_called()
+
+    async def test_restart_command_stops_application_for_admin(self):
+        old_restart_requested = bot.restart_requested
+        bot.restart_requested = False
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        context = SimpleNamespace(application=SimpleNamespace(stop_running=Mock()))
+
+        try:
+            with patch.object(bot, "ADMIN_USER_IDS", {1}):
+                await bot.restart_command(update, context)
+                self.assertTrue(bot.restart_requested)
+        finally:
+            bot.restart_requested = old_restart_requested
+
+        update.message.reply_text.assert_awaited_once_with("♻️ Перезапускаюсь...")
+        context.application.stop_running.assert_called_once()
+
+    async def test_restart_text_stops_application_for_admin(self):
+        old_restart_requested = bot.restart_requested
+        bot.restart_requested = False
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=SimpleNamespace(text="рестарт", reply_text=AsyncMock()),
+        )
+        context = SimpleNamespace(application=SimpleNamespace(stop_running=Mock()))
+
+        try:
+            with patch.object(bot, "ADMIN_USER_IDS", {1}):
+                await bot.message_handler(update, context)
+                self.assertTrue(bot.restart_requested)
+        finally:
+            bot.restart_requested = old_restart_requested
+
+        update.message.reply_text.assert_awaited_once_with("♻️ Перезапускаюсь...")
+        context.application.stop_running.assert_called_once()
+
+    def test_access_allows_private_users_by_default(self):
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=10),
+            effective_chat=SimpleNamespace(id=10, type="private"),
+        )
+
+        with (
+            patch.object(bot, "ADMIN_USER_IDS", set()),
+            patch.object(bot, "ALLOWED_USER_IDS", set()),
+            patch.object(bot, "ALLOWED_CHAT_IDS", set()),
+            patch.object(bot, "ALLOW_GROUP_CHATS", False),
+        ):
+            self.assertTrue(bot.is_access_allowed(update))
+
+    def test_access_blocks_unlisted_group_by_default(self):
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=10),
+            effective_chat=SimpleNamespace(id=-100, type="supergroup"),
+        )
+
+        with (
+            patch.object(bot, "ADMIN_USER_IDS", set()),
+            patch.object(bot, "ALLOWED_USER_IDS", set()),
+            patch.object(bot, "ALLOWED_CHAT_IDS", set()),
+            patch.object(bot, "ALLOW_GROUP_CHATS", False),
+        ):
+            self.assertFalse(bot.is_access_allowed(update))
+
+    def test_access_allows_configured_chat(self):
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=10),
+            effective_chat=SimpleNamespace(id=-100, type="supergroup"),
+        )
+
+        with (
+            patch.object(bot, "ADMIN_USER_IDS", set()),
+            patch.object(bot, "ALLOWED_USER_IDS", set()),
+            patch.object(bot, "ALLOWED_CHAT_IDS", {-100}),
+            patch.object(bot, "ALLOW_GROUP_CHATS", False),
+        ):
+            self.assertTrue(bot.is_access_allowed(update))
 
 
 class CallbackPayloadStateTests(unittest.TestCase):

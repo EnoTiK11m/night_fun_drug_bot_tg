@@ -18,6 +18,34 @@ def _get_int_env(name: str, default: int) -> int:
         return default
 
 
+def _get_int_set_env(name: str) -> set[int]:
+    raw_value = os.getenv(name, "")
+    values: set[int] = set()
+    for item in raw_value.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.add(int(item))
+        except ValueError:
+            _CONFIG_ERRORS.append(f"{name} must contain only integer IDs")
+            break
+    return values
+
+
+def _get_bool_env(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    value = raw_value.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    _CONFIG_ERRORS.append(f"{name} must be a boolean")
+    return default
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # API настройки
@@ -29,6 +57,10 @@ API_USER_ID = os.getenv("API_USER_ID")
 API_KEY = os.getenv("API_KEY")
 SEARCH_COOLDOWN_SECONDS = _get_int_env("SEARCH_COOLDOWN_SECONDS", 3)
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+ADMIN_USER_IDS = _get_int_set_env("ADMIN_USER_IDS")
+ALLOWED_USER_IDS = _get_int_set_env("ALLOWED_USER_IDS") | ADMIN_USER_IDS
+ALLOWED_CHAT_IDS = _get_int_set_env("ALLOWED_CHAT_IDS")
+ALLOW_GROUP_CHATS = _get_bool_env("ALLOW_GROUP_CHATS", False)
 
 # Temporarily simplified blacklist for testing
 DEFAULT_BLACKLIST = {
