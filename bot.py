@@ -2253,15 +2253,22 @@ async def process_subscriptions(app):
     logger.info("Запущена фоновая задача для подписок")
     semaphore = asyncio.Semaphore(SUBSCRIPTION_CONCURRENCY)
 
-    async def guarded(subscription):
+    async def guarded_user(subscriptions):
         async with semaphore:
-            await process_one_subscription(app, subscription)
+            for subscription in subscriptions:
+                await process_one_subscription(app, subscription)
 
     while True:
         try:
             await release_stale_subscription_claims()
             due_subs = await get_due_subscriptions()
-            await asyncio.gather(*(guarded(subscription) for subscription in due_subs))
+            subscriptions_by_user = {}
+            for subscription in due_subs:
+                subscriptions_by_user.setdefault(subscription[0], []).append(subscription)
+            await asyncio.gather(*(
+                guarded_user(subscriptions)
+                for subscriptions in subscriptions_by_user.values()
+            ))
             await asyncio.sleep(60)
 
         except Exception:

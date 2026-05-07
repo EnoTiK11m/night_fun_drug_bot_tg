@@ -963,8 +963,8 @@ async def release_stale_subscription_claims():
             SET processing_until = NULL,
                 processing_token = NULL
             WHERE processing_until IS NOT NULL
-              AND datetime(processing_until) <= datetime('now', '+' || ? || ' minutes')
-        """, (SUBSCRIPTION_CLAIM_MINUTES,))
+              AND datetime(processing_until) <= datetime('now')
+        """)
         await db.commit()
 
 
