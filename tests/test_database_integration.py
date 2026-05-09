@@ -34,6 +34,33 @@ class SubscriptionClaimTests(TempDatabaseTestCase):
         await database.release_subscription_claim(1, "tag", token)
         self.assertIsNotNone(await database.claim_due_subscription(1, "tag"))
 
+    async def test_release_stale_claims_keeps_active_claim(self):
+        self.assertTrue(await database.add_subscription(1, "tag", 10))
+
+        token = await database.claim_due_subscription(1, "tag")
+        self.assertIsNotNone(token)
+
+        await database.release_stale_subscription_claims()
+
+        self.assertIsNone(await database.claim_due_subscription(1, "tag"))
+
+    async def test_release_stale_claims_releases_expired_claim(self):
+        self.assertTrue(await database.add_subscription(1, "tag", 10))
+
+        token = await database.claim_due_subscription(1, "tag")
+        self.assertIsNotNone(token)
+        async with database.connect_db() as db:
+            await db.execute("""
+                UPDATE subscriptions
+                SET processing_until = datetime('now', '-1 minute')
+                WHERE user_id = ? AND query = ?
+            """, (1, "tag"))
+            await db.commit()
+
+        await database.release_stale_subscription_claims()
+
+        self.assertIsNotNone(await database.claim_due_subscription(1, "tag"))
+
     async def test_update_subscription_time_requires_matching_token(self):
         self.assertTrue(await database.add_subscription(1, "tag", 10))
         token = await database.claim_due_subscription(1, "tag")

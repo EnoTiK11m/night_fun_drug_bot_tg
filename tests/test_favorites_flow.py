@@ -108,7 +108,10 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         data = bot.store_callback_payload("subscribe", "tag")
         update, query = make_callback_update(data)
 
-        with patch.object(bot, "add_subscription", AsyncMock(return_value=True)) as add_subscription:
+        with (
+            patch.object(bot, "add_subscription", AsyncMock(return_value=True)) as add_subscription,
+            patch.object(bot, "get_subscription_pause_until", AsyncMock(return_value=None)),
+        ):
             await bot.button_handler(update, SimpleNamespace())
 
         add_subscription.assert_awaited_once_with(1, "tag", 10)
