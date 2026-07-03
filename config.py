@@ -56,6 +56,12 @@ AUTOCOMPLETE_URL = "https://api.rule34.xxx/autocomplete.php"
 API_USER_ID = os.getenv("API_USER_ID")
 API_KEY = os.getenv("API_KEY")
 SEARCH_COOLDOWN_SECONDS = _get_int_env("SEARCH_COOLDOWN_SECONDS", 3)
+SUBSCRIPTION_CHECK_INTERVAL_SECONDS = max(
+    30, _get_int_env("SUBSCRIPTION_CHECK_INTERVAL_SECONDS", 120)
+)
+SUBSCRIPTION_MAX_POSTS_PER_USER_PASS = max(
+    1, min(2, _get_int_env("SUBSCRIPTION_MAX_POSTS_PER_USER_PASS", 2))
+)
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 ADMIN_USER_IDS = _get_int_set_env("ADMIN_USER_IDS")
 ALLOWED_USER_IDS = _get_int_set_env("ALLOWED_USER_IDS") | ADMIN_USER_IDS

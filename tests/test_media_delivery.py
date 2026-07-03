@@ -3,9 +3,14 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import bot
+from bot_delivery import telegram_rate_limiter
+from telegram.error import RetryAfter
 
 
 class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        telegram_rate_limiter.reset()
+
     async def test_send_post_media_tries_sample_url_after_file_url_failure(self):
         message = AsyncMock()
         message.reply_photo = AsyncMock(side_effect=[Exception("bad file"), None])
@@ -65,6 +70,30 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(delivered)
         message.reply_text.assert_awaited_once()
+
+    async def test_retry_after_stops_url_fallback_and_text_fallback(self):
+        telegram_bot = AsyncMock()
+        telegram_bot.send_photo = AsyncMock(side_effect=RetryAfter(10))
+        post = {
+            "id": 1,
+            "file_url": "https://example.test/original.jpg",
+            "sample_url": "https://example.test/sample.jpg",
+            "preview_url": "https://example.test/preview.jpg",
+        }
+
+        with patch.object(
+            telegram_rate_limiter,
+            "wait_for_slot",
+            AsyncMock(return_value=True),
+        ):
+            delivered = await bot.send_post_media_to_chat(
+                telegram_bot, 123, post, keyboard=object()
+            )
+
+        self.assertFalse(delivered)
+        telegram_bot.send_photo.assert_awaited_once()
+        telegram_bot.send_message.assert_not_awaited()
+        self.assertFalse(await telegram_rate_limiter.wait_for_slot(123))
 
     def test_redacting_formatter_masks_known_secrets(self):
         formatter = bot.RedactingFormatter("%(message)s")

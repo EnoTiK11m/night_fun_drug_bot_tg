@@ -40,6 +40,8 @@ from config import (
     API_USER_ID,
     BOT_TOKEN,
     SEARCH_COOLDOWN_SECONDS,
+    SUBSCRIPTION_CHECK_INTERVAL_SECONDS,
+    SUBSCRIPTION_MAX_POSTS_PER_USER_PASS,
     validate_config,
 )
 from bot_formatting import (
@@ -73,6 +75,7 @@ from bot_media import (
     get_media_url_candidates,
     send_post_media as send_post_media_with_retries,
     send_post_media_to_chat as send_post_media_to_chat_with_retries,
+    send_text_to_chat,
 )
 from bot_state import (
     get_callback_payload,
@@ -2120,7 +2123,7 @@ async def process_one_subscription(app, subscription):
     user_id, query, interval, empty_count = subscription
     processing_token = await claim_due_subscription(user_id, query)
     if not processing_token:
-        return
+        return False
 
     try:
         logger.info("Отправляем подписку пользователю %s: %s", user_id, query)
@@ -2160,7 +2163,7 @@ async def process_one_subscription(app, subscription):
                     )
             else:
                 await release_subscription_claim(user_id, query, processing_token)
-            return
+            return bool(delivered)
 
         empty_count, backoff_minutes, should_notify = await mark_subscription_empty(
             user_id, query, processing_token
@@ -2173,8 +2176,9 @@ async def process_one_subscription(app, subscription):
             backoff_minutes,
         )
         if should_notify:
-            await app.bot.send_message(
-                chat_id=user_id,
+            await send_text_to_chat(
+                app.bot,
+                user_id,
                 text=(
                     f"🕒 По подписке `{md_code(query)}` пока нет новых постов.\n\n"
                     f"Я продолжу проверять ее реже: следующая проверка примерно через {backoff_minutes} мин. "
@@ -2183,6 +2187,7 @@ async def process_one_subscription(app, subscription):
                 parse_mode="Markdown",
                 reply_markup=get_subscriptions_keyboard(),
             )
+        return False
 
     except APITemporaryError as e:
         await release_subscription_claim(user_id, query, processing_token)
@@ -2192,9 +2197,11 @@ async def process_one_subscription(app, subscription):
             query,
             e,
         )
+        return False
     except Exception:
         await release_subscription_claim(user_id, query, processing_token)
         logger.exception("Subscription processing error for user %s", user_id)
+        return False
 
 
 async def get_subscription_cached_image(user_id: int, query: str, blacklist: set, excluded_post_ids: set):
@@ -2255,8 +2262,15 @@ async def process_subscriptions(app):
 
     async def guarded_user(subscriptions):
         async with semaphore:
-            for subscription in subscriptions:
-                await process_one_subscription(app, subscription)
+            sent_this_pass = 0
+            for subscription in subscriptions[:SUBSCRIPTION_MAX_POSTS_PER_USER_PASS]:
+                sent_this_pass += bool(await process_one_subscription(app, subscription))
+            logger.info(
+                "Subscription pass user=%s sent=%s due=%s",
+                subscriptions[0][0],
+                sent_this_pass,
+                len(subscriptions),
+            )
 
     while True:
         try:
@@ -2269,11 +2283,16 @@ async def process_subscriptions(app):
                 guarded_user(subscriptions)
                 for subscriptions in subscriptions_by_user.values()
             ))
-            await asyncio.sleep(60)
+            logger.info(
+                "Subscription pass complete users=%s due=%s",
+                len(subscriptions_by_user),
+                len(due_subs),
+            )
+            await asyncio.sleep(SUBSCRIPTION_CHECK_INTERVAL_SECONDS)
 
         except Exception:
             logger.exception("Ошибка в фоновой задаче подписок")
-            await asyncio.sleep(60)
+            await asyncio.sleep(SUBSCRIPTION_CHECK_INTERVAL_SECONDS)
 
 
 async def heartbeat_loop():

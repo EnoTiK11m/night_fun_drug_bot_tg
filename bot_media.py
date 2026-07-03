@@ -1,10 +1,25 @@
 import asyncio
 import logging
 
+from telegram.error import RetryAfter
+
+from bot_delivery import telegram_rate_limiter
 from bot_formatting import md_text
 from bot_keyboards import get_subscription_image_keyboard
 
 logger = logging.getLogger(__name__)
+
+
+def _message_user_id(message) -> int:
+    user = getattr(message, "from_user", None)
+    chat = getattr(message, "chat", None)
+    user_id = getattr(user, "id", None)
+    chat_id = getattr(chat, "id", None)
+    if isinstance(chat_id, int):
+        return chat_id
+    if isinstance(user_id, int):
+        return user_id
+    return id(message)
 
 
 def get_media_url_candidates(post: dict) -> list[tuple[str, str]]:
@@ -17,6 +32,9 @@ def get_media_url_candidates(post: dict) -> list[tuple[str, str]]:
 
 
 async def reply_media_url(message, url: str, caption: str, reply_markup):
+    user_id = _message_user_id(message)
+    if not await telegram_rate_limiter.wait_for_slot(user_id):
+        return False
     if url.lower().endswith((".mp4", ".webm")):
         await message.reply_video(
             url,
@@ -38,9 +56,12 @@ async def reply_media_url(message, url: str, caption: str, reply_markup):
             parse_mode="Markdown",
             reply_markup=reply_markup,
         )
+    return True
 
 
 async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup):
+    if not await telegram_rate_limiter.wait_for_slot(chat_id):
+        return False
     if url.lower().endswith((".mp4", ".webm")):
         await bot.send_video(
             chat_id=chat_id,
@@ -65,6 +86,30 @@ async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup
             parse_mode="Markdown",
             reply_markup=reply_markup,
         )
+    return True
+
+
+async def _reply_text(message, text: str, **kwargs) -> bool:
+    user_id = _message_user_id(message)
+    if not await telegram_rate_limiter.wait_for_slot(user_id):
+        return False
+    try:
+        await message.reply_text(text, **kwargs)
+        return True
+    except RetryAfter as exc:
+        telegram_rate_limiter.apply_retry_after(user_id, exc)
+        return False
+
+
+async def send_text_to_chat(bot, chat_id: int, **kwargs) -> bool:
+    if not await telegram_rate_limiter.wait_for_slot(chat_id):
+        return False
+    try:
+        await bot.send_message(chat_id=chat_id, **kwargs)
+        return True
+    except RetryAfter as exc:
+        telegram_rate_limiter.apply_retry_after(chat_id, exc)
+        return False
 
 
 async def send_post_media(
@@ -78,7 +123,8 @@ async def send_post_media(
     candidates = get_media_url_candidates(post)
     fallback_url = candidates[0][1] if candidates else ""
     if not fallback_url:
-        await message.reply_text(
+        await _reply_text(
+            message,
             "⚠️ У этого поста нет сохранённой ссылки на файл. "
             "Попробуйте открыть свежий пост или найти его через `/id`.",
             parse_mode="Markdown",
@@ -90,13 +136,18 @@ async def send_post_media(
     for url_kind, media_url in candidates:
         for attempt in range(1, retries + 1):
             try:
-                await reply_media_url(message, media_url, caption, reply_markup)
+                sent = await reply_media_url(message, media_url, caption, reply_markup)
+                if not sent:
+                    return False
                 logger.info(
                     "Media send ok post=%s url_kind=%s",
                     post.get("id"),
                     url_kind,
                 )
                 return True
+            except RetryAfter as exc:
+                telegram_rate_limiter.apply_retry_after(_message_user_id(message), exc)
+                return False
             except Exception as exc:
                 logger.warning(
                     "Media send failed post=%s url_kind=%s attempt=%s/%s: %s",
@@ -116,13 +167,15 @@ async def send_post_media(
     )
     if caption:
         fallback += f"\n\n{caption}"
-    await message.reply_text(
+    sent = await _reply_text(
+        message,
         fallback,
         parse_mode="Markdown",
         reply_markup=reply_markup,
     )
-    logger.warning("Media fallback sent post=%s", post.get("id"))
-    return True
+    if sent:
+        logger.warning("Media fallback sent post=%s", post.get("id"))
+    return sent
 
 
 async def send_post_media_to_chat(
@@ -137,8 +190,9 @@ async def send_post_media_to_chat(
     candidates = get_media_url_candidates(post)
     fallback_url = candidates[0][1] if candidates else ""
     if not fallback_url:
-        await bot.send_message(
-            chat_id=chat_id,
+        await send_text_to_chat(
+            bot,
+            chat_id,
             text=(
                 "⚠️ У этого поста нет сохранённой ссылки на файл. "
                 "Попробуйте открыть свежий пост или найти его через `/id`."
@@ -156,7 +210,9 @@ async def send_post_media_to_chat(
     for url_kind, media_url in candidates:
         for attempt in range(1, retries + 1):
             try:
-                await send_media_url(bot, chat_id, media_url, caption, reply_markup)
+                sent = await send_media_url(bot, chat_id, media_url, caption, reply_markup)
+                if not sent:
+                    return False
                 logger.info(
                     "Subscription media send ok user=%s post=%s url_kind=%s",
                     chat_id,
@@ -164,6 +220,9 @@ async def send_post_media_to_chat(
                     url_kind,
                 )
                 return True
+            except RetryAfter as exc:
+                telegram_rate_limiter.apply_retry_after(chat_id, exc)
+                return False
             except Exception as exc:
                 logger.warning(
                     "Subscription media send failed user=%s post=%s url_kind=%s attempt=%s/%s: %s",
@@ -184,15 +243,17 @@ async def send_post_media_to_chat(
     )
     if caption:
         fallback += f"\n\n{caption}"
-    await bot.send_message(
-        chat_id=chat_id,
+    sent = await send_text_to_chat(
+        bot,
+        chat_id,
         text=fallback,
         parse_mode="Markdown",
         reply_markup=reply_markup,
     )
-    logger.warning(
-        "Subscription media fallback sent user=%s post=%s",
-        chat_id,
-        post.get("id"),
-    )
-    return True
+    if sent:
+        logger.warning(
+            "Subscription media fallback sent user=%s post=%s",
+            chat_id,
+            post.get("id"),
+        )
+    return sent
