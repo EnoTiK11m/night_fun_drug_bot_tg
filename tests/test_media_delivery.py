@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import bot
-from bot_delivery import telegram_rate_limiter
+from bot_delivery import TelegramRateLimiter, telegram_rate_limiter
 from telegram.error import RetryAfter
 
 
@@ -71,9 +71,9 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(delivered)
         message.reply_text.assert_awaited_once()
 
-    async def test_retry_after_stops_url_fallback_and_text_fallback(self):
+    async def test_retry_after_retries_same_url_without_fallback(self):
         telegram_bot = AsyncMock()
-        telegram_bot.send_photo = AsyncMock(side_effect=RetryAfter(10))
+        telegram_bot.send_photo = AsyncMock(side_effect=[RetryAfter(10), None])
         post = {
             "id": 1,
             "file_url": "https://example.test/original.jpg",
@@ -90,10 +90,79 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 telegram_bot, 123, post, keyboard=object()
             )
 
-        self.assertFalse(delivered)
-        telegram_bot.send_photo.assert_awaited_once()
+        self.assertTrue(delivered)
+        self.assertEqual(telegram_bot.send_photo.await_count, 2)
+        self.assertEqual(
+            telegram_bot.send_photo.await_args_list[0].kwargs["photo"],
+            "https://example.test/original.jpg",
+        )
+        self.assertEqual(
+            telegram_bot.send_photo.await_args_list[1].kwargs["photo"],
+            "https://example.test/original.jpg",
+        )
         telegram_bot.send_message.assert_not_awaited()
-        self.assertFalse(await telegram_rate_limiter.wait_for_slot(123))
+
+    async def test_rate_limiter_waits_for_retry_after_cooldown(self):
+        limiter = TelegramRateLimiter(per_user_seconds=0, global_per_second=25)
+
+        with (
+            patch(
+                "bot_delivery.time.monotonic",
+                side_effect=[100.0, 100.0, 107.0, 107.0, 107.0],
+            ),
+            patch("bot_delivery.asyncio.sleep", new=AsyncMock()) as sleep,
+        ):
+            limiter.apply_retry_after(123, RetryAfter(2))
+            allowed = await limiter.wait_for_slot(123)
+
+        self.assertTrue(allowed)
+        sleep.assert_awaited_once_with(7.0)
+
+    async def test_user_cooldown_does_not_delay_other_users(self):
+        limiter = TelegramRateLimiter(per_user_seconds=0, global_per_second=25)
+
+        with (
+            patch(
+                "bot_delivery.time.monotonic",
+                side_effect=[100.0, 100.0, 100.0, 100.0],
+            ),
+            patch("bot_delivery.asyncio.sleep", new=AsyncMock()) as sleep,
+        ):
+            limiter.apply_retry_after(123, RetryAfter(2))
+            allowed = await limiter.wait_for_slot(456)
+
+        self.assertTrue(allowed)
+        sleep.assert_not_awaited()
+
+    async def test_new_cooldown_during_pacing_wait_is_honored(self):
+        limiter = TelegramRateLimiter(per_user_seconds=0, global_per_second=25)
+        limiter._next_global_send = 101.0
+
+        async def apply_cooldown_during_first_sleep(_delay):
+            if sleep.await_count == 1:
+                limiter.apply_retry_after(123, RetryAfter(2))
+
+        sleep = AsyncMock(side_effect=apply_cooldown_during_first_sleep)
+        with (
+            patch(
+                "bot_delivery.time.monotonic",
+                side_effect=[
+                    100.0,
+                    100.0,
+                    100.0,
+                    100.0,
+                    100.0,
+                    107.0,
+                    107.0,
+                    107.0,
+                ],
+            ),
+            patch("bot_delivery.asyncio.sleep", new=sleep),
+        ):
+            allowed = await limiter.wait_for_slot(123)
+
+        self.assertTrue(allowed)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1.0, 7.0])
 
     def test_redacting_formatter_masks_known_secrets(self):
         formatter = bot.RedactingFormatter("%(message)s")

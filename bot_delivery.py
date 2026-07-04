@@ -27,47 +27,45 @@ class TelegramRateLimiter:
         self._cooldowns: dict[int, float] = {}
 
     async def wait_for_slot(self, user_id: int) -> bool:
-        now = time.monotonic()
-        cooldown_until = self._cooldowns.get(user_id, 0.0)
-        if cooldown_until > now:
-            logger.info(
-                "Telegram send skipped user=%s cooldown_remaining=%.1fs",
-                user_id,
-                cooldown_until - now,
-            )
-            return False
-
-        async with self._lock:
+        while True:
             now = time.monotonic()
             cooldown_until = self._cooldowns.get(user_id, 0.0)
             if cooldown_until > now:
                 logger.info(
-                    "Telegram send skipped user=%s cooldown_remaining=%.1fs",
+                    "Telegram send delayed user=%s cooldown_remaining=%.1fs",
                     user_id,
                     cooldown_until - now,
                 )
-                return False
-            send_at = max(
-                now,
-                self._next_global_send,
-                self._next_user_send.get(user_id, 0.0),
-            )
-            self._next_global_send = send_at + self.global_interval
-            self._next_user_send[user_id] = send_at + self.per_user_seconds
+                await asyncio.sleep(cooldown_until - now)
+                continue
 
-        if send_at > now:
-            await asyncio.sleep(send_at - now)
+            async with self._lock:
+                now = time.monotonic()
+                cooldown_until = self._cooldowns.get(user_id, 0.0)
+                if cooldown_until > now:
+                    cooldown_delay = cooldown_until - now
+                    send_at = None
+                else:
+                    cooldown_delay = 0.0
+                    send_at = max(
+                        now,
+                        self._next_global_send,
+                        self._next_user_send.get(user_id, 0.0),
+                    )
+                    self._next_global_send = send_at + self.global_interval
+                    self._next_user_send[user_id] = send_at + self.per_user_seconds
 
-        now = time.monotonic()
-        cooldown_until = self._cooldowns.get(user_id, 0.0)
-        if cooldown_until > now:
-            logger.info(
-                "Telegram send skipped user=%s cooldown_remaining=%.1fs",
-                user_id,
-                cooldown_until - now,
-            )
-            return False
-        return True
+            if send_at is None:
+                await asyncio.sleep(cooldown_delay)
+                continue
+
+            if send_at > now:
+                await asyncio.sleep(send_at - now)
+
+            now = time.monotonic()
+            if self._cooldowns.get(user_id, 0.0) > now:
+                continue
+            return True
 
     def apply_retry_after(self, user_id: int, error: RetryAfter) -> float:
         wait_seconds = retry_after_seconds(error) + 5.0

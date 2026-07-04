@@ -147,7 +147,8 @@ async def send_post_media(
                 return True
             except RetryAfter as exc:
                 telegram_rate_limiter.apply_retry_after(_message_user_id(message), exc)
-                return False
+                if attempt == retries:
+                    return False
             except Exception as exc:
                 logger.warning(
                     "Media send failed post=%s url_kind=%s attempt=%s/%s: %s",
@@ -222,7 +223,8 @@ async def send_post_media_to_chat(
                 return True
             except RetryAfter as exc:
                 telegram_rate_limiter.apply_retry_after(chat_id, exc)
-                return False
+                if attempt == retries:
+                    return False
             except Exception as exc:
                 logger.warning(
                     "Subscription media send failed user=%s post=%s url_kind=%s attempt=%s/%s: %s",
