@@ -164,25 +164,38 @@ def configure_logging():
     formatter = RedactingFormatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    handlers = [
-        logging.StreamHandler(),
-        RotatingFileHandler(
+    info_handler = RotatingFileHandler(
             os.path.join("logs", "info.log"),
             maxBytes=5 * 1024 * 1024,
             backupCount=3,
             encoding="utf-8",
-        ),
-        RotatingFileHandler(
+        )
+    warning_handler = RotatingFileHandler(
             os.path.join("logs", "warnings.log"),
             maxBytes=5 * 1024 * 1024,
             backupCount=3,
             encoding="utf-8",
-        ),
-    ]
-    handlers[0].setLevel(logging.INFO)
-    handlers[1].setLevel(logging.INFO)
-    handlers[2].setLevel(logging.WARNING)
-    handlers[1].addFilter(ExactLevelFilter(logging.INFO))
+        )
+    error_handler = RotatingFileHandler(
+            os.path.join("logs", "errors.log"),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+
+    info_handler.setLevel(logging.INFO)
+    info_handler.addFilter(ExactLevelFilter(logging.INFO))
+    warning_handler.setLevel(logging.WARNING)
+    warning_handler.addFilter(ExactLevelFilter(logging.WARNING))
+    error_handler.setLevel(logging.ERROR)
+
+    handlers = [info_handler, warning_handler, error_handler]
+    # Avoid duplicating all application logs into the launcher's redirected
+    # stderr file. An interactive terminal still gets normal console output.
+    if sys.stderr.isatty():
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        handlers.append(console_handler)
     for handler in handlers:
         handler.setFormatter(formatter)
 

@@ -3,7 +3,9 @@ mkdir logs 2>nul
 
 :restart
 echo [%date% %time%] Launcher started >> logs\bat_launcher.log
-python bot.py >> logs\script_output.log 2>> logs\script_errors.log
+rem Application logs are rotated by Python. These files only capture raw output
+rem emitted before logging is configured, such as import and syntax errors.
+python bot.py > logs\startup_output.log 2> logs\startup_errors.log
 set EXIT_CODE=%ERRORLEVEL%
 echo [%date% %time%] Launcher stopped with code %EXIT_CODE% >> logs\bat_launcher.log
 
