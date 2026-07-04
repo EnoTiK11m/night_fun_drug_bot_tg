@@ -3,13 +3,23 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import bot
-from bot_delivery import TelegramRateLimiter, telegram_rate_limiter
+from bot_delivery import (
+    TELEGRAM_MESSAGES_PER_CHAT_MINUTE,
+    TelegramRateLimiter,
+    telegram_rate_limiter,
+)
 from telegram.error import RetryAfter
 
 
 class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         telegram_rate_limiter.reset()
+
+    def test_default_rate_limit_is_45_messages_per_chat_per_minute(self):
+        limiter = TelegramRateLimiter()
+
+        self.assertEqual(TELEGRAM_MESSAGES_PER_CHAT_MINUTE, 45)
+        self.assertAlmostEqual(limiter.per_user_seconds, 60 / 45)
 
     async def test_send_post_media_tries_sample_url_after_file_url_failure(self):
         message = AsyncMock()

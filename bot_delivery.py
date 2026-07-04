@@ -7,6 +7,8 @@ from telegram.error import RetryAfter
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_MESSAGES_PER_CHAT_MINUTE = 45
+
 
 def retry_after_seconds(error: RetryAfter) -> float:
     value = error.retry_after
@@ -18,7 +20,11 @@ def retry_after_seconds(error: RetryAfter) -> float:
 class TelegramRateLimiter:
     """In-process per-user/global pacing plus Telegram RetryAfter cooldowns."""
 
-    def __init__(self, per_user_seconds: float = 1.0, global_per_second: int = 25):
+    def __init__(
+        self,
+        per_user_seconds: float = 60 / TELEGRAM_MESSAGES_PER_CHAT_MINUTE,
+        global_per_second: int = 25,
+    ):
         self.per_user_seconds = max(0.0, per_user_seconds)
         self.global_interval = 1.0 / max(1, global_per_second)
         self._lock = asyncio.Lock()
