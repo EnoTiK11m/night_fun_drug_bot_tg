@@ -11,14 +11,8 @@ bot_data.db
 bot_data.db-*
 .pytest_cache/
 .coverage
-.agents/
+.codex/
 skills-lock.json
 .venv/
 venv/
 env/
-.idea/
-.vscode/
-*.tmp
-*.bak
-*.sqlite
-*.sqlite3
