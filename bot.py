@@ -2124,6 +2124,47 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def blacklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /blacklist"""
+    if context.args:
+        action = context.args[0].lower()
+        tags = [tag.lower() for tag in context.args[1:] if tag.strip()]
+        if action not in {"add", "remove"} or not tags:
+            await update.message.reply_text(
+                "Использование:\n"
+                "`/blacklist add <тег>`\n"
+                "`/blacklist remove <тег>`",
+                parse_mode="Markdown",
+            )
+            return
+
+        changed = []
+        unchanged = []
+        operation = add_to_blacklist if action == "add" else remove_from_blacklist
+        for tag in tags:
+            if await operation(update.effective_user.id, tag):
+                changed.append(tag)
+            else:
+                unchanged.append(tag)
+
+        lines = []
+        if changed:
+            label = "Добавлены" if action == "add" else "Удалены"
+            lines.append(
+                f"✅ {label}: {', '.join(f'`{md_code(tag)}`' for tag in changed)}"
+            )
+        if unchanged:
+            label = "Уже были" if action == "add" else "Не найдены"
+            lines.append(
+                f"⚠️ {label}: "
+                f"{', '.join(f'`{md_code(tag)}`' for tag in unchanged)}"
+            )
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            reply_markup=get_blacklist_keyboard(),
+            parse_mode="Markdown",
+        )
+        return
+
     await update.message.reply_text(
         "🚫 *Настройки Blacklist*",
         reply_markup=get_blacklist_keyboard(),
