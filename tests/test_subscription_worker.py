@@ -51,12 +51,14 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "send_post_media_to_chat", AsyncMock(return_value=False)),
             patch.object(bot, "update_subscription_time", AsyncMock()) as update_time,
             patch.object(bot, "mark_post_sent", AsyncMock()) as mark_sent,
+            patch.object(bot, "save_delivery_failure", AsyncMock()) as save_failure,
             patch.object(bot, "release_subscription_claim", AsyncMock()) as release_claim,
         ):
             await bot.process_one_subscription(app, (1, "tag", 10, 0))
 
         update_time.assert_not_awaited()
         mark_sent.assert_not_awaited()
+        save_failure.assert_awaited_once()
         release_claim.assert_awaited_once_with(1, "tag", "token")
 
     async def test_expired_claim_update_does_not_mark_sent(self):

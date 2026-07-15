@@ -1,12 +1,15 @@
 import asyncio
 import io
 import logging
-from urllib.parse import unquote, urlparse
+import ipaddress
+import socket
+from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
 from telegram.error import RetryAfter
 
 from bot_delivery import telegram_rate_limiter
+from bot_features import runtime_metrics
 from bot_formatting import md_text
 from bot_keyboards import get_subscription_image_keyboard
 
@@ -16,6 +19,15 @@ DOWNLOADABLE_PHOTO_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 MAX_DOWNLOADED_PHOTO_BYTES = 10 * 1024 * 1024
 PHOTO_DOWNLOAD_TIMEOUT_SECONDS = 20
 PHOTO_DOWNLOAD_USER_AGENT = "night-fun-drug-bot/1.0"
+ALLOWED_PHOTO_CONTENT_TYPES = {
+    "image/jpeg",
+    "image/jpg",
+    "image/pjpeg",
+    "image/png",
+    "image/webp",
+    "application/octet-stream",
+}
+PHOTO_DOWNLOAD_MAX_REDIRECTS = 5
 
 
 def _message_user_id(message) -> int:
@@ -70,24 +82,97 @@ def _download_filename_from_url(url: str) -> str:
     return filename
 
 
-async def _download_photo_file(url: str) -> io.BytesIO:
+def _looks_like_supported_photo(data: bytes) -> bool:
+    return (
+        data.startswith(b"\xff\xd8\xff")
+        or data.startswith(b"\x89PNG\r\n\x1a\n")
+        or (len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+    )
+
+
+def _is_public_ip(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_global
+    except ValueError:
+        return False
+
+
+async def _validate_public_photo_url(url: str):
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Unsupported photo URL")
+    if parsed.username or parsed.password:
+        raise ValueError("Photo URL credentials are not allowed")
+    try:
+        literal_ip = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None:
+        if not literal_ip.is_global:
+            raise ValueError("Private or non-public photo host is not allowed")
+        return
+    loop = asyncio.get_running_loop()
+    addresses = await loop.getaddrinfo(
+        parsed.hostname,
+        parsed.port or (443 if parsed.scheme == "https" else 80),
+        type=socket.SOCK_STREAM,
+    )
+    if not addresses or any(not _is_public_ip(item[4][0]) for item in addresses):
+        raise ValueError("Private or non-public photo host is not allowed")
+
+
+async def _download_photo_file(
+    url: str, max_bytes: int = MAX_DOWNLOADED_PHOTO_BYTES
+) -> io.BytesIO:
+    max_bytes = max(1, int(max_bytes))
     timeout = aiohttp.ClientTimeout(total=PHOTO_DOWNLOAD_TIMEOUT_SECONDS)
     headers = {"User-Agent": PHOTO_DOWNLOAD_USER_AGENT}
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.get(url) as response:
-            response.raise_for_status()
-            content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
-            if content_type.startswith("text/"):
-                raise ValueError(f"Unsupported photo content-type: {content_type}")
+    current_url = url
+    photo = io.BytesIO()
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            for redirect_count in range(PHOTO_DOWNLOAD_MAX_REDIRECTS + 1):
+                await _validate_public_photo_url(current_url)
+                async with session.get(current_url, allow_redirects=False) as response:
+                    if 300 <= response.status < 400 and response.headers.get("Location"):
+                        if redirect_count >= PHOTO_DOWNLOAD_MAX_REDIRECTS:
+                            raise ValueError("Too many photo redirects")
+                        current_url = urljoin(current_url, response.headers["Location"])
+                        continue
 
-            photo = io.BytesIO()
-            async for chunk in response.content.iter_chunked(64 * 1024):
-                photo.write(chunk)
-                if photo.tell() > MAX_DOWNLOADED_PHOTO_BYTES:
-                    raise ValueError("Downloaded photo is too large for Telegram sendPhoto")
+                    response.raise_for_status()
+                    content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
+                    if content_type and content_type not in ALLOWED_PHOTO_CONTENT_TYPES:
+                        raise ValueError(f"Unsupported photo content-type: {content_type}")
+                    content_length = response.headers.get("Content-Length")
+                    if content_length:
+                        try:
+                            if int(content_length) > max_bytes:
+                                raise ValueError("Downloaded photo exceeds the configured size limit")
+                        except ValueError as exc:
+                            if "configured size limit" in str(exc):
+                                raise
+                            raise ValueError("Invalid photo content-length") from exc
+
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        photo.write(chunk)
+                        if photo.tell() > max_bytes:
+                            raise ValueError("Downloaded photo exceeds the configured size limit")
+                    break
+            else:
+                raise ValueError("Too many photo redirects")
+    except Exception:
+        photo.close()
+        raise
 
     if photo.tell() == 0:
         raise ValueError("Downloaded photo is empty")
+
+    photo.seek(0)
+    header = photo.read(12)
+    if not _looks_like_supported_photo(header):
+        photo.close()
+        raise ValueError("Downloaded file is not a supported JPEG, PNG or WebP image")
 
     photo.seek(0)
     photo.name = _download_filename_from_url(url)
@@ -125,16 +210,19 @@ async def reply_media_url(message, url: str, caption: str, reply_markup):
 
 async def reply_downloaded_photo(message, url: str, caption: str, reply_markup):
     user_id = _message_user_id(message)
-    if not await telegram_rate_limiter.wait_for_slot(user_id):
-        return False
     photo = await _download_photo_file(url)
-    await message.reply_photo(
-        photo,
-        caption=caption if caption else None,
-        parse_mode="Markdown",
-        reply_markup=reply_markup,
-    )
-    return True
+    try:
+        if not await telegram_rate_limiter.wait_for_slot(user_id):
+            return False
+        await message.reply_photo(
+            photo,
+            caption=caption if caption else None,
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+        return True
+    finally:
+        photo.close()
 
 
 async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup):
@@ -169,17 +257,20 @@ async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup
 
 
 async def send_downloaded_photo(bot, chat_id: int, url: str, caption: str, reply_markup):
-    if not await telegram_rate_limiter.wait_for_slot(chat_id):
-        return False
     photo = await _download_photo_file(url)
-    await bot.send_photo(
-        chat_id=chat_id,
-        photo=photo,
-        caption=caption if caption else None,
-        parse_mode="Markdown",
-        reply_markup=reply_markup,
-    )
-    return True
+    try:
+        if not await telegram_rate_limiter.wait_for_slot(chat_id):
+            return False
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=photo,
+            caption=caption if caption else None,
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+        return True
+    finally:
+        photo.close()
 
 
 async def _reply_text(message, text: str, **kwargs) -> bool:
@@ -237,6 +328,7 @@ async def send_post_media(
                     post.get("id"),
                     url_kind,
                 )
+                runtime_metrics.increment("media_direct_ok")
                 return True
             except RetryAfter as exc:
                 telegram_rate_limiter.apply_retry_after(_message_user_id(message), exc)
@@ -262,6 +354,7 @@ async def send_post_media(
                                 post.get("id"),
                                 url_kind,
                             )
+                            runtime_metrics.increment("media_upload_fallback_ok")
                             return True
                     except RetryAfter as retry_exc:
                         telegram_rate_limiter.apply_retry_after(
@@ -296,6 +389,9 @@ async def send_post_media(
     )
     if sent:
         logger.warning("Media fallback sent post=%s", post.get("id"))
+        runtime_metrics.increment("media_text_fallback")
+    else:
+        runtime_metrics.failure(f"interactive post={post.get('id')}")
     return sent
 
 
@@ -340,6 +436,7 @@ async def send_post_media_to_chat(
                     post.get("id"),
                     url_kind,
                 )
+                runtime_metrics.increment("media_direct_ok")
                 return True
             except RetryAfter as exc:
                 telegram_rate_limiter.apply_retry_after(chat_id, exc)
@@ -367,6 +464,7 @@ async def send_post_media_to_chat(
                                 post.get("id"),
                                 url_kind,
                             )
+                            runtime_metrics.increment("media_upload_fallback_ok")
                             return True
                     except RetryAfter as retry_exc:
                         telegram_rate_limiter.apply_retry_after(chat_id, retry_exc)
@@ -405,4 +503,7 @@ async def send_post_media_to_chat(
             chat_id,
             post.get("id"),
         )
+        runtime_metrics.increment("media_text_fallback")
+    else:
+        runtime_metrics.failure(f"subscription user={chat_id} post={post.get('id')}")
     return sent

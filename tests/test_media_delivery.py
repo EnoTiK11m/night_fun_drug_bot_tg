@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import bot
+import bot_media
 from bot_delivery import (
     TELEGRAM_MESSAGES_PER_CHAT_MINUTE,
     TelegramRateLimiter,
@@ -21,6 +22,27 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(TELEGRAM_MESSAGES_PER_CHAT_MINUTE, 45)
         self.assertAlmostEqual(limiter.per_user_seconds, 60 / 45)
+
+    def test_downloaded_photo_magic_validation(self):
+        self.assertTrue(bot_media._looks_like_supported_photo(b"\xff\xd8\xffrest"))
+        self.assertTrue(bot_media._looks_like_supported_photo(b"\x89PNG\r\n\x1a\nrest"))
+        self.assertTrue(bot_media._looks_like_supported_photo(b"RIFF1234WEBPrest"))
+        self.assertFalse(bot_media._looks_like_supported_photo(b"<html>bad"))
+
+    def test_download_blocks_private_network_addresses(self):
+        self.assertFalse(bot_media._is_public_ip("127.0.0.1"))
+        self.assertFalse(bot_media._is_public_ip("10.0.0.1"))
+        self.assertFalse(bot_media._is_public_ip("169.254.169.254"))
+        self.assertTrue(bot_media._is_public_ip("1.1.1.1"))
+
+    async def test_photo_url_validation_rejects_private_hosts_and_credentials(self):
+        with self.assertRaises(ValueError):
+            await bot_media._validate_public_photo_url("http://127.0.0.1/image.jpg")
+        with self.assertRaises(ValueError):
+            await bot_media._validate_public_photo_url(
+                "https://user:password@1.1.1.1/image.jpg"
+            )
+        await bot_media._validate_public_photo_url("https://1.1.1.1/image.jpg")
 
     async def test_send_post_media_tries_sample_url_after_file_url_failure(self):
         message = AsyncMock()
@@ -107,6 +129,7 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "https://example.test/original.jpg",
         )
         self.assertIs(message.reply_photo.await_args_list[1].args[0], downloaded)
+        self.assertTrue(downloaded.closed)
         message.reply_text.assert_not_awaited()
 
     async def test_send_post_media_to_chat_downloads_photo_when_telegram_cannot_fetch_url(self):
@@ -138,6 +161,7 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(
             telegram_bot.send_photo.await_args_list[1].kwargs["photo"], downloaded
         )
+        self.assertTrue(downloaded.closed)
         telegram_bot.send_message.assert_not_awaited()
 
     async def test_send_post_media_to_chat_detects_media_type_before_query_string(self):

@@ -161,6 +161,34 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[3][0].callback_data, "post_tags_123")
         self.assertIn("id=123", rows[4][0].url)
 
+    def test_persistent_keyboard_contains_only_primary_actions(self):
+        keyboard = bot.get_persistent_keyboard()
+        labels = [button.text for row in keyboard.keyboard for button in row]
+
+        self.assertEqual(len(labels), 6)
+        self.assertIn(bot.PERSISTENT_SEARCH, labels)
+        self.assertIn(bot.PERSISTENT_GALLERY, labels)
+        self.assertIn(bot.PERSISTENT_RANDOM, labels)
+        self.assertIn(bot.PERSISTENT_FAVORITES, labels)
+        self.assertIn(bot.PERSISTENT_SUBSCRIPTIONS, labels)
+        self.assertIn(bot.PERSISTENT_MENU, labels)
+        self.assertTrue(keyboard.resize_keyboard)
+        self.assertTrue(keyboard.is_persistent)
+
+    async def test_persistent_menu_button_opens_advanced_inline_menu(self):
+        bot.user_states[1] = "waiting_search"
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=SimpleNamespace(text=bot.PERSISTENT_MENU, reply_text=AsyncMock()),
+        )
+
+        with patch.object(bot, "build_main_menu_text", AsyncMock(return_value="menu")):
+            await bot.message_handler(update, SimpleNamespace())
+
+        self.assertNotIn(1, bot.user_states)
+        markup = update.message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertIsInstance(markup, bot.InlineKeyboardMarkup)
+
     def test_subscription_keyboard_uses_post_id_callback(self):
         keyboard = bot.get_subscription_image_keyboard(123, "tag")
         callback_data = keyboard.inline_keyboard[0][0].callback_data
@@ -210,6 +238,70 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("fav_list", callbacks)
         self.assertIn("fav_find", callbacks)
         self.assertIn("fav_export", callbacks)
+        self.assertIn("fav_collections", callbacks)
+
+    async def test_collection_picker_callback_is_not_consumed_by_generic_favorite(self):
+        update, _query = make_callback_update("fav_col_pick_123")
+
+        with (
+            patch.object(bot, "show_collection_picker", AsyncMock()) as picker,
+            patch.object(bot, "add_favorite", AsyncMock()) as add_favorite,
+        ):
+            await bot.button_handler(update, SimpleNamespace())
+
+        picker.assert_awaited_once_with(update.callback_query.message, 1, 123)
+        add_favorite.assert_not_awaited()
+
+    async def test_gallery_settings_cycle_persists_sort(self):
+        update, query = make_callback_update("gallery_cycle_sort")
+        settings = bot.normalize_feature_settings({"gallery_sort": "random"})
+
+        with (
+            patch.object(bot, "get_user_settings", AsyncMock(return_value=settings)),
+            patch.object(bot, "save_user_settings", AsyncMock()) as save_settings,
+        ):
+            await bot.button_handler(update, SimpleNamespace())
+
+        self.assertEqual(save_settings.await_args.args[1]["gallery_sort"], "new")
+        query.edit_message_text.assert_awaited_once()
+
+    async def test_search_gallery_uses_gif_preview_without_splitting_album(self):
+        message = SimpleNamespace(
+            reply_media_group=AsyncMock(),
+            reply_text=AsyncMock(),
+        )
+        posts = [
+            {
+                "id": 10,
+                "file_url": "https://example.test/10.gif",
+                "sample_url": "https://example.test/10-sample.jpg",
+            }
+        ] + [
+            {"id": post_id, "file_url": f"https://example.test/{post_id}.jpg"}
+            for post_id in range(9, 0, -1)
+        ]
+        settings = bot.normalize_feature_settings(
+            {"gallery_sort": "new", "gallery_size": 10, "quality_mode": "original"}
+        )
+
+        with (
+            patch.object(bot, "get_user_settings", AsyncMock(return_value=settings)),
+            patch.object(bot, "get_user_blacklist", AsyncMock(return_value=[])),
+            patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
+            patch.object(bot.api, "search", AsyncMock(return_value=posts)),
+            patch.object(bot, "mark_post_sent", AsyncMock()),
+            patch.object(bot, "save_user_query", AsyncMock()),
+            patch.object(bot, "store_callback_payload", return_value="token"),
+            patch.object(bot, "send_post_media", AsyncMock()) as send_single,
+        ):
+            delivered = await bot.send_search_gallery(message, 1, "test")
+
+        self.assertTrue(delivered)
+        message.reply_media_group.assert_awaited_once()
+        media = message.reply_media_group.await_args.kwargs["media"]
+        self.assertEqual(len(media), 10)
+        self.assertEqual(media[0].media, "https://example.test/10-sample.jpg")
+        send_single.assert_not_awaited()
 
     async def test_export_button_schedules_zip_export(self):
         update, _query = make_callback_update("fav_export")

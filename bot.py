@@ -6,6 +6,9 @@ import os
 import sys
 import tempfile
 import zipfile
+import json
+import shutil
+import io
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse
 
@@ -39,6 +42,7 @@ from config import (
     API_KEY,
     API_USER_ID,
     BOT_TOKEN,
+    DB_PATH,
     SEARCH_COOLDOWN_SECONDS,
     SUBSCRIPTION_CHECK_INTERVAL_SECONDS,
     SUBSCRIPTION_MAX_POSTS_PER_USER_PASS,
@@ -70,8 +74,28 @@ from bot_keyboards import (
     get_subscription_gallery_keyboard,
     get_subscription_image_keyboard,
     get_subscriptions_keyboard,
+    get_gallery_settings_keyboard,
+    get_quality_settings_keyboard,
+    get_gallery_result_keyboard,
+    get_persistent_keyboard,
+    PERSISTENT_SEARCH,
+    PERSISTENT_GALLERY,
+    PERSISTENT_RANDOM,
+    PERSISTENT_FAVORITES,
+    PERSISTENT_SUBSCRIPTIONS,
+    PERSISTENT_MENU,
+)
+from bot_features import (
+    filter_and_sort_posts,
+    media_group_compatible_url,
+    normalize_feature_settings,
+    post_matches_preferences,
+    prepare_gallery_album_posts,
+    prepare_post_quality,
+    runtime_metrics,
 )
 from bot_media import (
+    _download_photo_file,
     get_media_url_candidates,
     media_url_path_lower,
     send_post_media as send_post_media_with_retries,
@@ -119,6 +143,7 @@ from database import (
     mark_post_sent,
     replace_subscription_cache,
     SUBSCRIPTION_CACHE_MIN_AVAILABLE,
+    DEFAULT_USER_SETTINGS,
     add_favorite,
     remove_favorite,
     get_favorite,
@@ -131,6 +156,29 @@ from database import (
     get_subscription_queries_for_post,
     get_subscription_post_by_index,
     remove_subscription_post,
+    BLACKLIST_PRESETS,
+    add_temporary_blacklist_tag,
+    get_blacklist_entries,
+    apply_blacklist_preset,
+    remove_blacklist_preset,
+    replace_user_blacklist,
+    create_favorite_collection,
+    get_favorite_collections,
+    get_favorite_collection,
+    rename_favorite_collection,
+    delete_favorite_collection,
+    add_favorite_to_collection,
+    remove_favorite_from_collection,
+    get_collection_favorites,
+    count_collection_favorites,
+    set_favorite_note,
+    get_favorite_note,
+    get_user_activity_stats,
+    clear_user_activity_stats,
+    save_delivery_failure,
+    get_delivery_failures,
+    delete_delivery_failure,
+    get_admin_database_stats,
 )
 from api_handler import api, APITemporaryError
 
@@ -209,7 +257,6 @@ def configure_logging():
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -224,13 +271,42 @@ SUBSCRIPTION_CONCURRENCY = 5
 HEARTBEAT_INTERVAL_SECONDS = 5 * 60
 FAVORITES_EXPORT_ZIP_LIMIT_BYTES = 45 * 1024 * 1024
 FAVORITES_EXPORT_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
-FAVORITES_EXPORT_TIMEOUT_SECONDS = 30
 FAVORITES_EXPORT_COOLDOWN_SECONDS = 5 * 60
 RESTART_EXIT_CODE = 42
 restart_requested = False
 RESTART_TEXT_COMMANDS = {"restart", "рестарт"}
 favorites_export_users: set[int] = set()
 favorites_export_last_finished_at: dict[int, float] = {}
+upstream_failure_streak = 0
+last_admin_alert_at = 0.0
+ADMIN_ALERT_COOLDOWN_SECONDS = 15 * 60
+
+
+async def note_upstream_failure(app, reason: str):
+    global upstream_failure_streak, last_admin_alert_at
+    upstream_failure_streak += 1
+    runtime_metrics.increment("upstream_failures")
+    now = time.monotonic()
+    if (
+        upstream_failure_streak < 5
+        or now - last_admin_alert_at < ADMIN_ALERT_COOLDOWN_SECONDS
+    ):
+        return
+    last_admin_alert_at = now
+    text = (
+        "🚨 Серия ошибок Rule34/сети: "
+        f"{upstream_failure_streak} подряд. Последняя: {reason[:300]}"
+    )
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await send_text_to_chat(app.bot, admin_id, text=text)
+        except Exception:
+            logger.exception("Failed to notify admin %s about upstream outage", admin_id)
+
+
+def reset_upstream_failure_streak():
+    global upstream_failure_streak
+    upstream_failure_streak = 0
 
 
 async def remember_and_cache_post(post: dict):
@@ -377,7 +453,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Запрос поиска\n- ID поста\n- Очки (score)\n- Рейтинг\n- Теги\n- Метку подписки\n\n"
         "⚠️ Бот предназначен только для пользователей 18+."
         f"{pause_text}",
-        reply_markup=get_main_keyboard(),
+        reply_markup=get_persistent_keyboard(),
         parse_mode="Markdown",
     )
 
@@ -498,6 +574,109 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "favorites":
         await show_favorites(query.message, user_id, edit=True)
 
+    elif data == "gallery":
+        user_states[user_id] = "waiting_gallery"
+        await query.edit_message_text(
+            "🖼 Введите теги для галереи. Для случайной подборки отправьте `random`.",
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("gallery_next_"):
+        payload = get_callback_payload("gallery_next", data)
+        try:
+            params = json.loads(payload or "{}")
+            page = int(params.get("page", 0))
+            tags = str(params.get("tags", ""))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            await query.message.reply_text("❌ Подборка устарела. Запустите галерею заново.")
+            return
+        schedule_background_task(
+            context, send_search_gallery(query.message, user_id, tags, page)
+        )
+
+    elif data == "stats":
+        await show_user_stats(query.message, user_id)
+
+    elif data == "stats_clear_confirm":
+        await query.message.reply_text(
+            "Очистить историю поиска и отметки просмотренных постов? Избранное и настройки сохранятся.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Очистить", callback_data="stats_clear_do"),
+                InlineKeyboardButton("Отмена", callback_data="stats"),
+            ]]),
+        )
+
+    elif data == "stats_clear_do":
+        await clear_user_activity_stats(user_id)
+        await query.message.reply_text("✅ Персональная статистика очищена.")
+
+    elif data == "fav_collections":
+        await show_collections(query.message, user_id)
+
+    elif data == "col_create":
+        user_states[user_id] = "waiting_collection_create"
+        await query.message.reply_text("Введите название коллекции (до 40 символов):")
+
+    elif data.startswith("col_open_"):
+        value = data.replace("col_open_", "", 1)
+        if value.isdigit():
+            await show_collection(query.message, user_id, int(value))
+
+    elif data.startswith("col_page_"):
+        parts = data.split("_")
+        if len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit():
+            await show_collection(query.message, user_id, int(parts[2]), int(parts[3]))
+
+    elif data.startswith("col_delete_"):
+        value = data.replace("col_delete_", "", 1)
+        if value.isdigit():
+            await delete_favorite_collection(user_id, int(value))
+            await show_collections(query.message, user_id)
+
+    elif data.startswith("col_rename_"):
+        value = data.replace("col_rename_", "", 1)
+        if value.isdigit():
+            user_states[user_id] = f"waiting_collection_rename_{value}"
+            await query.message.reply_text("Введите новое название коллекции:")
+
+    elif data.startswith("fav_col_pick_"):
+        value = data.replace("fav_col_pick_", "", 1)
+        if value.isdigit():
+            await show_collection_picker(query.message, user_id, int(value))
+
+    elif data.startswith("col_add_"):
+        parts = data.split("_")
+        if len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit():
+            added = await add_favorite_to_collection(user_id, int(parts[2]), int(parts[3]))
+            await query.message.reply_text(
+                "✅ Добавлено в коллекцию." if added else "ℹ️ Пост уже в коллекции или не найден."
+            )
+
+    elif data.startswith("col_remove_"):
+        parts = data.split("_")
+        if len(parts) == 5 and all(part.isdigit() for part in parts[2:]):
+            collection_id, post_id, index = map(int, parts[2:])
+            await remove_favorite_from_collection(user_id, collection_id, post_id)
+            await show_collection(query.message, user_id, collection_id, index)
+
+    elif data.startswith("col_export_"):
+        value = data.replace("col_export_", "", 1)
+        if value.isdigit():
+            schedule_background_task(
+                context,
+                start_collection_zip_export(query.message, user_id, int(value)),
+            )
+
+    elif data.startswith("fav_note_"):
+        value = data.replace("fav_note_", "", 1)
+        if value.isdigit():
+            user_states[user_id] = f"waiting_favorite_note_{value}"
+            current = await get_favorite_note(user_id, int(value))
+            await query.message.reply_text(
+                "Введите заметку до 1000 символов. Отправьте `-`, чтобы удалить."
+                + (f"\n\nСейчас: {current}" if current else "")
+            )
+
     elif data == "fav_gallery":
         await send_favorites_gallery(query.message, user_id)
 
@@ -541,6 +720,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "noop":
         return
+
+    elif data.startswith("post_original_"):
+        post_id_text = data.replace("post_original_", "", 1)
+        if not post_id_text.isdigit():
+            await query.message.reply_text("❌ Не удалось определить пост.")
+            return
+        post = await get_known_post(int(post_id_text))
+        if not post or not post.get("file_url"):
+            post = await api.get_post_by_id(int(post_id_text))
+            if post:
+                await remember_and_cache_post(post)
+        if not post:
+            await query.message.reply_text("❌ Оригинал недоступен.")
+            return
+        settings = await get_user_settings(user_id)
+        settings["quality_mode"] = "original"
+        await send_post_media(
+            query.message,
+            post,
+            keyboard=get_image_keyboard(
+                int(post_id_text), show_tags_button=should_show_tags_button(settings)
+            ),
+            settings=settings,
+        )
 
     elif data.startswith("post_tags_"):
         post_id_text = data.replace("post_tags_", "", 1)
@@ -590,8 +793,72 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=text, reply_markup=keyboard, parse_mode="Markdown"
             )
 
+    elif data == "settings_gallery":
+        settings = normalize_feature_settings(await get_user_settings(user_id))
+        await query.edit_message_text(
+            gallery_settings_text(settings),
+            reply_markup=get_gallery_settings_keyboard(settings),
+            parse_mode="Markdown",
+        )
+
+    elif data == "settings_quality":
+        settings = normalize_feature_settings(await get_user_settings(user_id))
+        await query.edit_message_text(
+            quality_settings_text(settings),
+            reply_markup=get_quality_settings_keyboard(settings),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("gallery_cycle_") or data.startswith("gallery_size_"):
+        settings = normalize_feature_settings(await get_user_settings(user_id))
+        if data == "gallery_cycle_sort":
+            values = ["random", "new", "popular"]
+            settings["gallery_sort"] = values[(values.index(settings["gallery_sort"]) + 1) % len(values)]
+        elif data == "gallery_cycle_rating":
+            values = ["all", "s", "q", "e"]
+            settings["rating_filter"] = values[(values.index(settings["rating_filter"]) + 1) % len(values)]
+        elif data == "gallery_cycle_type":
+            values = ["all", "images", "animations", "videos"]
+            settings["media_type"] = values[(values.index(settings["media_type"]) + 1) % len(values)]
+        elif data == "gallery_cycle_orientation":
+            values = ["any", "portrait", "landscape", "square"]
+            settings["orientation"] = values[(values.index(settings["orientation"]) + 1) % len(values)]
+        elif data == "gallery_size_down":
+            settings["gallery_size"] = max(2, settings["gallery_size"] - 1)
+        elif data == "gallery_size_up":
+            settings["gallery_size"] = min(10, settings["gallery_size"] + 1)
+        await save_user_settings(user_id, settings)
+        await query.edit_message_text(
+            gallery_settings_text(settings),
+            reply_markup=get_gallery_settings_keyboard(settings),
+            parse_mode="Markdown",
+        )
+
+    elif data == "gallery_resolution":
+        user_states[user_id] = "waiting_gallery_resolution"
+        await query.edit_message_text(
+            "Введите минимальное разрешение как `ширинаxвысота`, например `1920x1080`. Для сброса: `0x0`.",
+            parse_mode="Markdown",
+        )
+
+    elif data == "quality_cycle_mode" or data.startswith("quality_max_"):
+        settings = normalize_feature_settings(await get_user_settings(user_id))
+        if data == "quality_cycle_mode":
+            values = ["auto", "preview", "sample", "original"]
+            settings["quality_mode"] = values[(values.index(settings["quality_mode"]) + 1) % len(values)]
+        elif data == "quality_max_down":
+            settings["max_file_mb"] = max(1, settings["max_file_mb"] - 1)
+        elif data == "quality_max_up":
+            settings["max_file_mb"] = min(50, settings["max_file_mb"] + 1)
+        await save_user_settings(user_id, settings)
+        await query.edit_message_text(
+            quality_settings_text(settings),
+            reply_markup=get_quality_settings_keyboard(settings),
+            parse_mode="Markdown",
+        )
+
     elif data == "settings_reset":
-        await save_user_settings(user_id, DEFAULT_CAPTION_SETTINGS)
+        await save_user_settings(user_id, DEFAULT_USER_SETTINGS)
         await query.edit_message_text(
             "✅ Настройки сброшены к значениям по умолчанию!",
             reply_markup=get_settings_keyboard(),
@@ -949,6 +1216,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 post["id"],
                 show_tags_button=should_show_tags_button(settings),
             ),
+            settings=settings,
         )
 
     elif data == "fav_all":
@@ -1006,11 +1274,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sub_queries:
             await query.message.reply_text(
                 f"⭐ Пост `{md_code(post_id)}` добавлен в избранное подписки.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🗂 В коллекцию", callback_data=f"fav_col_pick_{post_id}")
+                ]]),
                 parse_mode="Markdown",
             )
         else:
             await query.message.reply_text(
                 f"⭐ Пост `{md_code(post_id)}` добавлен в избранное.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🗂 В коллекцию", callback_data=f"fav_col_pick_{post_id}")
+                ]]),
                 parse_mode="Markdown",
             )
             logger.warning(
@@ -1038,6 +1312,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if added:
             await query.message.reply_text(
                 f"⭐ Пост `{md_code(post_id)}` добавлен в избранное.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🗂 В коллекцию", callback_data=f"fav_col_pick_{post_id}")
+                ]]),
                 parse_mode="Markdown",
             )
         else:
@@ -1076,9 +1353,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode="Markdown")
 
     elif data == "bl_show":
-        blacklist = await get_user_blacklist(user_id)
-        if blacklist:
-            tags_list = "\n".join(f"• `{md_code(tag)}`" for tag in sorted(blacklist))
+        entries = await get_blacklist_entries(user_id)
+        if entries:
+            tags_list = "\n".join(
+                f"• `{md_code(item['tag'])}`"
+                + (f" — до {md_text(item['expires_at'])}" if item["expires_at"] else "")
+                for item in entries
+            )
             text = f"📋 *Ваш Blacklist:*\n\n{tags_list}"
         else:
             text = "📋 Ваш Blacklist пуст"
@@ -1086,6 +1367,69 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             text, reply_markup=get_blacklist_keyboard(), parse_mode="Markdown"
         )
+
+    elif data == "bl_temp":
+        user_states[user_id] = "waiting_bl_temp"
+        await query.edit_message_text(
+            "Введите тег и срок: `tag 2ч`, `tag 1д` или `tag 30` (минуты).",
+            parse_mode="Markdown",
+        )
+
+    elif data == "bl_import":
+        user_states[user_id] = "waiting_bl_import"
+        await query.edit_message_text(
+            "Отправьте список тегов через пробел, запятую или с новой строки. Импорт заменит текущий blacklist."
+        )
+
+    elif data == "bl_export":
+        entries = await get_blacklist_entries(user_id)
+        content = "\n".join(item["tag"] for item in entries).encode("utf-8")
+        document = io.BytesIO(content)
+        document.name = f"blacklist_{user_id}.txt"
+        await query.message.reply_document(
+            document=document,
+            filename=document.name,
+            caption=f"Blacklist: {len(entries)} тегов",
+        )
+
+    elif data == "bl_suggest":
+        user_states[user_id] = "waiting_bl_suggest"
+        await query.edit_message_text("Введите тег, для которого найти похожие варианты:")
+
+    elif data == "bl_presets":
+        rows = []
+        for preset, tags in BLACKLIST_PRESETS.items():
+            rows.append([
+                InlineKeyboardButton(
+                    f"➕ {preset} ({len(tags)})", callback_data=f"bl_preset_add_{preset}"
+                ),
+                InlineKeyboardButton("➖", callback_data=f"bl_preset_del_{preset}"),
+            ])
+        rows.append([InlineKeyboardButton("◀️ Назад", callback_data="blacklist")])
+        await query.edit_message_text(
+            "🧰 *Пресеты blacklist*\n\nДобавление не удаляет ваши собственные теги.",
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("bl_preset_add_"):
+        preset = data.replace("bl_preset_add_", "", 1)
+        changed = await apply_blacklist_preset(user_id, preset)
+        await query.message.reply_text(f"✅ Добавлено тегов: {changed}.")
+
+    elif data.startswith("bl_preset_del_"):
+        preset = data.replace("bl_preset_del_", "", 1)
+        changed = await remove_blacklist_preset(user_id, preset)
+        await query.message.reply_text(f"✅ Удалено тегов пресета: {changed}.")
+
+    elif data.startswith("bl_quick_"):
+        tag = get_callback_payload("bl_quick", data)
+        if tag:
+            added = await add_to_blacklist(user_id, tag)
+            await query.message.reply_text(
+                f"✅ `{md_code(tag)}` добавлен." if added else f"ℹ️ `{md_code(tag)}` уже есть.",
+                parse_mode="Markdown",
+            )
 
     elif data == "back":
         user_states.pop(user_id, None)
@@ -1142,6 +1486,15 @@ async def send_random_image(message, user_id: int):
     started_at = time.monotonic()
     try:
         result = await api.get_global_random_image(blacklist, excluded_post_ids)
+        filter_settings = normalize_feature_settings(settings)
+        filter_attempts = 0
+        while result and not post_matches_preferences(result, filter_settings) and filter_attempts < 4:
+            try:
+                excluded_post_ids.add(int(result.get("id")))
+            except (TypeError, ValueError):
+                pass
+            result = await api.get_global_random_image(blacklist, excluded_post_ids)
+            filter_attempts += 1
         logger.info(
             "Random post source=api user=%s post=%s elapsed=%.3fs",
             user_id,
@@ -1190,6 +1543,7 @@ async def send_random_image(message, user_id: int):
             post_id,
             should_show_tags_button(settings),
         ),
+        settings=settings,
     )
     if delivered and post_id:
         await mark_post_sent(user_id, int(post_id))
@@ -1227,8 +1581,24 @@ async def send_image(
         # Если это кнопка "ещё", используем улучшенную логику
         if is_more:
             result = await api.get_next_image(user_id, tags, blacklist, excluded_post_ids)
+            filter_settings = normalize_feature_settings(settings)
+            filter_attempts = 0
+            while result and not post_matches_preferences(result, filter_settings) and filter_attempts < 4:
+                result = await api.get_next_image(
+                    user_id, tags, blacklist, excluded_post_ids
+                )
+                filter_attempts += 1
         else:
             result = await api.get_random_image(tags, blacklist, excluded_post_ids)
+            filter_settings = normalize_feature_settings(settings)
+            filter_attempts = 0
+            while result and not post_matches_preferences(result, filter_settings) and filter_attempts < 4:
+                try:
+                    excluded_post_ids.add(int(result.get("id")))
+                except (TypeError, ValueError):
+                    pass
+                result = await api.get_random_image(tags, blacklist, excluded_post_ids)
+                filter_attempts += 1
             # Сохраняем историю поиска для кнопки "ещё"
             if result:
                 await api.save_search_state(user_id, tags, blacklist, result.get("id"))
@@ -1282,7 +1652,9 @@ async def send_image(
         else:
             keyboard = get_image_keyboard(post_id, tags, show_tags_button)
 
-        delivered = await send_post_media(message, result, caption, keyboard)
+        delivered = await send_post_media(
+            message, result, caption, keyboard, settings=settings
+        )
         if delivered and post_id:
             await mark_post_sent(user_id, int(post_id))
 
@@ -1311,7 +1683,11 @@ async def send_image(
         return False
 
 
-async def send_post_media(message, post: dict, caption: str = "", keyboard=None):
+async def send_post_media(
+    message, post: dict, caption: str = "", keyboard=None, settings: dict | None = None
+):
+    if settings:
+        post = prepare_post_quality(post, normalize_feature_settings(settings))
     return await send_post_media_with_retries(
         message,
         post,
@@ -1321,7 +1697,12 @@ async def send_post_media(message, post: dict, caption: str = "", keyboard=None)
     )
 
 
-async def send_post_media_to_chat(bot, chat_id: int, post: dict, caption: str = "", keyboard=None):
+async def send_post_media_to_chat(
+    bot, chat_id: int, post: dict, caption: str = "", keyboard=None,
+    settings: dict | None = None,
+):
+    if settings:
+        post = prepare_post_quality(post, normalize_feature_settings(settings))
     return await send_post_media_to_chat_with_retries(
         bot,
         chat_id,
@@ -1372,39 +1753,29 @@ async def download_original_favorite_image(
 
     post_id = post.get("id", "unknown")
     filename = f"{post_id}{extension}"
-    async with session.get(url, timeout=FAVORITES_EXPORT_TIMEOUT_SECONDS) as response:
-        if response.status != 200:
-            logger.warning(
-                "Favorite export download failed post=%s status=%s",
-                post_id,
-                response.status,
-            )
-            return None
-
-        content_length = response.headers.get("Content-Length")
-        if content_length and int(content_length) > FAVORITES_EXPORT_ZIP_LIMIT_BYTES:
-            logger.warning("Favorite export skipped oversized image post=%s", post_id)
-            return None
-
-        data = await response.read()
-        if len(data) > FAVORITES_EXPORT_ZIP_LIMIT_BYTES:
-            logger.warning("Favorite export skipped oversized image post=%s", post_id)
-            return None
-
-    return filename, data
+    photo = await _download_photo_file(
+        url, max_bytes=FAVORITES_EXPORT_ZIP_LIMIT_BYTES
+    )
+    try:
+        return filename, photo.read()
+    finally:
+        photo.close()
 
 
-async def send_favorites_zip_export(message, user_id: int):
-    total = await count_favorites(user_id)
+async def send_favorites_zip_export(
+    message, user_id: int, favorites: list[dict] | None = None, title: str = "Избранное"
+):
+    total = len(favorites) if favorites is not None else await count_favorites(user_id)
     if total <= 0:
         await message.reply_text("⭐ Избранное пока пустое.")
         return
 
     await message.reply_text(
-        f"📦 Собираю ZIP из избранного: {total} постов. Беру только оригинальные картинки."
+        f"📦 Собираю ZIP «{title}»: {total} постов. Беру только оригинальные картинки."
     )
 
-    favorites = await get_favorites(user_id, limit=None)
+    if favorites is None:
+        favorites = await get_favorites(user_id, limit=None)
     exported = 0
     skipped = 0
     part = 1
@@ -1439,7 +1810,7 @@ async def send_favorites_zip_export(message, user_id: int):
                         await message.reply_document(
                             document=document,
                             filename=os.path.basename(archive_path),
-                            caption=f"📦 Избранное, часть {part}",
+                            caption=f"📦 {title}, часть {part}",
                         )
                     sent_parts += 1
                     part += 1
@@ -1463,7 +1834,7 @@ async def send_favorites_zip_export(message, user_id: int):
                 await message.reply_document(
                     document=document,
                     filename=os.path.basename(archive_path),
-                    caption=f"📦 Избранное, часть {part}",
+                    caption=f"📦 {title}, часть {part}",
                 )
             sent_parts += 1
 
@@ -1495,6 +1866,28 @@ async def start_favorites_zip_export(message, user_id: int):
     favorites_export_users.add(user_id)
     try:
         await send_favorites_zip_export(message, user_id)
+    finally:
+        favorites_export_users.discard(user_id)
+        favorites_export_last_finished_at[user_id] = time.monotonic()
+
+
+async def start_collection_zip_export(message, user_id: int, collection_id: int):
+    collection = await get_favorite_collection(user_id, collection_id)
+    if not collection:
+        await message.reply_text("❌ Коллекция не найдена.")
+        return
+    posts = await get_collection_favorites(user_id, collection_id, limit=None)
+    if not posts:
+        await message.reply_text("❌ Коллекция пуста.")
+        return
+    if user_id in favorites_export_users:
+        await message.reply_text("📦 Другой архив уже собирается.")
+        return
+    favorites_export_users.add(user_id)
+    try:
+        await send_favorites_zip_export(
+            message, user_id, favorites=posts, title=collection["name"]
+        )
     finally:
         favorites_export_users.discard(user_id)
         favorites_export_last_finished_at[user_id] = time.monotonic()
@@ -1563,7 +1956,7 @@ async def send_subscription_post_by_index(
         message, post, caption, get_subscription_image_keyboard(
             post.get("id", 0),
             show_tags_button=should_show_tags_button(settings),
-        )
+        ), settings=settings
     )
 
 
@@ -1595,6 +1988,7 @@ async def send_subscription_gallery(
             post.get("id", 0),
             should_show_tags_button(settings),
         ),
+        settings=settings,
     )
 
 
@@ -1632,7 +2026,7 @@ async def edit_subscription_gallery(
         )
     except Exception as e:
         logger.error(f"Ошибка обновления галереи подписки: {e}")
-        await send_post_media(query.message, post, caption, keyboard)
+        await send_post_media(query.message, post, caption, keyboard, settings=settings)
 
 
 async def send_favorites_gallery(message, user_id: int, index: int = 0):
@@ -1659,6 +2053,7 @@ async def send_favorites_gallery(message, user_id: int, index: int = 0):
             post.get("id", 0),
             should_show_tags_button(settings),
         ),
+        settings=settings,
     )
 
 
@@ -1688,7 +2083,7 @@ async def edit_favorites_gallery(query, user_id: int, index: int):
         )
     except Exception as e:
         logger.error(f"Ошибка обновления галереи избранного: {e}")
-        await send_post_media(query.message, post, caption, keyboard)
+        await send_post_media(query.message, post, caption, keyboard, settings=settings)
 
 
 async def show_history(message, user_id: int, edit: bool = False):
@@ -1731,6 +2126,7 @@ async def show_favorites(message, user_id: int, edit: bool = False):
                 [InlineKeyboardButton("🖼 Галерея", callback_data="fav_gallery")],
                 [InlineKeyboardButton("📋 Список", callback_data="fav_list")],
                 [InlineKeyboardButton("🔎 Найти по тегу", callback_data="fav_find")],
+                [InlineKeyboardButton("🗂 Коллекции", callback_data="fav_collections")],
                 [InlineKeyboardButton("📦 Скачать ZIP", callback_data="fav_export")],
                 [InlineKeyboardButton("◀️ Назад", callback_data="back")],
             ]
@@ -1832,18 +2228,384 @@ async def show_favorites_list(
         await message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
 
+async def send_search_gallery(message, user_id: int, tags: str, page: int = 0):
+    settings = normalize_feature_settings(await get_user_settings(user_id))
+    blacklist = await get_user_blacklist(user_id)
+    excluded = await get_sent_post_ids(user_id)
+    try:
+        posts = await api.search(
+            tags=tags,
+            blacklist=blacklist,
+            limit=100,
+            pid=max(0, page),
+            allow_blacklist_only=not tags.strip(),
+        )
+    except APITemporaryError:
+        await message.reply_text("⚠️ Rule34 временно недоступен. Попробуйте позже.")
+        return False
+
+    candidates = filter_and_sort_posts(posts or [], settings, excluded)
+    if not candidates:
+        await message.reply_text(
+            "❌ По текущим фильтрам ничего не найдено. Попробуйте ослабить фильтры.",
+            reply_markup=get_settings_keyboard(),
+        )
+        return False
+
+    if settings["media_type"] == "animations":
+        prepared = [
+            prepare_post_quality(post, settings)
+            for post in candidates[: settings["gallery_size"]]
+        ]
+    else:
+        prepared = prepare_gallery_album_posts(
+            candidates, settings, settings["gallery_size"]
+        )
+        if not prepared:
+            # A GIF-only result without static previews cannot be sent as an album.
+            prepared = [
+                prepare_post_quality(post, settings)
+                for post in candidates[: settings["gallery_size"]]
+            ]
+    can_group = len(prepared) > 1 and all(
+        media_group_compatible_url(post.get("file_url", ""))
+        for post in prepared
+    )
+    delivered_ids = []
+    if can_group:
+        try:
+            media = []
+            for index, post in enumerate(prepared):
+                caption = (
+                    f"🖼 Галерея: `{md_code(tags or 'random')}`"
+                    if index == 0 else ""
+                )
+                media.append(media_from_post(post, caption))
+            await message.reply_media_group(media=media)
+            delivered_ids = [int(post["id"]) for post in prepared]
+            runtime_metrics.increment("gallery_albums")
+            runtime_metrics.increment("gallery_items", len(delivered_ids))
+        except Exception as exc:
+            logger.warning("Gallery album failed, using sequential fallback: %s", exc)
+
+    if not delivered_ids:
+        for post in prepared:
+            delivered = await send_post_media(
+                message,
+                post,
+                keyboard=get_image_keyboard(
+                    int(post.get("id") or 0),
+                    query=tags,
+                    show_tags_button=should_show_tags_button(settings),
+                ),
+                settings=settings,
+            )
+            if delivered:
+                delivered_ids.append(int(post["id"]))
+
+    for post_id in delivered_ids:
+        await mark_post_sent(user_id, post_id)
+    if tags:
+        await save_user_query(user_id, tags)
+    next_callback = store_callback_payload(
+        "gallery_next", json.dumps({"tags": tags, "page": page + 1})
+    )
+    previous_callback = None
+    if page > 0:
+        previous_callback = store_callback_payload(
+            "gallery_next", json.dumps({"tags": tags, "page": page - 1})
+        )
+    await message.reply_text(
+        f"Показано: {len(delivered_ids)}. Страница источника: {page + 1}.",
+        reply_markup=get_gallery_result_keyboard(next_callback, previous_callback),
+    )
+    return bool(delivered_ids)
+
+
+def gallery_settings_text(settings: dict) -> str:
+    settings = normalize_feature_settings(settings)
+    return (
+        "🖼 *Галерея и фильтры*\n\n"
+        f"Сортировка: `{md_code(settings['gallery_sort'])}`\n"
+        f"Rating: `{md_code(settings['rating_filter'])}`\n"
+        f"Тип: `{md_code(settings['media_type'])}`\n"
+        f"Ориентация: `{md_code(settings['orientation'])}`\n"
+        f"Минимум: `{settings['min_width']}×{settings['min_height']}`\n"
+        f"Размер альбома: `{settings['gallery_size']}`"
+    )
+
+
+def quality_settings_text(settings: dict) -> str:
+    settings = normalize_feature_settings(settings)
+    return (
+        "📦 *Качество медиа*\n\n"
+        f"Режим: `{md_code(settings['quality_mode'])}`\n"
+        f"Максимальный размер оригинала в auto: `{settings['max_file_mb']} MiB`\n\n"
+        "Auto предпочитает оригинал, но выбирает sample для слишком больших файлов."
+    )
+
+
+async def show_collections(message, user_id: int, edit: bool = False):
+    collections = await get_favorite_collections(user_id)
+    rows = []
+    lines = []
+    for collection in collections:
+        lines.append(f"• `{md_code(collection['name'])}` — {collection['count']}")
+        rows.append([
+            InlineKeyboardButton(
+                f"🗂 {collection['name'][:24]} ({collection['count']})",
+                callback_data=f"col_open_{collection['id']}",
+            ),
+            InlineKeyboardButton("✏️", callback_data=f"col_rename_{collection['id']}"),
+            InlineKeyboardButton("🗑", callback_data=f"col_delete_{collection['id']}"),
+        ])
+    rows.append([InlineKeyboardButton("➕ Создать", callback_data="col_create")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="favorites")])
+    text = "🗂 *Коллекции избранного*"
+    if lines:
+        text += "\n\n" + "\n".join(lines)
+    else:
+        text += "\n\nКоллекций пока нет."
+    kwargs = {"reply_markup": InlineKeyboardMarkup(rows), "parse_mode": "Markdown"}
+    if edit:
+        await message.edit_text(text, **kwargs)
+    else:
+        await message.reply_text(text, **kwargs)
+
+
+async def show_collection(message, user_id: int, collection_id: int, index: int = 0):
+    collection = await get_favorite_collection(user_id, collection_id)
+    if not collection:
+        await message.reply_text("❌ Коллекция не найдена.")
+        return
+    total = await count_collection_favorites(user_id, collection_id)
+    if not total:
+        await message.reply_text(
+            f"🗂 Коллекция «{collection['name']}» пуста.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Коллекции", callback_data="fav_collections")]
+            ]),
+        )
+        return
+    index = max(0, min(index, total - 1))
+    posts = await get_collection_favorites(user_id, collection_id, limit=1, offset=index)
+    post = posts[0]
+    note = await get_favorite_note(user_id, int(post["id"]))
+    caption = f"🗂 *{md_text(collection['name'])}* — {index + 1}/{total}"
+    if note:
+        caption += f"\n📝 {md_text(note)}"
+    prev_index = (index - 1) % total
+    next_index = (index + 1) % total
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("◀️", callback_data=f"col_page_{collection_id}_{prev_index}"),
+            InlineKeyboardButton(f"{index + 1}/{total}", callback_data="noop"),
+            InlineKeyboardButton("▶️", callback_data=f"col_page_{collection_id}_{next_index}"),
+        ],
+        [
+            InlineKeyboardButton("📝 Заметка", callback_data=f"fav_note_{post['id']}"),
+            InlineKeyboardButton(
+                "➖ Из коллекции", callback_data=f"col_remove_{collection_id}_{post['id']}_{index}"
+            ),
+        ],
+        [InlineKeyboardButton("📦 ZIP коллекции", callback_data=f"col_export_{collection_id}")],
+        [InlineKeyboardButton("◀️ Коллекции", callback_data="fav_collections")],
+    ])
+    settings = await get_user_settings(user_id)
+    await send_post_media(message, post, caption, keyboard, settings=settings)
+
+
+async def show_collection_picker(message, user_id: int, post_id: int):
+    collections = await get_favorite_collections(user_id)
+    if not collections:
+        await message.reply_text(
+            "Сначала создайте коллекцию.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Создать коллекцию", callback_data="col_create")]
+            ]),
+        )
+        return
+    rows = [[InlineKeyboardButton(
+        f"🗂 {item['name'][:28]}", callback_data=f"col_add_{item['id']}_{post_id}"
+    )] for item in collections]
+    await message.reply_text("Выберите коллекцию:", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def show_user_stats(message, user_id: int):
+    stats = await get_user_activity_stats(user_id)
+    top_queries = "\n".join(
+        f"• `{md_code(query)}` — {count}" for query, count in stats["top_queries"]
+    ) or "• пока нет"
+    top_tags = ", ".join(
+        f"`{md_code(tag)}` ({count})" for tag, count in stats["top_tags"]
+    ) or "пока нет"
+    text = (
+        "📊 *Ваша статистика*\n\n"
+        f"Просмотрено: {stats['viewed_total']} (7 дней: {stats['viewed_week']}, 30 дней: {stats['viewed_month']})\n"
+        f"В избранном: {stats['favorites_total']} (7 дней: {stats['favorites_week']}, 30 дней: {stats['favorites_month']})\n"
+        f"Поисков: {stats['searches_total']} (7 дней: {stats['searches_week']}, 30 дней: {stats['searches_month']})\n"
+        f"Активных подписок: {stats['subscriptions_active']}\n\n"
+        f"*Частые запросы:*\n{top_queries}\n\n"
+        f"*Теги избранного:* {top_tags}"
+    )
+    await message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧹 Очистить статистику", callback_data="stats_clear_confirm")],
+            [InlineKeyboardButton("◀️ Меню", callback_data="back")],
+        ]),
+        parse_mode="Markdown",
+    )
+
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
     state = user_states.get(user_id)
 
-    if text.lower() in RESTART_TEXT_COMMANDS:
+    if text == PERSISTENT_SEARCH:
+        user_states[user_id] = "waiting_search"
+        await update.message.reply_text(
+            "🔍 Введите теги для поиска через пробел.\n"
+            "Например: `blonde_hair blue_eyes`",
+            parse_mode="Markdown",
+        )
+
+    elif text == PERSISTENT_GALLERY:
+        user_states[user_id] = "waiting_gallery"
+        await update.message.reply_text(
+            "🖼 Введите теги для подборки или `random` для случайных изображений.",
+            parse_mode="Markdown",
+        )
+
+    elif text == PERSISTENT_RANDOM:
+        user_states.pop(user_id, None)
+        schedule_background_task(context, send_random_image(update.message, user_id))
+
+    elif text == PERSISTENT_FAVORITES:
+        user_states.pop(user_id, None)
+        await show_favorites(update.message, user_id)
+
+    elif text == PERSISTENT_SUBSCRIPTIONS:
+        user_states.pop(user_id, None)
+        await update.message.reply_text(
+            "🔔 *Управление подписками*",
+            reply_markup=get_subscriptions_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    elif text == PERSISTENT_MENU:
+        user_states.pop(user_id, None)
+        await update.message.reply_text(
+            await build_main_menu_text(user_id),
+            reply_markup=get_main_keyboard(),
+        )
+
+    elif text.lower() in RESTART_TEXT_COMMANDS:
         await request_restart(update, context)
 
     elif state == "waiting_search":
         user_states.pop(user_id, None)
         schedule_background_task(context, send_image(update.message, user_id, text))
+
+    elif state == "waiting_gallery":
+        user_states.pop(user_id, None)
+        tags = "" if text.lower() in {"random", "рандом", "случайно"} else text
+        schedule_background_task(context, send_search_gallery(update.message, user_id, tags))
+
+    elif state == "waiting_collection_create":
+        user_states.pop(user_id, None)
+        collection_id = await create_favorite_collection(user_id, text)
+        if collection_id:
+            await update.message.reply_text(f"✅ Коллекция «{text[:40]}» создана.")
+        else:
+            await update.message.reply_text("❌ Пустое имя или коллекция уже существует.")
+        await show_collections(update.message, user_id)
+
+    elif state and state.startswith("waiting_collection_rename_"):
+        user_states.pop(user_id, None)
+        collection_id = state.replace("waiting_collection_rename_", "", 1)
+        renamed = collection_id.isdigit() and await rename_favorite_collection(
+            user_id, int(collection_id), text
+        )
+        await update.message.reply_text(
+            "✅ Коллекция переименована." if renamed else "❌ Имя занято или коллекция не найдена."
+        )
+        await show_collections(update.message, user_id)
+
+    elif state and state.startswith("waiting_favorite_note_"):
+        user_states.pop(user_id, None)
+        post_id_text = state.replace("waiting_favorite_note_", "", 1)
+        note = "" if text == "-" else text
+        saved = post_id_text.isdigit() and await set_favorite_note(
+            user_id, int(post_id_text), note
+        )
+        await update.message.reply_text(
+            "✅ Заметка сохранена." if saved and note else
+            "✅ Заметка удалена." if saved else "❌ Пост не найден в избранном."
+        )
+
+    elif state == "waiting_gallery_resolution":
+        user_states.pop(user_id, None)
+        normalized = text.lower().replace("×", "x").replace(" ", "")
+        parts = normalized.split("x", 1)
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            await update.message.reply_text("❌ Формат: `1920x1080`.", parse_mode="Markdown")
+        else:
+            settings = await get_user_settings(user_id)
+            settings["min_width"] = min(int(parts[0]), 10000)
+            settings["min_height"] = min(int(parts[1]), 10000)
+            await save_user_settings(user_id, settings)
+            await update.message.reply_text(
+                gallery_settings_text(settings),
+                reply_markup=get_gallery_settings_keyboard(normalize_feature_settings(settings)),
+                parse_mode="Markdown",
+            )
+
+    elif state == "waiting_bl_temp":
+        user_states.pop(user_id, None)
+        parts = text.split()
+        if len(parts) < 2:
+            await update.message.reply_text("❌ Укажите тег и срок, например `animated 2ч`.", parse_mode="Markdown")
+        else:
+            minutes = parse_pause_minutes(parts[-1])
+            tag = "_".join(parts[:-1]).lower()
+            changed = await add_temporary_blacklist_tag(user_id, tag, minutes)
+            await update.message.reply_text(
+                (
+                    f"✅ `{md_code(tag)}` скрыт на {format_pause_duration(minutes)}."
+                    if changed else
+                    f"ℹ️ `{md_code(tag)}` уже находится в постоянном blacklist."
+                ),
+                reply_markup=get_blacklist_keyboard(),
+                parse_mode="Markdown",
+            )
+
+    elif state == "waiting_bl_import":
+        user_states.pop(user_id, None)
+        tags = {
+            tag.strip().lower()
+            for tag in text.replace(",", " ").replace(";", " ").split()
+            if tag.strip()
+        }
+        count = await replace_user_blacklist(user_id, tags)
+        await update.message.reply_text(
+            f"✅ Импортировано тегов: {count}.", reply_markup=get_blacklist_keyboard()
+        )
+
+    elif state == "waiting_bl_suggest":
+        user_states.pop(user_id, None)
+        suggestions = await api.autocomplete(text)
+        if suggestions:
+            rows = [[InlineKeyboardButton(
+                f"➕ {tag[:40]}", callback_data=store_callback_payload("bl_quick", tag)
+            )] for tag in suggestions[:10]]
+            await update.message.reply_text(
+                "💡 Похожие теги:", reply_markup=InlineKeyboardMarkup(rows)
+            )
+        else:
+            await update.message.reply_text("Похожие теги не найдены.")
 
     elif state == "waiting_pause_subscriptions":
         user_states.pop(user_id, None)
@@ -2037,6 +2799,121 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def gallery_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tags = " ".join(context.args).strip()
+    if not tags:
+        user_states[update.effective_user.id] = "waiting_gallery"
+        await update.message.reply_text(
+            "🖼 Введите теги для галереи или `random` для случайной подборки.",
+            parse_mode="Markdown",
+        )
+        return
+    if tags.lower() in {"random", "рандом"}:
+        tags = ""
+    schedule_background_task(
+        context, send_search_gallery(update.message, update.effective_user.id, tags)
+    )
+
+
+async def collections_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_collections(update.message, update.effective_user.id)
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_user_stats(update.message, update.effective_user.id)
+
+
+async def whyblocked_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: `/whyblocked <ID поста или теги>`", parse_mode="Markdown"
+        )
+        return
+    blacklist = await get_user_blacklist(update.effective_user.id)
+    if len(context.args) == 1 and context.args[0].isdigit():
+        post_id = int(context.args[0])
+        post = await get_known_post(post_id) or await api.get_post_by_id(post_id)
+        supplied = set((post or {}).get("tags", "").lower().split())
+    else:
+        supplied = {tag.lower().lstrip("-") for tag in context.args}
+    matched = sorted(blacklist & supplied)
+    if matched:
+        await update.message.reply_text(
+            "🚫 Совпали blacklist-теги: "
+            + ", ".join(f"`{md_code(tag)}`" for tag in matched),
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text("✅ Среди переданных тегов совпадений с blacklist нет.")
+
+
+async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ Недостаточно прав.")
+        return
+    db_stats = await get_admin_database_stats()
+    disk = shutil.disk_usage(os.getcwd())
+    api_started = time.monotonic()
+    try:
+        await api.search("1girl", set(), limit=1, timeout=5)
+        api_status = f"ok ({time.monotonic() - api_started:.2f}s)"
+    except Exception as exc:
+        api_status = f"error: {type(exc).__name__}"
+    sub_status = "running" if subscription_task and not subscription_task.done() else "stopped"
+    heartbeat_status = "running" if heartbeat_task and not heartbeat_task.done() else "stopped"
+    await update.message.reply_text(
+        "🩺 *Health*\n\n"
+        f"DB quick_check: `{md_code(db_stats['quick_check'])}`\n"
+        f"Rule34 API: `{api_status}`\n"
+        f"Subscription worker: `{sub_status}`\n"
+        f"Heartbeat: `{heartbeat_status}`\n"
+        f"DB size: `{os.path.getsize(DB_PATH) // (1024 * 1024)} MiB`\n"
+        f"Disk free: `{disk.free // (1024 * 1024)} MiB`",
+        parse_mode="Markdown",
+    )
+
+
+async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ Недостаточно прав.")
+        return
+    db_stats = await get_admin_database_stats()
+    metrics = runtime_metrics.snapshot()
+    counters = "\n".join(
+        f"• `{md_code(name)}`: {value}"
+        for name, value in sorted(metrics["counters"].items())
+    ) or "• событий пока нет"
+    counts = "\n".join(
+        f"• `{table}`: {count}" for table, count in db_stats["counts"].items()
+    )
+    await update.message.reply_text(
+        f"📈 *Статистика бота*\n\nUptime: {metrics['uptime_seconds']} сек.\n\n"
+        f"*Runtime:*\n{counters}\n\n*Database:*\n{counts}",
+        parse_mode="Markdown",
+    )
+
+
+async def retry_failed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ Недостаточно прав.")
+        return
+    failures = await get_delivery_failures(limit=20)
+    delivered = 0
+    for failure in failures:
+        ok = await send_post_media_to_chat(
+            context.bot,
+            failure["user_id"],
+            failure["post"],
+            failure["caption"],
+        )
+        if ok:
+            delivered += 1
+            await delete_delivery_failure(failure["id"])
+    await update.message.reply_text(
+        f"♻️ Повторено: {len(failures)}, доставлено: {delivered}, осталось: {len(failures) - delivered}."
+    )
+
+
 async def request_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global restart_requested
 
@@ -2111,7 +2988,9 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 show_tags_button=should_show_tags_button(settings),
             )
 
-            await send_post_media(update.message, result, caption, keyboard)
+            await send_post_media(
+                update.message, result, caption, keyboard, settings=settings
+            )
         else:
             await update.message.reply_text(
                 f"❌ Пост с ID `{md_code(post_id)}` не найден",
@@ -2181,6 +3060,8 @@ async def process_one_subscription(app, subscription):
     if not processing_token:
         return False
 
+    result = None
+    caption = ""
     try:
         logger.info("Отправляем подписку пользователю %s: %s", user_id, query)
 
@@ -2190,6 +3071,7 @@ async def process_one_subscription(app, subscription):
         result = await get_subscription_cached_image(
             user_id, query, blacklist, excluded_post_ids
         )
+        reset_upstream_failure_streak()
 
         if result:
             await remember_and_cache_post(result)
@@ -2205,9 +3087,10 @@ async def process_one_subscription(app, subscription):
                 caption = await build_caption(settings, result, query, True)
 
             delivered = await send_post_media_to_chat(
-                app.bot, user_id, result, caption, keyboard
+                app.bot, user_id, result, caption, keyboard, settings=settings
             )
             if delivered:
+                runtime_metrics.increment("subscription_delivered")
                 updated = await update_subscription_time(user_id, query, processing_token)
                 if updated and post_id:
                     await mark_post_sent(user_id, int(post_id))
@@ -2218,6 +3101,8 @@ async def process_one_subscription(app, subscription):
                         query,
                     )
             else:
+                runtime_metrics.increment("subscription_failed")
+                await save_delivery_failure(user_id, result, caption)
                 await release_subscription_claim(user_id, query, processing_token)
             return bool(delivered)
 
@@ -2247,6 +3132,7 @@ async def process_one_subscription(app, subscription):
 
     except APITemporaryError as e:
         await release_subscription_claim(user_id, query, processing_token)
+        await note_upstream_failure(app, str(e))
         logger.warning(
             "Temporary Rule34 API error for subscription user=%s query=%r: %s",
             user_id,
@@ -2254,7 +3140,11 @@ async def process_one_subscription(app, subscription):
             e,
         )
         return False
-    except Exception:
+    except Exception as exc:
+        if result:
+            await save_delivery_failure(
+                user_id, result, caption, error=f"{type(exc).__name__}: {exc}"
+            )
         await release_subscription_claim(user_id, query, processing_token)
         logger.exception("Subscription processing error for user %s", user_id)
         return False
@@ -2384,10 +3274,13 @@ async def post_init(application):
         BotCommand("start", "Запуск бота"),
         BotCommand("search", "Поиск"),
         BotCommand("random", "Случайная картинка"),
+        BotCommand("gallery", "Галерея по тегам"),
         BotCommand("blacklist", "Черный список"),
         BotCommand("subscriptions", "Подписки"),
         BotCommand("history", "История"),
         BotCommand("favorites", "Избранное"),
+        BotCommand("collections", "Коллекции избранного"),
+        BotCommand("stats", "Личная статистика"),
         BotCommand("settings", "Настройки"),
         BotCommand("tags", "Поиск по тегу"),
         BotCommand("id", "Поиск по ID картинки"),
@@ -2447,6 +3340,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Запуск бота"""
+    configure_logging()
     missing_config = validate_config()
     if missing_config:
         logger.error(
@@ -2468,13 +3362,20 @@ def main():
     application.add_handler(CommandHandler("start", require_access(start)))
     application.add_handler(CommandHandler("search", require_access(search_command)))
     application.add_handler(CommandHandler("random", require_access(random_command)))
+    application.add_handler(CommandHandler("gallery", require_access(gallery_command)))
     application.add_handler(CommandHandler("blacklist", require_access(blacklist_command)))
     application.add_handler(CommandHandler(
         "subscriptions", require_access(subscriptions_command)))
     application.add_handler(CommandHandler("history", require_access(history_command)))
     application.add_handler(CommandHandler("favorites", require_access(favorites_command)))
+    application.add_handler(CommandHandler("collections", require_access(collections_command)))
+    application.add_handler(CommandHandler("stats", require_access(stats_command)))
+    application.add_handler(CommandHandler("whyblocked", require_access(whyblocked_command)))
     application.add_handler(CommandHandler("settings", require_access(settings_command)))
     application.add_handler(CommandHandler("restart", require_access(restart_command)))
+    application.add_handler(CommandHandler("health", require_access(health_command)))
+    application.add_handler(CommandHandler("adminstats", require_access(admin_stats_command)))
+    application.add_handler(CommandHandler("retry_failed", require_access(retry_failed_command)))
     application.add_handler(CommandHandler("tags", require_access(tags_command)))
     application.add_handler(CommandHandler("id", require_access(id_command)))
     application.add_handler(CallbackQueryHandler(require_access(button_handler)))

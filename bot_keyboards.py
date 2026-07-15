@@ -1,7 +1,33 @@
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from bot_state import store_callback_payload
 from database import get_user_settings
+
+
+PERSISTENT_SEARCH = "🔍 Поиск"
+PERSISTENT_GALLERY = "🖼 Подборка"
+PERSISTENT_RANDOM = "🎲 Рандом"
+PERSISTENT_FAVORITES = "⭐ Избранное"
+PERSISTENT_SUBSCRIPTIONS = "🔔 Подписки"
+PERSISTENT_MENU = "⚙️ Меню"
+
+
+def get_persistent_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(PERSISTENT_SEARCH), KeyboardButton(PERSISTENT_GALLERY)],
+            [KeyboardButton(PERSISTENT_RANDOM), KeyboardButton(PERSISTENT_FAVORITES)],
+            [KeyboardButton(PERSISTENT_SUBSCRIPTIONS), KeyboardButton(PERSISTENT_MENU)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Выберите действие или введите теги",
+    )
 
 
 def get_tags_button(post_id: int) -> InlineKeyboardButton:
@@ -44,6 +70,9 @@ def build_post_keyboard(
     if show_tags_button:
         keyboard.append([get_tags_button(post_id)])
     keyboard.append([get_site_button(post_id)])
+    keyboard.append([
+        InlineKeyboardButton("🔎 Оригинал", callback_data=f"post_original_{post_id}")
+    ])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -94,8 +123,10 @@ def get_favorites_gallery_keyboard(
         [
             InlineKeyboardButton(
                 "❌ Удалить", callback_data=f"fav_del_{post_id}_{index}"
-            )
+            ),
+            InlineKeyboardButton("🗂 В коллекцию", callback_data=f"fav_col_pick_{post_id}"),
         ],
+        [InlineKeyboardButton("📝 Заметка", callback_data=f"fav_note_{post_id}")],
     ]
     if show_tags_button:
         keyboard.append([get_tags_button(post_id)])
@@ -107,6 +138,7 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("🔍 Поиск", callback_data="search")],
         [InlineKeyboardButton("🎲 Рандомная картинка", callback_data="random")],
+        [InlineKeyboardButton("🖼 Галерея поиска", callback_data="gallery")],
         [InlineKeyboardButton("🔄 Ещё", callback_data="more")],
         [
             InlineKeyboardButton("🚫 Blacklist", callback_data="blacklist"),
@@ -118,8 +150,9 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
-            InlineKeyboardButton("❓ Помощь", callback_data="help"),
+            InlineKeyboardButton("📊 Статистика", callback_data="stats"),
         ],
+        [InlineKeyboardButton("❓ Помощь", callback_data="help")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -129,6 +162,13 @@ def get_blacklist_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("➕ Добавить тег", callback_data="bl_add")],
         [InlineKeyboardButton("➖ Удалить тег", callback_data="bl_remove")],
         [InlineKeyboardButton("📋 Показать список", callback_data="bl_show")],
+        [InlineKeyboardButton("⏳ Временно скрыть", callback_data="bl_temp")],
+        [InlineKeyboardButton("🧰 Готовые пресеты", callback_data="bl_presets")],
+        [
+            InlineKeyboardButton("📥 Импорт", callback_data="bl_import"),
+            InlineKeyboardButton("📤 Экспорт", callback_data="bl_export"),
+        ],
+        [InlineKeyboardButton("💡 Похожие теги", callback_data="bl_suggest")],
         [InlineKeyboardButton("◀️ Назад", callback_data="back")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -156,6 +196,8 @@ def get_subscriptions_keyboard() -> InlineKeyboardMarkup:
 def get_settings_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("📝 Настройки описания", callback_data="settings_caption")],
+        [InlineKeyboardButton("🖼 Галерея и фильтры", callback_data="settings_gallery")],
+        [InlineKeyboardButton("📦 Качество медиа", callback_data="settings_quality")],
         [
             InlineKeyboardButton(
                 "⏸ Остановить все подписки на время",
@@ -172,6 +214,69 @@ def get_settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("◀️ Назад", callback_data="back")],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+def get_gallery_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
+    labels = {"random": "случайно", "new": "новые", "popular": "популярные"}
+    ratings = {"all": "все", "s": "safe", "q": "questionable", "e": "explicit"}
+    types = {"all": "все", "images": "изображения", "animations": "GIF", "videos": "видео"}
+    orientations = {"any": "любая", "portrait": "вертикальная", "landscape": "горизонтальная", "square": "квадрат"}
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"↕️ Сортировка: {labels.get(settings.get('gallery_sort'), 'случайно')}",
+            callback_data="gallery_cycle_sort",
+        )],
+        [InlineKeyboardButton(
+            f"🔞 Rating: {ratings.get(settings.get('rating_filter'), 'все')}",
+            callback_data="gallery_cycle_rating",
+        )],
+        [InlineKeyboardButton(
+            f"🎞 Тип: {types.get(settings.get('media_type'), 'все')}",
+            callback_data="gallery_cycle_type",
+        )],
+        [InlineKeyboardButton(
+            f"📐 Ориентация: {orientations.get(settings.get('orientation'), 'любая')}",
+            callback_data="gallery_cycle_orientation",
+        )],
+        [
+            InlineKeyboardButton("➖", callback_data="gallery_size_down"),
+            InlineKeyboardButton(f"В альбоме: {settings.get('gallery_size', 10)}", callback_data="noop"),
+            InlineKeyboardButton("➕", callback_data="gallery_size_up"),
+        ],
+        [InlineKeyboardButton("📏 Минимальное разрешение", callback_data="gallery_resolution")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="settings")],
+    ])
+
+
+def get_quality_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
+    labels = {"auto": "авто", "preview": "preview", "sample": "sample", "original": "оригинал"}
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🖼 Качество: {labels.get(settings.get('quality_mode'), 'авто')}",
+            callback_data="quality_cycle_mode",
+        )],
+        [
+            InlineKeyboardButton("➖", callback_data="quality_max_down"),
+            InlineKeyboardButton(f"Лимит: {settings.get('max_file_mb', 10)} MiB", callback_data="noop"),
+            InlineKeyboardButton("➕", callback_data="quality_max_up"),
+        ],
+        [InlineKeyboardButton("◀️ Назад", callback_data="settings")],
+    ])
+
+
+def get_gallery_result_keyboard(
+    next_callback: str, previous_callback: str | None = None
+) -> InlineKeyboardMarkup:
+    navigation = []
+    if previous_callback:
+        navigation.append(InlineKeyboardButton("⬅️ Предыдущая", callback_data=previous_callback))
+    navigation.append(InlineKeyboardButton("Следующая ➡️", callback_data=next_callback))
+    return InlineKeyboardMarkup([
+        navigation,
+        [InlineKeyboardButton("🔍 Новый запрос", callback_data="gallery")],
+        [InlineKeyboardButton("⚙️ Фильтры", callback_data="settings_gallery")],
+        [InlineKeyboardButton("◀️ Меню", callback_data="back")],
+    ])
 
 
 async def get_caption_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
