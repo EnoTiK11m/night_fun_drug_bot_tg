@@ -9,6 +9,7 @@ import zipfile
 import json
 import shutil
 import io
+import re
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse
 
@@ -403,6 +404,33 @@ def media_from_post(post: dict, caption: str = "", has_spoiler: bool = False):
     return InputMediaPhoto(
         file_url, caption=media_caption, parse_mode="Markdown", has_spoiler=has_spoiler
     )
+
+
+def gallery_failed_item_index(error: Exception, item_count: int) -> int | None:
+    """Return the zero-based media index reported by Telegram, if available."""
+    match = re.search(r"(?:message|item)\s*#(\d+)", str(error), re.IGNORECASE)
+    if not match:
+        return None
+    index = int(match.group(1)) - 1
+    return index if 0 <= index < item_count else None
+
+
+def gallery_fallback_post(post: dict) -> dict | None:
+    """Switch a failed album item to another Telegram-compatible static URL."""
+    current_url = post.get("file_url") or ""
+    fallback_url = next(
+        (
+            post.get(key) or ""
+            for key in ("sample_url", "preview_url")
+            if post.get(key)
+            and post.get(key) != current_url
+            and media_group_compatible_url(post.get(key))
+        ),
+        "",
+    )
+    if not fallback_url:
+        return None
+    return dict(post, file_url=fallback_url)
 
 
 def should_show_tags_button(settings: dict | None = None) -> bool:
@@ -2658,22 +2686,70 @@ async def send_search_gallery(message, user_id: int, tags: str, page: int = 0):
         await remember_and_cache_post(source_posts.get(str(post.get("id")), post))
     delivered_ids = []
     if can_group:
-        try:
+        album_posts = list(prepared)
+        fallback_post_ids = set()
+        max_album_attempts = min(5, len(album_posts) + 1)
+        for attempt in range(1, max_album_attempts + 1):
             media = []
-            for index, post in enumerate(prepared):
+            for index, post in enumerate(album_posts):
                 caption = (
                     f"🖼 Галерея: `{md_code(tags or 'random')}`"
                     if index == 0 else ""
                 )
                 media.append(
-                    media_from_post(post, caption, should_spoiler(settings, post))
+                        media_from_post(post, caption, should_spoiler(settings, post))
+                    )
+            try:
+                await message.reply_media_group(media=media)
+                delivered_ids = [int(post["id"]) for post in album_posts]
+                runtime_metrics.increment("gallery_albums")
+                runtime_metrics.increment("gallery_items", len(delivered_ids))
+                break
+            except Exception as exc:
+                failed_index = gallery_failed_item_index(exc, len(album_posts))
+                if failed_index is None:
+                    logger.warning(
+                        "Gallery album failed without item index; using sequential "
+                        "fallback: %s",
+                        exc,
+                    )
+                    break
+
+                failed_post = album_posts[failed_index]
+                failed_post_id = int(failed_post.get("id") or 0)
+                replacement = (
+                    gallery_fallback_post(failed_post)
+                    if failed_post_id not in fallback_post_ids
+                    else None
                 )
-            await message.reply_media_group(media=media)
-            delivered_ids = [int(post["id"]) for post in prepared]
-            runtime_metrics.increment("gallery_albums")
-            runtime_metrics.increment("gallery_items", len(delivered_ids))
-        except Exception as exc:
-            logger.warning("Gallery album failed, using sequential fallback: %s", exc)
+                if replacement is not None:
+                    fallback_post_ids.add(failed_post_id)
+                    album_posts[failed_index] = replacement
+                    logger.warning(
+                        "Gallery album item failed; retrying with fallback URL "
+                        "attempt=%s/%s item=%s post=%s error=%s",
+                        attempt,
+                        max_album_attempts,
+                        failed_index + 1,
+                        failed_post_id,
+                        exc,
+                    )
+                    continue
+
+                removed = album_posts.pop(failed_index)
+                logger.warning(
+                    "Gallery album item failed without usable fallback; removing "
+                    "item=%s post=%s remaining=%s error=%s",
+                    failed_index + 1,
+                    removed.get("id"),
+                    len(album_posts),
+                    exc,
+                )
+                if len(album_posts) < 2:
+                    break
+
+        if not delivered_ids and album_posts != prepared:
+            prepared = album_posts
 
     if not delivered_ids:
         for post in prepared:

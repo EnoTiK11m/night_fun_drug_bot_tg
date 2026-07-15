@@ -528,6 +528,93 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cached_posts[0]["file_url"], "https://example.test/10.gif")
         send_single.assert_not_awaited()
 
+    async def test_search_gallery_retries_failed_album_item_with_sample(self):
+        message = SimpleNamespace(
+            reply_media_group=AsyncMock(side_effect=[
+                bot.BadRequest(
+                    'Failed to send message #6 with the error message "webpage_curl_failed"'
+                ),
+                None,
+            ]),
+            reply_text=AsyncMock(),
+        )
+        posts = [
+            {
+                "id": post_id,
+                "file_url": f"https://example.test/{post_id}-original.jpg",
+                "sample_url": f"https://example.test/{post_id}-sample.jpg",
+            }
+            for post_id in range(10, 0, -1)
+        ]
+        settings = bot.normalize_feature_settings(
+            {"gallery_sort": "new", "gallery_size": 10, "quality_mode": "original"}
+        )
+
+        with (
+            patch.object(bot, "get_user_settings", AsyncMock(return_value=settings)),
+            patch.object(bot, "get_user_blacklist", AsyncMock(return_value=[])),
+            patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
+            patch.object(bot.api, "search", AsyncMock(return_value=posts)),
+            patch.object(bot, "mark_post_sent", AsyncMock()) as mark_sent,
+            patch.object(bot, "save_user_query", AsyncMock()),
+            patch.object(bot, "store_callback_payload", return_value="token"),
+            patch.object(bot, "remember_and_cache_post", AsyncMock()),
+            patch.object(bot, "send_post_media", AsyncMock()) as send_single,
+        ):
+            delivered = await bot.send_search_gallery(message, 1, "test")
+
+        self.assertTrue(delivered)
+        self.assertEqual(message.reply_media_group.await_count, 2)
+        first_media = message.reply_media_group.await_args_list[0].kwargs["media"]
+        retried_media = message.reply_media_group.await_args_list[1].kwargs["media"]
+        self.assertEqual(first_media[5].media, "https://example.test/5-original.jpg")
+        self.assertEqual(retried_media[5].media, "https://example.test/5-sample.jpg")
+        self.assertEqual(len(retried_media), 10)
+        self.assertEqual(mark_sent.await_count, 10)
+        send_single.assert_not_awaited()
+
+    async def test_search_gallery_removes_only_failed_album_item_without_fallback(self):
+        message = SimpleNamespace(
+            reply_media_group=AsyncMock(side_effect=[
+                bot.BadRequest(
+                    'Failed to send message #5 with the error message "webpage_curl_failed"'
+                ),
+                None,
+            ]),
+            reply_text=AsyncMock(),
+        )
+        posts = [
+            {"id": post_id, "file_url": f"https://example.test/{post_id}.jpg"}
+            for post_id in range(10, 0, -1)
+        ]
+        settings = bot.normalize_feature_settings(
+            {"gallery_sort": "new", "gallery_size": 10, "quality_mode": "original"}
+        )
+
+        with (
+            patch.object(bot, "get_user_settings", AsyncMock(return_value=settings)),
+            patch.object(bot, "get_user_blacklist", AsyncMock(return_value=[])),
+            patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
+            patch.object(bot.api, "search", AsyncMock(return_value=posts)),
+            patch.object(bot, "mark_post_sent", AsyncMock()) as mark_sent,
+            patch.object(bot, "save_user_query", AsyncMock()),
+            patch.object(bot, "store_callback_payload", return_value="token"),
+            patch.object(bot, "remember_and_cache_post", AsyncMock()),
+            patch.object(bot, "send_post_media", AsyncMock()) as send_single,
+        ):
+            delivered = await bot.send_search_gallery(message, 1, "test")
+
+        self.assertTrue(delivered)
+        self.assertEqual(message.reply_media_group.await_count, 2)
+        retried_media = message.reply_media_group.await_args_list[1].kwargs["media"]
+        self.assertEqual(len(retried_media), 9)
+        self.assertNotIn(
+            "https://example.test/6.jpg",
+            [item.media for item in retried_media],
+        )
+        self.assertEqual(mark_sent.await_count, 9)
+        send_single.assert_not_awaited()
+
     async def test_export_button_schedules_zip_export(self):
         update, _query = make_callback_update("fav_export")
         context = SimpleNamespace()
