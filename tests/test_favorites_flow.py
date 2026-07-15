@@ -306,6 +306,45 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("fav_export", callbacks)
         self.assertIn("fav_collections", callbacks)
 
+    async def test_stats_button_sends_activity_summary(self):
+        update, query = make_callback_update("stats")
+        stats = {
+            "viewed_total": 12,
+            "viewed_week": 3,
+            "viewed_month": 8,
+            "favorites_total": 5,
+            "favorites_week": 1,
+            "favorites_month": 4,
+            "searches_total": 9,
+            "searches_week": 2,
+            "searches_month": 7,
+            "subscriptions_active": 2,
+            "top_queries": [("blue_hair", 4)],
+            "top_tags": [("solo", 3)],
+        }
+
+        with patch.object(
+            bot, "get_user_activity_stats", AsyncMock(return_value=stats)
+        ) as get_stats:
+            await bot.button_handler(update, SimpleNamespace())
+
+        get_stats.assert_awaited_once_with(1)
+        query.message.reply_text.assert_awaited_once()
+        text = query.message.reply_text.await_args.args[0]
+        self.assertIn("Ваша статистика", text)
+        self.assertIn("Просмотрено: 12", text)
+        self.assertIn("blue_hair", text)
+        markup = query.message.reply_text.await_args.kwargs["reply_markup"]
+        callbacks = [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(callbacks, ["stats_clear_confirm", "back"])
+        self.assertEqual(
+            query.message.reply_text.await_args.kwargs["parse_mode"], "Markdown"
+        )
+
     async def test_collection_picker_callback_is_not_consumed_by_generic_favorite(self):
         update, _query = make_callback_update("fav_col_pick_123")
 

@@ -3,6 +3,7 @@
 [![CI](https://github.com/EnoTiK11m/night_fun_drug_bot_tg/actions/workflows/ci.yml/badge.svg)](https://github.com/EnoTiK11m/night_fun_drug_bot_tg/actions/workflows/ci.yml)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![ENG](https://img.shields.io/badge/lang-ENG-0078D4?logo=googletranslate&logoColor=white)](README.en.md)
 
 Telegram-бот для поиска, просмотра и организации медиа из [Rule34](https://rule34.xxx/) по тегам. Поддерживает одиночную выдачу, альбомы, избранное, коллекции, blacklist и автоматические подписки.
 
@@ -267,7 +268,7 @@ docker compose down
 | [`config.py`](config.py) | Чтение и валидация конфигурации |
 | [`scripts/backup_sqlite.py`](scripts/backup_sqlite.py) | Согласованная резервная копия работающей SQLite-базы |
 | [`tests/`](tests) | Модульные и интеграционные тесты |
-| [`docs/PRODUCTION.md`](docs/PRODUCTION.md) | Краткий production runbook |
+| [`docs/PRODUCTION.md`](docs/PRODUCTION.md) | Краткое руководство по эксплуатации |
 
 ## Данные, логи и резервное копирование
 

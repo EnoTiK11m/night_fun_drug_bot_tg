@@ -1,9 +1,11 @@
-Hidden bot launcher
+Скрытый запуск бота
 
-Use start_hidden.vbs to run the bot without a visible command prompt window.
+Используйте `start_hidden.vbs`, чтобы запустить бота без видимого окна
+командной строки.
 
-The launch chain is:
-start_hidden.vbs -> rule34.bat -> python bot.py
+Цепочка запуска:
 
-Keep using rule34.bat inside the chain because it handles /restart by watching
-for bot.py exit code 42 and starting it again.
+`start_hidden.vbs` → `rule34.bat` → `python bot.py`
+
+Не исключайте `rule34.bat` из этой цепочки: он обрабатывает команду `/restart`,
+отслеживает завершение `bot.py` с кодом 42 и после этого запускает бот заново.

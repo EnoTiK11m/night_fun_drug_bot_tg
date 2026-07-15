@@ -2773,6 +2773,14 @@ async def show_user_stats(message, user_id: int):
         f"*Частые запросы:*\n{top_queries}\n\n"
         f"*Теги избранного:* {top_tags}"
     )
+    await message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧹 Очистить статистику", callback_data="stats_clear_confirm")],
+            [InlineKeyboardButton("◀️ Меню", callback_data="back")],
+        ]),
+        parse_mode="Markdown",
+    )
 
 
 async def show_search_presets(message, user_id: int):
@@ -2982,14 +2990,6 @@ async def send_digest_to_chat(bot, user_id: int, posts: list[dict]) -> bool:
             )
         )
     return delivered > 0
-    await message.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧹 Очистить статистику", callback_data="stats_clear_confirm")],
-            [InlineKeyboardButton("◀️ Меню", callback_data="back")],
-        ]),
-        parse_mode="Markdown",
-    )
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
