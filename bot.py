@@ -2574,8 +2574,15 @@ async def send_search_gallery(message, user_id: int, tags: str, page: int = 0):
         media_group_compatible_url(post.get("file_url", ""))
         for post in prepared
     )
+    source_posts = {
+        str(post.get("id")): post
+        for post in candidates
+        if post.get("id") is not None
+    }
     for post in prepared:
-        await remember_and_cache_post(post)
+        # Delivery preparation can replace the original URL with a static GIF
+        # preview or a lower-quality variant. Keep canonical API URLs in cache.
+        await remember_and_cache_post(source_posts.get(str(post.get("id")), post))
     delivered_ids = []
     if can_group:
         try:

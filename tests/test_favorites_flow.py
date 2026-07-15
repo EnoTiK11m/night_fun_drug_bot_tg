@@ -358,6 +358,7 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "mark_post_sent", AsyncMock()),
             patch.object(bot, "save_user_query", AsyncMock()),
             patch.object(bot, "store_callback_payload", return_value="token"),
+            patch.object(bot, "remember_and_cache_post", AsyncMock()) as cache_post,
             patch.object(bot, "send_post_media", AsyncMock()) as send_single,
         ):
             delivered = await bot.send_search_gallery(message, 1, "test")
@@ -367,6 +368,10 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         media = message.reply_media_group.await_args.kwargs["media"]
         self.assertEqual(len(media), 10)
         self.assertEqual(media[0].media, "https://example.test/10-sample.jpg")
+        self.assertEqual(cache_post.await_count, 10)
+        cached_posts = [call.args[0] for call in cache_post.await_args_list]
+        self.assertEqual({post["id"] for post in cached_posts}, set(range(1, 11)))
+        self.assertEqual(cached_posts[0]["file_url"], "https://example.test/10.gif")
         send_single.assert_not_awaited()
 
     async def test_export_button_schedules_zip_export(self):
