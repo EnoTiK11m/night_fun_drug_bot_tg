@@ -2863,7 +2863,7 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     heartbeat_status = "running" if heartbeat_task and not heartbeat_task.done() else "stopped"
     await update.message.reply_text(
         "🩺 *Health*\n\n"
-        f"DB quick_check: `{md_code(db_stats['quick_check'])}`\n"
+        f"DB quick check: `{md_code(db_stats['quick_check'])}`\n"
         f"Rule34 API: `{api_status}`\n"
         f"Subscription worker: `{sub_status}`\n"
         f"Heartbeat: `{heartbeat_status}`\n"

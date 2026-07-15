@@ -466,6 +466,37 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         update.message.reply_text.assert_awaited_once_with("❌ Недостаточно прав.")
         context.application.stop_running.assert_not_called()
 
+    async def test_health_command_sends_markdown_safe_status(self):
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+
+        with (
+            patch.object(bot, "ADMIN_USER_IDS", {1}),
+            patch.object(
+                bot,
+                "get_admin_database_stats",
+                AsyncMock(return_value={"quick_check": "ok", "counts": {}}),
+            ),
+            patch.object(bot.api, "search", AsyncMock(return_value=[])),
+            patch.object(
+                bot.shutil,
+                "disk_usage",
+                return_value=SimpleNamespace(free=10 * 1024 * 1024),
+            ),
+            patch.object(bot.os.path, "getsize", return_value=1024),
+        ):
+            await bot.health_command(update, SimpleNamespace())
+
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.await_args.args[0]
+        self.assertIn("DB quick check: `ok`", text)
+        self.assertNotIn("DB quick_check", text)
+        self.assertEqual(
+            update.message.reply_text.await_args.kwargs["parse_mode"], "Markdown"
+        )
+
     async def test_restart_command_stops_application_for_admin(self):
         old_restart_requested = bot.restart_requested
         bot.restart_requested = False
