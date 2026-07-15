@@ -1,3 +1,4 @@
+import io
 import logging
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -80,6 +81,90 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(delivered)
         message.reply_text.assert_awaited_once()
+
+    async def test_send_post_media_downloads_photo_when_telegram_cannot_fetch_url(self):
+        message = AsyncMock()
+        message.reply_photo = AsyncMock(
+            side_effect=[Exception("Failed to get http url content"), None]
+        )
+        post = {
+            "id": 1,
+            "file_url": "https://example.test/original.jpg",
+        }
+        downloaded = io.BytesIO(b"image-data")
+        downloaded.name = "original.jpg"
+
+        with (
+            patch.object(bot, "MEDIA_SEND_RETRIES", 1),
+            patch("bot_media._download_photo_file", AsyncMock(return_value=downloaded)),
+        ):
+            delivered = await bot.send_post_media(message, post, keyboard=object())
+
+        self.assertTrue(delivered)
+        self.assertEqual(message.reply_photo.await_count, 2)
+        self.assertEqual(
+            message.reply_photo.await_args_list[0].args[0],
+            "https://example.test/original.jpg",
+        )
+        self.assertIs(message.reply_photo.await_args_list[1].args[0], downloaded)
+        message.reply_text.assert_not_awaited()
+
+    async def test_send_post_media_to_chat_downloads_photo_when_telegram_cannot_fetch_url(self):
+        telegram_bot = AsyncMock()
+        telegram_bot.send_photo = AsyncMock(
+            side_effect=[Exception("Wrong type of the web page content"), None]
+        )
+        post = {
+            "id": 1,
+            "file_url": "https://example.test/original.png?token=abc",
+        }
+        downloaded = io.BytesIO(b"image-data")
+        downloaded.name = "original.png"
+
+        with (
+            patch.object(bot, "MEDIA_SEND_RETRIES", 1),
+            patch("bot_media._download_photo_file", AsyncMock(return_value=downloaded)),
+        ):
+            delivered = await bot.send_post_media_to_chat(
+                telegram_bot, 123, post, keyboard=object()
+            )
+
+        self.assertTrue(delivered)
+        self.assertEqual(telegram_bot.send_photo.await_count, 2)
+        self.assertEqual(
+            telegram_bot.send_photo.await_args_list[0].kwargs["photo"],
+            "https://example.test/original.png?token=abc",
+        )
+        self.assertIs(
+            telegram_bot.send_photo.await_args_list[1].kwargs["photo"], downloaded
+        )
+        telegram_bot.send_message.assert_not_awaited()
+
+    async def test_send_post_media_to_chat_detects_media_type_before_query_string(self):
+        telegram_bot = AsyncMock()
+        post = {
+            "id": 1,
+            "file_url": "https://example.test/animated.GIF?download=1",
+        }
+
+        delivered = await bot.send_post_media_to_chat(
+            telegram_bot, 123, post, keyboard=object()
+        )
+
+        self.assertTrue(delivered)
+        telegram_bot.send_animation.assert_awaited_once()
+        self.assertEqual(
+            telegram_bot.send_animation.await_args.kwargs["animation"],
+            "https://example.test/animated.GIF?download=1",
+        )
+        telegram_bot.send_photo.assert_not_awaited()
+
+    def test_media_from_post_detects_media_type_before_query_string(self):
+        media = bot.media_from_post(
+            {"file_url": "https://example.test/video.WEBM?token=abc"}
+        )
+
+        self.assertIsInstance(media, bot.InputMediaVideo)
 
     async def test_retry_after_retries_same_url_without_fallback(self):
         telegram_bot = AsyncMock()

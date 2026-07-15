@@ -1,6 +1,9 @@
 import asyncio
+import io
 import logging
+from urllib.parse import unquote, urlparse
 
+import aiohttp
 from telegram.error import RetryAfter
 
 from bot_delivery import telegram_rate_limiter
@@ -8,6 +11,11 @@ from bot_formatting import md_text
 from bot_keyboards import get_subscription_image_keyboard
 
 logger = logging.getLogger(__name__)
+
+DOWNLOADABLE_PHOTO_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+MAX_DOWNLOADED_PHOTO_BYTES = 10 * 1024 * 1024
+PHOTO_DOWNLOAD_TIMEOUT_SECONDS = 20
+PHOTO_DOWNLOAD_USER_AGENT = "night-fun-drug-bot/1.0"
 
 
 def _message_user_id(message) -> int:
@@ -31,18 +39,74 @@ def get_media_url_candidates(post: dict) -> list[tuple[str, str]]:
     return candidates
 
 
+def media_url_path_lower(url: str) -> str:
+    return urlparse(url).path.lower()
+
+
+def _is_downloadable_photo_url(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    return media_url_path_lower(url).endswith(DOWNLOADABLE_PHOTO_EXTENSIONS)
+
+
+def _telegram_url_fetch_failed(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "failed to get http url content",
+            "wrong type of the web page content",
+            "invalid file http url specified",
+        )
+    )
+
+
+def _download_filename_from_url(url: str) -> str:
+    path = unquote(urlparse(url).path)
+    filename = path.rsplit("/", 1)[-1] or "image.jpg"
+    if not filename.lower().endswith(DOWNLOADABLE_PHOTO_EXTENSIONS):
+        filename += ".jpg"
+    return filename
+
+
+async def _download_photo_file(url: str) -> io.BytesIO:
+    timeout = aiohttp.ClientTimeout(total=PHOTO_DOWNLOAD_TIMEOUT_SECONDS)
+    headers = {"User-Agent": PHOTO_DOWNLOAD_USER_AGENT}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(url) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
+            if content_type.startswith("text/"):
+                raise ValueError(f"Unsupported photo content-type: {content_type}")
+
+            photo = io.BytesIO()
+            async for chunk in response.content.iter_chunked(64 * 1024):
+                photo.write(chunk)
+                if photo.tell() > MAX_DOWNLOADED_PHOTO_BYTES:
+                    raise ValueError("Downloaded photo is too large for Telegram sendPhoto")
+
+    if photo.tell() == 0:
+        raise ValueError("Downloaded photo is empty")
+
+    photo.seek(0)
+    photo.name = _download_filename_from_url(url)
+    return photo
+
+
 async def reply_media_url(message, url: str, caption: str, reply_markup):
     user_id = _message_user_id(message)
     if not await telegram_rate_limiter.wait_for_slot(user_id):
         return False
-    if url.lower().endswith((".mp4", ".webm")):
+    url_path = media_url_path_lower(url)
+    if url_path.endswith((".mp4", ".webm")):
         await message.reply_video(
             url,
             caption=caption if caption else None,
             parse_mode="Markdown",
             reply_markup=reply_markup,
         )
-    elif url.lower().endswith(".gif"):
+    elif url_path.endswith(".gif"):
         await message.reply_animation(
             url,
             caption=caption if caption else None,
@@ -59,10 +123,25 @@ async def reply_media_url(message, url: str, caption: str, reply_markup):
     return True
 
 
+async def reply_downloaded_photo(message, url: str, caption: str, reply_markup):
+    user_id = _message_user_id(message)
+    if not await telegram_rate_limiter.wait_for_slot(user_id):
+        return False
+    photo = await _download_photo_file(url)
+    await message.reply_photo(
+        photo,
+        caption=caption if caption else None,
+        parse_mode="Markdown",
+        reply_markup=reply_markup,
+    )
+    return True
+
+
 async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup):
     if not await telegram_rate_limiter.wait_for_slot(chat_id):
         return False
-    if url.lower().endswith((".mp4", ".webm")):
+    url_path = media_url_path_lower(url)
+    if url_path.endswith((".mp4", ".webm")):
         await bot.send_video(
             chat_id=chat_id,
             video=url,
@@ -70,7 +149,7 @@ async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup
             parse_mode="Markdown",
             reply_markup=reply_markup,
         )
-    elif url.lower().endswith(".gif"):
+    elif url_path.endswith(".gif"):
         await bot.send_animation(
             chat_id=chat_id,
             animation=url,
@@ -86,6 +165,20 @@ async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup
             parse_mode="Markdown",
             reply_markup=reply_markup,
         )
+    return True
+
+
+async def send_downloaded_photo(bot, chat_id: int, url: str, caption: str, reply_markup):
+    if not await telegram_rate_limiter.wait_for_slot(chat_id):
+        return False
+    photo = await _download_photo_file(url)
+    await bot.send_photo(
+        chat_id=chat_id,
+        photo=photo,
+        caption=caption if caption else None,
+        parse_mode="Markdown",
+        reply_markup=reply_markup,
+    )
     return True
 
 
@@ -158,6 +251,33 @@ async def send_post_media(
                     retries,
                     exc,
                 )
+                if _telegram_url_fetch_failed(exc) and _is_downloadable_photo_url(media_url):
+                    try:
+                        sent = await reply_downloaded_photo(
+                            message, media_url, caption, reply_markup
+                        )
+                        if sent:
+                            logger.info(
+                                "Media downloaded fallback send ok post=%s url_kind=%s",
+                                post.get("id"),
+                                url_kind,
+                            )
+                            return True
+                    except RetryAfter as retry_exc:
+                        telegram_rate_limiter.apply_retry_after(
+                            _message_user_id(message), retry_exc
+                        )
+                        if attempt == retries:
+                            return False
+                    except Exception as fallback_exc:
+                        logger.warning(
+                            "Media downloaded fallback failed post=%s url_kind=%s attempt=%s/%s: %s",
+                            post.get("id"),
+                            url_kind,
+                            attempt,
+                            retries,
+                            fallback_exc,
+                        )
                 if attempt < retries:
                     await asyncio.sleep(1)
 
@@ -235,6 +355,33 @@ async def send_post_media_to_chat(
                     retries,
                     exc,
                 )
+                if _telegram_url_fetch_failed(exc) and _is_downloadable_photo_url(media_url):
+                    try:
+                        sent = await send_downloaded_photo(
+                            bot, chat_id, media_url, caption, reply_markup
+                        )
+                        if sent:
+                            logger.info(
+                                "Subscription media downloaded fallback send ok user=%s post=%s url_kind=%s",
+                                chat_id,
+                                post.get("id"),
+                                url_kind,
+                            )
+                            return True
+                    except RetryAfter as retry_exc:
+                        telegram_rate_limiter.apply_retry_after(chat_id, retry_exc)
+                        if attempt == retries:
+                            return False
+                    except Exception as fallback_exc:
+                        logger.warning(
+                            "Subscription media downloaded fallback failed user=%s post=%s url_kind=%s attempt=%s/%s: %s",
+                            chat_id,
+                            post.get("id"),
+                            url_kind,
+                            attempt,
+                            retries,
+                            fallback_exc,
+                        )
                 if attempt < retries:
                     await asyncio.sleep(1)
 

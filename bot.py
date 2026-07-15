@@ -73,6 +73,7 @@ from bot_keyboards import (
 )
 from bot_media import (
     get_media_url_candidates,
+    media_url_path_lower,
     send_post_media as send_post_media_with_retries,
     send_post_media_to_chat as send_post_media_to_chat_with_retries,
     send_text_to_chat,
@@ -283,9 +284,10 @@ def media_from_post(post: dict, caption: str = ""):
     candidates = get_media_url_candidates(post)
     file_url = candidates[0][1] if candidates else ""
     media_caption = caption if caption else None
-    if file_url.lower().endswith((".mp4", ".webm")):
+    url_path = media_url_path_lower(file_url)
+    if url_path.endswith((".mp4", ".webm")):
         return InputMediaVideo(file_url, caption=media_caption, parse_mode="Markdown")
-    if file_url.lower().endswith(".gif"):
+    if url_path.endswith(".gif"):
         return InputMediaAnimation(
             file_url, caption=media_caption, parse_mode="Markdown"
         )
