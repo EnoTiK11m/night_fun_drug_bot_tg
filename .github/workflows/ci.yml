@@ -25,7 +25,7 @@ jobs:
         run: python -m pip check
 
       - name: Compile Python files
-        run: python -m py_compile bot.py database.py api_handler.py config.py bot_media.py bot_formatting.py bot_keyboards.py bot_state.py
+        run: python -m py_compile bot.py database.py api_handler.py config.py bot_delivery.py bot_features.py bot_media.py bot_formatting.py bot_keyboards.py bot_state.py tag_translation.py
 
       - name: Run tests
         run: python -m unittest discover -s tests -v

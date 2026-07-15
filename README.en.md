@@ -53,6 +53,7 @@ favorites, collections, a blacklist, and automatic subscriptions.
 - configurable maximum download size;
 - spoilers for all media or only posts rated `explicit`;
 - search history and personal statistics;
+- English and Russian labels when viewing post tags and the blacklist;
 - an explanation of which blacklist tag blocked a post.
 
 ### Favorites and Collections
@@ -188,6 +189,7 @@ All settings are read from environment variables or `.env`.
 | `ALLOWED_USER_IDS` | no | empty | Comma-separated users allowed in private chats |
 | `ALLOWED_CHAT_IDS` | no | empty | Comma-separated allowed Telegram chat IDs |
 | `ALLOW_GROUP_CHATS` | no | `false` | Allow the bot in group chats |
+| `TAG_TRANSLATION_ENABLED` | no | `true` | Translate displayed tags into Russian in the background |
 
 When `ALLOWED_USER_IDS` is empty, all users may access the bot in private chats.
 Groups are disabled by default. Users in `ADMIN_USER_IDS` are always allowed.
@@ -284,6 +286,7 @@ policy, or another process manager.
 | [`bot_keyboards.py`](bot_keyboards.py) | Persistent and inline keyboards |
 | [`bot_formatting.py`](bot_formatting.py) | Captions, Markdown, and data formatting |
 | [`bot_state.py`](bot_state.py) | Temporary conversation state and callback payloads |
+| [`tag_translation.py`](tag_translation.py) | Background tag translation and translation-cache orchestration |
 | [`config.py`](config.py) | Configuration loading and validation |
 | [`scripts/backup_sqlite.py`](scripts/backup_sqlite.py) | Consistent backup of a running SQLite database |
 | [`tests/`](tests) | Unit and integration tests |
@@ -319,6 +322,10 @@ The application rotates operational logs. See
 [`docs/PRODUCTION.en.md`](docs/PRODUCTION.en.md) for deployment and maintenance
 recommendations.
 
+Tag translations are cached in SQLite and populated gradually by a background
+task. For missing translations, the bot sends only tag names to the external
+Google Translate service; search queries, user IDs, and media are not shared.
+
 ## Development and Verification
 
 Install and verify dependencies:
@@ -331,7 +338,7 @@ python -m pip check
 Check syntax and run tests:
 
 ```bash
-python -m compileall -q bot.py api_handler.py database.py config.py bot_delivery.py bot_features.py bot_formatting.py bot_keyboards.py bot_media.py bot_state.py
+python -m compileall -q bot.py api_handler.py database.py config.py bot_delivery.py bot_features.py bot_formatting.py bot_keyboards.py bot_media.py bot_state.py tag_translation.py
 python -m unittest discover -s tests -v
 ```
 

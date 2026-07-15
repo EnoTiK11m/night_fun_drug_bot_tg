@@ -168,6 +168,37 @@ class FeatureDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["id"], 88)
         self.assertEqual(stats["favorites"], 1)
 
+    async def test_tag_translation_queue_round_trip_and_seed(self):
+        await database.cache_post({
+            "id": 99,
+            "file_url": "https://example.test/99.jpg",
+            "tags": "blue_hair green_eyes",
+        })
+        await database.add_to_blacklist(1, "gore")
+
+        inserted = await database.seed_tag_translation_queue()
+        pending = await database.get_pending_tag_translations(10)
+
+        self.assertGreaterEqual(inserted, 3)
+        self.assertTrue({"blue_hair", "green_eyes", "gore"}.issubset(set(pending)))
+
+        await database.save_tag_translations_bulk({
+            "blue_hair": "голубые волосы",
+            "green_eyes": "зелёные глаза",
+        })
+        translations = await database.get_tag_translations(
+            ["blue_hair", "green_eyes", "missing"]
+        )
+        self.assertEqual(translations["blue_hair"], "голубые волосы")
+        self.assertEqual(translations["green_eyes"], "зелёные глаза")
+
+        await database.mark_tag_translations_failed(["gore"])
+        states = await database.get_tag_translation_states(
+            ["blue_hair", "green_eyes", "gore"]
+        )
+        self.assertEqual(states["blue_hair"], "ready")
+        self.assertEqual(states["gore"], "failed")
+
 
 class MediaPreferenceTests(unittest.TestCase):
     def test_filter_sort_and_orientation(self):

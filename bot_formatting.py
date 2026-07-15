@@ -190,9 +190,12 @@ async def build_caption(
     return clamp_caption(f"{caption_parts[0]}\n" + "\n".join(caption_parts[1:]))
 
 
-def build_full_tags_messages(post: dict) -> list[str]:
+def build_full_tags_messages(
+    post: dict, translations: dict[str, str] | None = None
+) -> list[str]:
     post_id = post.get("id", 0)
     tags = [tag for tag in str(post.get("tags", "")).split() if tag]
+    translations = translations or {}
     if not tags:
         return [f"🏷 У поста `{md_code(post_id)}` нет сохранённых тегов."]
 
@@ -200,7 +203,9 @@ def build_full_tags_messages(post: dict) -> list[str]:
     messages: list[str] = []
     current = header
     for tag in tags:
-        line = f"• `{md_code(tag)}`\n"
+        translation = translations.get(tag, "").strip()
+        suffix = f" — {md_text(translation)}" if translation else ""
+        line = f"• `{md_code(tag)}`{suffix}\n"
         if len(current) + len(line) > 3900:
             messages.append(current.rstrip())
             current = line

@@ -32,11 +32,13 @@ class MarkdownEscapingTests(unittest.TestCase):
 
     def test_full_tags_message_splits_tags_line_by_line(self):
         messages = build_full_tags_messages(
-            {"id": 123, "tags": "tag_one girls&#039;_frontline bad`tag"}
+            {"id": 123, "tags": "tag_one girls&#039;_frontline bad`tag"},
+            {"tag_one": "первый тег"},
         )
 
         self.assertEqual(len(messages), 1)
         self.assertIn("• `tag_one`", messages[0])
+        self.assertIn("первый тег", messages[0])
         self.assertIn("• `girls'_frontline`", messages[0])
         self.assertIn("• `bad'tag`", messages[0])
 

@@ -366,6 +366,17 @@ async def init_db():
                 PRIMARY KEY(user_id, query, post_id)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS tag_translations (
+                tag TEXT PRIMARY KEY,
+                translation_ru TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                source TEXT NOT NULL DEFAULT 'queue',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_retry_at TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_search_history_user_query
@@ -411,6 +422,10 @@ async def init_db():
             ON subscription_digest_queue (user_id, queued_at)
         """)
         await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tag_translations_pending
+            ON tag_translations (status, next_retry_at, updated_at)
+        """)
+        await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_collection_items_user
             ON favorite_collection_items (user_id, collection_id, added_at)
         """)
@@ -449,6 +464,173 @@ async def get_user_blacklist(user_id: int) -> Set[str]:
         rows = await cursor.fetchall()
         await db.commit()
         return {row[0] for row in rows}
+
+
+def _normalize_translation_tags(tags) -> List[str]:
+    if isinstance(tags, str):
+        tags = tags.split()
+    return sorted({
+        str(tag).strip().lower()
+        for tag in tags
+        if tag is not None and str(tag).strip()
+    })
+
+
+async def queue_tag_translations(tags, source: str = "queue") -> int:
+    normalized = _normalize_translation_tags(tags)
+    if not normalized:
+        return 0
+    async with connect_db() as db:
+        before = db.total_changes
+        await db.executemany("""
+            INSERT OR IGNORE INTO tag_translations (tag, source)
+            VALUES (?, ?)
+        """, [(tag, source[:30]) for tag in normalized])
+        await db.commit()
+        return db.total_changes - before
+
+
+async def get_tag_translations(tags) -> Dict[str, str]:
+    normalized = _normalize_translation_tags(tags)
+    if not normalized:
+        return {}
+    result: Dict[str, str] = {}
+    async with connect_db() as db:
+        for offset in range(0, len(normalized), 500):
+            chunk = normalized[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            cursor = await db.execute(f"""
+                SELECT tag, translation_ru
+                FROM tag_translations
+                WHERE tag IN ({placeholders})
+                  AND status = 'ready'
+                  AND translation_ru <> ''
+            """, tuple(chunk))
+            result.update(await cursor.fetchall())
+    return result
+
+
+async def get_tag_translation_states(tags) -> Dict[str, str]:
+    normalized = _normalize_translation_tags(tags)
+    if not normalized:
+        return {}
+    result: Dict[str, str] = {}
+    async with connect_db() as db:
+        for offset in range(0, len(normalized), 500):
+            chunk = normalized[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            cursor = await db.execute(f"""
+                SELECT tag, status
+                FROM tag_translations
+                WHERE tag IN ({placeholders})
+                  AND (
+                    status IN ('ready', 'unchanged')
+                    OR (status = 'failed' AND next_retry_at > CURRENT_TIMESTAMP)
+                  )
+            """, tuple(chunk))
+            result.update(await cursor.fetchall())
+    return result
+
+
+async def get_pending_tag_translations(limit: int = 20) -> List[str]:
+    limit = max(1, min(int(limit), 100))
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            SELECT tag FROM tag_translations
+            WHERE status = 'pending'
+               OR (status = 'failed' AND (
+                    next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP
+               ))
+            ORDER BY CASE source
+                        WHEN 'blacklist' THEN 0
+                        WHEN 'display' THEN 1
+                        ELSE 2
+                     END,
+                     CASE status WHEN 'pending' THEN 0 ELSE 1 END,
+                     updated_at ASC, tag ASC
+            LIMIT ?
+        """, (limit,))
+        return [row[0] for row in await cursor.fetchall()]
+
+
+async def save_tag_translations_bulk(
+    translations: Dict[str, str], source: str = "google"
+) -> None:
+    rows = []
+    for tag, translation in translations.items():
+        normalized_tag = str(tag).strip().lower()
+        normalized_translation = " ".join(str(translation).split()).strip()
+        if normalized_tag:
+            rows.append((
+                normalized_tag,
+                normalized_translation,
+                "ready" if normalized_translation else "unchanged",
+                source[:30],
+            ))
+    if not rows:
+        return
+    async with connect_db() as db:
+        await db.executemany("""
+            INSERT INTO tag_translations
+                (tag, translation_ru, status, source, attempts, next_retry_at, updated_at)
+            VALUES (?, ?, ?, ?, 1, NULL, CURRENT_TIMESTAMP)
+            ON CONFLICT(tag) DO UPDATE SET
+                translation_ru = excluded.translation_ru,
+                status = excluded.status,
+                source = excluded.source,
+                attempts = tag_translations.attempts + 1,
+                next_retry_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+        """, rows)
+        await db.commit()
+
+
+async def mark_tag_translations_failed(tags) -> None:
+    normalized = _normalize_translation_tags(tags)
+    if not normalized:
+        return
+    async with connect_db() as db:
+        await db.executemany("""
+            INSERT INTO tag_translations
+                (tag, status, source, attempts, next_retry_at, updated_at)
+            VALUES (?, 'failed', 'network', 1, datetime('now', '+6 hours'), CURRENT_TIMESTAMP)
+            ON CONFLICT(tag) DO UPDATE SET
+                status = 'failed',
+                source = 'network',
+                attempts = tag_translations.attempts + 1,
+                next_retry_at = datetime(
+                    'now', '+' || MIN(24, 6 * (tag_translations.attempts + 1)) || ' hours'
+                ),
+                updated_at = CURRENT_TIMESTAMP
+        """, [(tag,) for tag in normalized])
+        await db.commit()
+
+
+async def seed_tag_translation_queue() -> int:
+    """Collect known tags without delaying database initialization."""
+    inserted = 0
+    async with connect_db() as db:
+        cursor = await db.execute("SELECT DISTINCT tag FROM blacklist WHERE tag <> ''")
+        blacklist_tags = [row[0] for row in await cursor.fetchall()]
+    inserted += await queue_tag_translations(blacklist_tags, source="blacklist")
+
+    for table in ("post_cache", "subscription_cache", "subscription_posts", "favorites"):
+        async with connect_db() as db:
+            cursor = await db.execute(
+                f"SELECT tags FROM {table} WHERE COALESCE(tags, '') <> ''"
+            )
+            while True:
+                rows = await cursor.fetchmany(250)
+                if not rows:
+                    break
+                batch = {
+                    tag
+                    for row in rows
+                    for tag in str(row[0] or "").split()
+                    if tag
+                }
+                inserted += await queue_tag_translations(batch, source=table)
+    return inserted
 
 
 async def add_to_blacklist(user_id: int, tag: str) -> bool:
@@ -1893,7 +2075,7 @@ async def get_admin_database_stats() -> Dict[str, Any]:
         counts = {}
         for table in (
             "users", "favorites", "subscriptions", "sent_posts",
-            "delivery_failures", "bot_events",
+            "delivery_failures", "bot_events", "tag_translations",
         ):
             cursor = await db.execute(f"SELECT COUNT(*) FROM {table}")
             counts[table] = int((await cursor.fetchone())[0] or 0)

@@ -65,3 +65,6 @@ seconds when the process exits unexpectedly with a non-zero code.
 - Watch `logs/info.log` for periodic heartbeat entries. Missing heartbeats
   usually mean that the bot process has stopped or is stuck before the event
   loop starts.
+- Tag translation requires outbound HTTPS access to Google Translate. Set
+  `TAG_TRANSLATION_ENABLED=false` to disable it; stored English tags, the
+  blacklist, search, and subscriptions will continue to work.

@@ -597,6 +597,7 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         text = update.message.reply_text.await_args.args[0]
         self.assertIn("DB quick check: `ok`", text)
         self.assertNotIn("DB quick_check", text)
+        self.assertIn("Tag translation worker:", text)
         self.assertEqual(
             update.message.reply_text.await_args.kwargs["parse_mode"], "Markdown"
         )

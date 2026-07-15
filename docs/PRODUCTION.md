@@ -70,3 +70,6 @@ python scripts/backup_sqlite.py --db data/bot_data.db --output-dir backups
 - Следите за периодическими heartbeat-записями в `logs/info.log`. Их отсутствие
   обычно означает, что процесс бота остановлен или завис до запуска цикла
   обработки событий.
+- Для перевода тегов требуется исходящий HTTPS-доступ к Google Translate.
+  Перевод можно отключить через `TAG_TRANSLATION_ENABLED=false`; сохранённые
+  английские теги, blacklist, поиск и подписки продолжат работать.

@@ -46,6 +46,7 @@ from config import (
     SEARCH_COOLDOWN_SECONDS,
     SUBSCRIPTION_CHECK_INTERVAL_SECONDS,
     SUBSCRIPTION_MAX_POSTS_PER_USER_PASS,
+    TAG_TRANSLATION_ENABLED,
     validate_config,
 )
 from bot_formatting import (
@@ -112,6 +113,7 @@ from bot_state import (
     remember_post,
     store_callback_payload,
 )
+from tag_translation import tag_translation_service
 from database import (
     init_db,
     get_user_blacklist,
@@ -287,6 +289,7 @@ pending_subscription_options: dict[int, str] = {}
 # Глобальная задача для подписок
 subscription_task = None
 heartbeat_task = None
+tag_translation_task = None
 user_last_search_at = {}
 MEDIA_SEND_RETRIES = 2
 SUBSCRIPTION_CONCURRENCY = 5
@@ -1645,7 +1648,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[user_id] = "waiting_bl_remove"
         blacklist = await get_user_blacklist(user_id)
         if blacklist:
-            tags_list = ", ".join(f"`{md_code(tag)}`" for tag in sorted(blacklist))
+            ordered_tags = sorted(blacklist)
+            visible_tags = ordered_tags[:60]
+            translations = await tag_translation_service.translate_tags(visible_tags)
+            tags_list = ", ".join(
+                f"`{md_code(tag)}`"
+                + (f" — {md_text(translations[tag])}" if translations.get(tag) else "")
+                for tag in visible_tags
+            )
+            if len(ordered_tags) > len(visible_tags):
+                tags_list += f"\n\n…и ещё {len(ordered_tags) - len(visible_tags)}. Полный список доступен через «Показать»."
             text = f"➖ Введите тег для удаления:\n\nВаши теги: {tags_list}"
         else:
             text = "➖ Ваш blacklist пуст"
@@ -1654,18 +1666,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "bl_show":
         entries = await get_blacklist_entries(user_id)
         if entries:
-            tags_list = "\n".join(
-                f"• `{md_code(item['tag'])}`"
-                + (f" — до {md_text(item['expires_at'])}" if item["expires_at"] else "")
-                for item in entries
+            translations = await tag_translation_service.translate_tags(
+                [item["tag"] for item in entries], immediate_limit=50
             )
-            text = f"📋 *Ваш Blacklist:*\n\n{tags_list}"
+            pages = []
+            current = "📋 *Ваш Blacklist:*\n\n"
+            for item in entries:
+                translation = translations.get(item["tag"], "")
+                line = f"• `{md_code(item['tag'])}`"
+                if translation:
+                    line += f" — {md_text(translation)}"
+                if item["expires_at"]:
+                    line += f" — до {md_text(item['expires_at'])}"
+                line += "\n"
+                if len(current) + len(line) > 3900:
+                    pages.append(current.rstrip())
+                    current = line
+                else:
+                    current += line
+            if current.strip():
+                pages.append(current.rstrip())
         else:
-            text = "📋 Ваш Blacklist пуст"
+            pages = ["📋 Ваш Blacklist пуст"]
 
         await query.edit_message_text(
-            text, reply_markup=get_blacklist_keyboard(), parse_mode="Markdown"
+            pages[0],
+            reply_markup=get_blacklist_keyboard() if len(pages) == 1 else None,
+            parse_mode="Markdown",
         )
+        for index, page in enumerate(pages[1:], start=1):
+            await query.message.reply_text(
+                page,
+                reply_markup=get_blacklist_keyboard() if index == len(pages) - 1 else None,
+                parse_mode="Markdown",
+            )
 
     elif data == "bl_temp":
         user_states[user_id] = "waiting_bl_temp"
@@ -3473,12 +3507,21 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         api_status = f"error: {type(exc).__name__}"
     sub_status = "running" if subscription_task and not subscription_task.done() else "stopped"
     heartbeat_status = "running" if heartbeat_task and not heartbeat_task.done() else "stopped"
+    if not TAG_TRANSLATION_ENABLED:
+        translation_status = "disabled"
+    else:
+        translation_status = (
+            "running"
+            if tag_translation_task and not tag_translation_task.done()
+            else "stopped"
+        )
     await update.message.reply_text(
         "🩺 *Health*\n\n"
         f"DB quick check: `{md_code(db_stats['quick_check'])}`\n"
         f"Rule34 API: `{api_status}`\n"
         f"Subscription worker: `{sub_status}`\n"
         f"Heartbeat: `{heartbeat_status}`\n"
+        f"Tag translation worker: `{translation_status}`\n"
         f"DB size: `{os.path.getsize(DB_PATH) // (1024 * 1024)} MiB`\n"
         f"Disk free: `{disk.free // (1024 * 1024)} MiB`",
         parse_mode="Markdown",
@@ -3903,7 +3946,7 @@ async def heartbeat_loop():
 
 
 async def post_init(application):
-    global subscription_task, heartbeat_task
+    global subscription_task, heartbeat_task, tag_translation_task
 
     bot = application.bot
 
@@ -3950,11 +3993,19 @@ async def post_init(application):
         heartbeat_task = asyncio.create_task(heartbeat_loop())
         logger.info("Heartbeat task started")
 
+    if TAG_TRANSLATION_ENABLED and (
+        tag_translation_task is None or tag_translation_task.done()
+    ):
+        tag_translation_task = asyncio.create_task(
+            tag_translation_service.background_worker()
+        )
+        logger.info("Tag translation task started")
+
 
 async def post_shutdown(application):
     """Очистка при завершении"""
     # Останавливаем фоновую задачу
-    global subscription_task, heartbeat_task
+    global subscription_task, heartbeat_task, tag_translation_task
     if subscription_task and not subscription_task.done():
         subscription_task.cancel()
         try:
@@ -3969,6 +4020,14 @@ async def post_shutdown(application):
         except asyncio.CancelledError:
             pass
 
+    if tag_translation_task and not tag_translation_task.done():
+        tag_translation_task.cancel()
+        try:
+            await tag_translation_task
+        except asyncio.CancelledError:
+            pass
+
+    await tag_translation_service.close()
     await api.close()
 
 
