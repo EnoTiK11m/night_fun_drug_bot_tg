@@ -46,6 +46,8 @@ DEFAULT_USER_SETTINGS = {
     "min_height": 0,
     "quality_mode": "auto",
     "max_file_mb": 10,
+    "spoiler_mode": "off",
+    "read_later_days": 30,
 }
 
 BLACKLIST_PRESETS = {
@@ -77,6 +79,8 @@ async def ensure_subscription_columns(db):
         "exhausted_notified": "BOOLEAN DEFAULT 0",
         "processing_until": "TIMESTAMP",
         "processing_token": "TEXT",
+        "settings_json": "TEXT DEFAULT '{}'",
+        "digest_mode": "TEXT DEFAULT 'instant'",
     }
     for column, definition in column_defs.items():
         if column not in columns:
@@ -97,6 +101,8 @@ async def ensure_subscription_cache_columns(db):
     column_defs = {
         "sample_url": "TEXT DEFAULT ''",
         "preview_url": "TEXT DEFAULT ''",
+        "width": "INTEGER DEFAULT 0",
+        "height": "INTEGER DEFAULT 0",
     }
     for column, definition in column_defs.items():
         if column not in columns:
@@ -238,6 +244,8 @@ async def init_db():
                 tags TEXT DEFAULT '',
                 rating TEXT DEFAULT '',
                 score INTEGER DEFAULT 0,
+                width INTEGER DEFAULT 0,
+                height INTEGER DEFAULT 0,
                 cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (user_id, query, post_id)
             )
@@ -327,6 +335,37 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS search_presets (
+                preset_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL COLLATE NOCASE,
+                query TEXT NOT NULL,
+                settings_json TEXT NOT NULL DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, name)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS read_later (
+                user_id INTEGER NOT NULL,
+                post_id INTEGER NOT NULL,
+                post_json TEXT NOT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
+                PRIMARY KEY(user_id, post_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS subscription_digest_queue (
+                user_id INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                post_id INTEGER NOT NULL,
+                post_json TEXT NOT NULL,
+                queued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, query, post_id)
+            )
+        """)
 
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_search_history_user_query
@@ -362,6 +401,14 @@ async def init_db():
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_post_cache_cached
             ON post_cache (cached_at)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_read_later_expiry
+            ON read_later (user_id, expires_at)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_digest_queue_user
+            ON subscription_digest_queue (user_id, queued_at)
         """)
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_collection_items_user
@@ -587,6 +634,13 @@ def _post_from_row(row) -> Dict[str, Any]:
     }
 
 
+def _subscription_post_from_row(row) -> Dict[str, Any]:
+    post = _post_from_row(row)
+    post["width"] = int(row[7] or 0)
+    post["height"] = int(row[8] or 0)
+    return post
+
+
 def _normalize_post(post: Dict[str, Any]) -> Optional[tuple[int, str, str, str, str, str, int]]:
     try:
         post_id = int(post.get("id"))
@@ -643,11 +697,12 @@ async def get_subscription_cache(
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     async with connect_db() as db:
         cursor = await db.execute("""
-            SELECT post_id, file_url, sample_url, preview_url, tags, rating, score
+            SELECT post_id, file_url, sample_url, preview_url, tags, rating, score,
+                   width, height
             FROM subscription_cache
             WHERE user_id = ? AND query = ?
         """, (user_id, query.strip()))
-        posts = [_post_from_row(row) for row in await cursor.fetchall()]
+        posts = [_subscription_post_from_row(row) for row in await cursor.fetchall()]
 
         cursor = await db.execute("""
             SELECT MIN(cached_at)
@@ -698,6 +753,8 @@ async def replace_subscription_cache(
             post.get("tags", "") or "",
             post.get("rating", "") or "",
             int(post.get("score") or 0),
+            int(post.get("width") or 0),
+            int(post.get("height") or 0),
         ))
 
     async with connect_db() as db:
@@ -713,8 +770,9 @@ async def replace_subscription_cache(
         if rows:
             await db.executemany("""
                 INSERT OR REPLACE INTO subscription_cache
-                (user_id, query, post_id, file_url, sample_url, preview_url, tags, rating, score)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (user_id, query, post_id, file_url, sample_url, preview_url, tags, rating, score,
+                 width, height)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
             await db.executemany("""
                 INSERT INTO post_cache
@@ -740,6 +798,8 @@ async def replace_subscription_cache(
                     tags,
                     rating,
                     score,
+                    _width,
+                    _height,
                 ) in rows
             ])
         cursor = await db.execute("""
@@ -1838,3 +1898,295 @@ async def get_admin_database_stats() -> Dict[str, Any]:
             cursor = await db.execute(f"SELECT COUNT(*) FROM {table}")
             counts[table] = int((await cursor.fetchone())[0] or 0)
         return {"quick_check": quick_check, "counts": counts}
+
+
+async def create_search_preset(
+    user_id: int, name: str, query: str, settings: Dict[str, Any]
+) -> Optional[int]:
+    name, query = name.strip()[:40], query.strip()[:500]
+    if not name or not query:
+        return None
+    async with connect_db() as db:
+        try:
+            cursor = await db.execute("""
+                INSERT INTO search_presets (user_id, name, query, settings_json)
+                VALUES (?, ?, ?, ?)
+            """, (user_id, name, query, json.dumps(settings)))
+            await db.commit()
+            return int(cursor.lastrowid)
+        except aiosqlite.IntegrityError:
+            return None
+
+
+async def get_search_presets(user_id: int) -> List[Dict[str, Any]]:
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            SELECT preset_id, name, query, settings_json
+            FROM search_presets WHERE user_id = ? ORDER BY name COLLATE NOCASE
+        """, (user_id,))
+        result = []
+        for preset_id, name, query, raw_settings in await cursor.fetchall():
+            try:
+                settings = json.loads(raw_settings or "{}")
+            except json.JSONDecodeError:
+                settings = {}
+            result.append({"id": preset_id, "name": name, "query": query, "settings": settings})
+        return result
+
+
+async def get_search_preset(user_id: int, preset_id: int) -> Optional[Dict[str, Any]]:
+    presets = await get_search_presets(user_id)
+    return next((item for item in presets if item["id"] == preset_id), None)
+
+
+async def delete_search_preset(user_id: int, preset_id: int) -> bool:
+    async with connect_db() as db:
+        cursor = await db.execute(
+            "DELETE FROM search_presets WHERE user_id = ? AND preset_id = ?",
+            (user_id, preset_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_subscription_options(user_id: int, query: str) -> Dict[str, Any]:
+    async with connect_db() as db:
+        try:
+            cursor = await db.execute("""
+                SELECT settings_json, digest_mode FROM subscriptions
+                WHERE user_id = ? AND query = ?
+            """, (user_id, query.strip()))
+        except aiosqlite.OperationalError:
+            return {"digest_mode": "instant"}
+        row = await cursor.fetchone()
+        if not row:
+            return {"digest_mode": "instant"}
+        try:
+            options = json.loads(row[0] or "{}")
+        except json.JSONDecodeError:
+            options = {}
+        options["digest_mode"] = row[1] or "instant"
+        return options
+
+
+async def update_subscription_options(
+    user_id: int, query: str, options: Dict[str, Any]
+) -> bool:
+    digest_mode = options.get("digest_mode", "instant")
+    if digest_mode not in {"instant", "digest"}:
+        digest_mode = "instant"
+    stored = {key: value for key, value in options.items() if key != "digest_mode"}
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            UPDATE subscriptions SET settings_json = ?, digest_mode = ?
+            WHERE user_id = ? AND query = ?
+        """, (json.dumps(stored), digest_mode, user_id, query.strip()))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def add_read_later(
+    user_id: int, post: Dict[str, Any], retention_days: int = 30
+) -> bool:
+    normalized = _normalize_post(post)
+    if normalized is None:
+        return False
+    post_id = normalized[0]
+    safe_post = dict(post)
+    safe_post["id"] = post_id
+    days = max(1, min(int(retention_days), 365))
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            INSERT OR IGNORE INTO read_later
+            (user_id, post_id, post_json, expires_at)
+            VALUES (?, ?, ?, datetime('now', '+' || ? || ' days'))
+        """, (user_id, post_id, json.dumps(safe_post), days))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_read_later(user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+    async with connect_db() as db:
+        await db.execute(
+            "DELETE FROM read_later WHERE expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')"
+        )
+        cursor = await db.execute("""
+            SELECT post_json FROM read_later WHERE user_id = ?
+            ORDER BY added_at DESC LIMIT ?
+        """, (user_id, max(1, min(limit, 100))))
+        await db.commit()
+        result = []
+        for (raw_post,) in await cursor.fetchall():
+            try:
+                result.append(json.loads(raw_post))
+            except json.JSONDecodeError:
+                continue
+        return result
+
+
+async def remove_read_later(user_id: int, post_id: int) -> bool:
+    async with connect_db() as db:
+        cursor = await db.execute(
+            "DELETE FROM read_later WHERE user_id = ? AND post_id = ?",
+            (user_id, post_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def enqueue_subscription_digest(user_id: int, query: str, post: Dict[str, Any]) -> bool:
+    normalized = _normalize_post(post)
+    if normalized is None:
+        return False
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            INSERT OR IGNORE INTO subscription_digest_queue
+            (user_id, query, post_id, post_json) VALUES (?, ?, ?, ?)
+        """, (user_id, query.strip(), normalized[0], json.dumps(post)))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def pop_subscription_digest(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            SELECT query, post_id, post_json FROM subscription_digest_queue
+            WHERE user_id = ? ORDER BY queued_at LIMIT ?
+        """, (user_id, max(2, min(limit, 10))))
+        rows = await cursor.fetchall()
+        if rows:
+            await db.executemany("""
+                DELETE FROM subscription_digest_queue
+                WHERE user_id = ? AND query = ? AND post_id = ?
+            """, [(user_id, row[0], row[1]) for row in rows])
+        await db.commit()
+        result = []
+        for query, _post_id, raw_post in rows:
+            try:
+                post = json.loads(raw_post)
+                post["subscription_query"] = query
+                result.append(post)
+            except json.JSONDecodeError:
+                continue
+        return result
+
+
+async def get_due_digest_users() -> List[int]:
+    async with connect_db() as db:
+        try:
+            cursor = await db.execute("""
+                SELECT user_id FROM subscription_digest_queue
+                GROUP BY user_id
+                HAVING COUNT(*) >= 5
+                   OR datetime(MIN(queued_at)) <= datetime('now', '-6 hours')
+                LIMIT 20
+            """)
+        except aiosqlite.OperationalError:
+            return []
+        return [int(row[0]) for row in await cursor.fetchall()]
+
+
+async def get_favorite_tag_profile(user_id: int, limit: int = 10) -> List[Tuple[str, int]]:
+    posts = await get_favorites(user_id, limit=None)
+    counts: Dict[str, int] = {}
+    ignored = {"solo", "1girl", "1boy", "highres", "absurdres", "explicit", "safe"}
+    for post in posts:
+        for tag in str(post.get("tags") or "").lower().split():
+            if len(tag) > 2 and tag not in ignored:
+                counts[tag] = counts.get(tag, 0) + 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+
+
+async def search_favorites(
+    user_id: int, query: str, limit: int = 20
+) -> List[Dict[str, Any]]:
+    terms = [term.lower() for term in query.split() if term][:8]
+    conditions = "".join(
+        " AND lower(COALESCE(NULLIF(pc.tags, ''), f.tags) || ' ' || COALESCE(fn.note, '')) LIKE ?"
+        for _term in terms
+    )
+    params: list[Any] = [user_id, *(f"%{term}%" for term in terms), max(1, min(limit, 100))]
+    async with connect_db() as db:
+        cursor = await db.execute(f"""
+            SELECT f.post_id,
+                   COALESCE(NULLIF(pc.file_url, ''), f.file_url),
+                   COALESCE(NULLIF(pc.sample_url, ''), f.sample_url),
+                   COALESCE(NULLIF(pc.preview_url, ''), f.preview_url),
+                   COALESCE(NULLIF(pc.tags, ''), f.tags),
+                   COALESCE(NULLIF(pc.rating, ''), f.rating),
+                   COALESCE(pc.score, f.score), f.added_at
+            FROM favorites f
+            LEFT JOIN post_cache pc ON pc.post_id = f.post_id
+            LEFT JOIN favorite_notes fn ON fn.user_id = f.user_id AND fn.post_id = f.post_id
+            WHERE f.user_id = ? {conditions}
+            ORDER BY f.added_at DESC LIMIT ?
+        """, tuple(params))
+        result = []
+        for row in await cursor.fetchall():
+            post = _post_from_row(row)
+            post["added_at"] = row[7]
+            result.append(post)
+        return result
+
+
+async def get_user_storage_stats(user_id: int) -> Dict[str, int]:
+    async with connect_db() as db:
+        counts = {}
+        for name, table in (
+            ("favorites", "favorites"),
+            ("collections", "favorite_collections"),
+            ("history", "search_history"),
+            ("viewed", "sent_posts"),
+            ("read_later", "read_later"),
+            ("presets", "search_presets"),
+            ("digest", "subscription_digest_queue"),
+        ):
+            cursor = await db.execute(f"SELECT COUNT(*) FROM {table} WHERE user_id = ?", (user_id,))
+            counts[name] = int((await cursor.fetchone())[0] or 0)
+        cursor = await db.execute("""
+            SELECT COUNT(*) FROM favorite_collections c
+            WHERE c.user_id = ? AND NOT EXISTS (
+                SELECT 1 FROM favorite_collection_items i
+                WHERE i.collection_id = c.collection_id
+            )
+        """, (user_id,))
+        counts["empty_collections"] = int((await cursor.fetchone())[0] or 0)
+        cursor = await db.execute("""
+            SELECT COUNT(*) FROM favorites f
+            LEFT JOIN post_cache pc ON pc.post_id = f.post_id
+            WHERE f.user_id = ?
+              AND COALESCE(NULLIF(pc.file_url, ''), f.file_url, '') = ''
+        """, (user_id,))
+        counts["favorites_without_url"] = int((await cursor.fetchone())[0] or 0)
+        return counts
+
+
+async def cleanup_empty_collections(user_id: int) -> int:
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            DELETE FROM favorite_collections
+            WHERE user_id = ? AND NOT EXISTS (
+                SELECT 1 FROM favorite_collection_items i
+                WHERE i.collection_id = favorite_collections.collection_id
+            )
+        """, (user_id,))
+        await db.commit()
+        return max(0, cursor.rowcount)
+
+
+async def cleanup_user_storage(user_id: int, days: int = 90) -> Dict[str, int]:
+    days = max(7, min(int(days), 3650))
+    async with connect_db() as db:
+        removed = {}
+        for name, table, column in (
+            ("history", "search_history", "searched_at"),
+            ("viewed", "sent_posts", "sent_at"),
+            ("events", "bot_events", "created_at"),
+        ):
+            cursor = await db.execute(f"""
+                DELETE FROM {table} WHERE user_id = ?
+                AND datetime({column}) < datetime('now', '-' || ? || ' days')
+            """, (user_id, days))
+            removed[name] = max(0, cursor.rowcount)
+        await db.commit()
+        return removed

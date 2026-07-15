@@ -8,6 +8,33 @@ from api_handler import APITemporaryError
 
 
 class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_digest_subscription_queues_without_immediate_send(self):
+        app = SimpleNamespace(bot=object())
+        result = {"id": "123", "file_url": "https://example.test/file.jpg"}
+
+        with (
+            patch.object(bot, "claim_due_subscription", AsyncMock(return_value="token")),
+            patch.object(bot, "get_user_blacklist", AsyncMock(return_value=set())),
+            patch.object(bot, "get_user_settings", AsyncMock(return_value={"show_caption": False})),
+            patch.object(bot, "get_subscription_options", AsyncMock(return_value={
+                "digest_mode": "digest", "rating_filter": "s"
+            })),
+            patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
+            patch.object(bot, "get_subscription_cached_image", AsyncMock(return_value=result)) as select_post,
+            patch.object(bot, "remember_and_cache_post", AsyncMock()),
+            patch.object(bot, "enqueue_subscription_digest", AsyncMock(return_value=True)) as enqueue,
+            patch.object(bot, "update_subscription_time", AsyncMock(return_value=True)),
+            patch.object(bot, "mark_post_sent", AsyncMock()),
+            patch.object(bot, "send_post_media_to_chat", AsyncMock()) as send_now,
+        ):
+            delivered = await bot.process_one_subscription(app, (1, "tag", 10, 0))
+
+        self.assertTrue(delivered)
+        enqueue.assert_awaited_once_with(1, "tag", result)
+        send_now.assert_not_awaited()
+        settings = select_post.await_args.args[4]
+        self.assertEqual(settings["rating_filter"], "s")
+
     async def test_successful_delivery_updates_schedule_then_marks_sent(self):
         app = SimpleNamespace(bot=object())
         result = {"id": "123", "file_url": "https://example.test/file.jpg"}

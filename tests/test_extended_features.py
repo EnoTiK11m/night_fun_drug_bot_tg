@@ -105,6 +105,69 @@ class FeatureDatabaseTests(unittest.IsolatedAsyncioTestCase):
         await database.delete_delivery_failure(failures[0]["id"])
         self.assertEqual(await database.get_delivery_failures(), [])
 
+    async def test_search_preset_crud_preserves_settings(self):
+        preset_id = await database.create_search_preset(
+            1, "Landscape", "character -comic", {"orientation": "landscape"}
+        )
+
+        preset = await database.get_search_preset(1, preset_id)
+
+        self.assertEqual(preset["query"], "character -comic")
+        self.assertEqual(preset["settings"]["orientation"], "landscape")
+        self.assertTrue(await database.delete_search_preset(1, preset_id))
+
+    async def test_subscription_options_are_isolated_per_query(self):
+        await database.add_subscription(1, "alpha", 10)
+        await database.update_subscription_options(1, "alpha", {
+            "rating_filter": "s", "digest_mode": "digest", "extra_blacklist": "comic"
+        })
+
+        options = await database.get_subscription_options(1, "alpha")
+
+        self.assertEqual(options["rating_filter"], "s")
+        self.assertEqual(options["digest_mode"], "digest")
+        self.assertEqual(options["extra_blacklist"], "comic")
+
+    async def test_subscription_cache_preserves_dimensions_for_filters(self):
+        await database.replace_subscription_cache(1, "alpha", [{
+            "id": 9,
+            "file_url": "https://example.test/9.jpg",
+            "width": 1920,
+            "height": 1080,
+        }])
+
+        posts, _cached_at = await database.get_subscription_cache(1, "alpha")
+
+        self.assertEqual(posts[0]["width"], 1920)
+        self.assertEqual(posts[0]["height"], 1080)
+
+    async def test_read_later_and_digest_queue_round_trip(self):
+        post = {"id": 77, "file_url": "https://example.test/77.jpg", "tags": "alpha"}
+        self.assertTrue(await database.add_read_later(1, post, 30))
+        self.assertEqual((await database.get_read_later(1))[0]["id"], 77)
+        self.assertTrue(await database.remove_read_later(1, 77))
+
+        self.assertTrue(await database.enqueue_subscription_digest(1, "alpha", post))
+        digest = await database.pop_subscription_digest(1, 10)
+        self.assertEqual(digest[0]["subscription_query"], "alpha")
+        self.assertEqual(await database.pop_subscription_digest(1, 10), [])
+
+    async def test_favorite_profile_search_and_storage_stats(self):
+        post = {
+            "id": 88, "file_url": "https://example.test/88.jpg",
+            "tags": "character_name blue_hair solo",
+        }
+        await database.add_favorite(1, post)
+        await database.set_favorite_note(1, 88, "best wallpaper")
+
+        profile = await database.get_favorite_tag_profile(1)
+        results = await database.search_favorites(1, "wallpaper blue_hair")
+        stats = await database.get_user_storage_stats(1)
+
+        self.assertIn(("blue_hair", 1), profile)
+        self.assertEqual(results[0]["id"], 88)
+        self.assertEqual(stats["favorites"], 1)
+
 
 class MediaPreferenceTests(unittest.TestCase):
     def test_filter_sort_and_orientation(self):
@@ -142,6 +205,7 @@ class MediaPreferenceTests(unittest.TestCase):
 
         self.assertEqual(prepared["file_url"], "sample.jpg")
         self.assertEqual(settings["gallery_size"], 10)
+        self.assertEqual(settings["spoiler_mode"], "off")
 
     def test_gallery_replaces_gif_with_static_preview_and_fills_album(self):
         posts = [
@@ -174,6 +238,47 @@ class MediaPreferenceTests(unittest.TestCase):
 
 
 class LegacyMigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_init_adds_subscription_feature_columns(self):
+        tempdir = f"test_sub_migration_{uuid.uuid4().hex}"
+        os.makedirs(tempdir)
+        path = os.path.join(tempdir, "legacy.db")
+        connection = sqlite3.connect(path)
+        connection.execute("""
+            CREATE TABLE subscriptions (
+                user_id INTEGER, query TEXT, interval_minutes INTEGER DEFAULT 10,
+                is_active BOOLEAN DEFAULT 1, last_sent TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, query)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE subscription_cache (
+                user_id INTEGER, query TEXT, post_id INTEGER, file_url TEXT,
+                tags TEXT DEFAULT '', rating TEXT DEFAULT '', score INTEGER DEFAULT 0,
+                cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, query, post_id)
+            )
+        """)
+        connection.execute("INSERT INTO subscriptions (user_id, query) VALUES (1, 'keep')")
+        connection.commit()
+        connection.close()
+        old_path = database.DB_PATH
+        database.DB_PATH = path
+        try:
+            await database.init_db()
+            async with database.connect_db() as db:
+                sub_columns = {
+                    row[1] for row in await (await db.execute("PRAGMA table_info(subscriptions)" )).fetchall()
+                }
+                cache_columns = {
+                    row[1] for row in await (await db.execute("PRAGMA table_info(subscription_cache)" )).fetchall()
+                }
+            self.assertTrue({"settings_json", "digest_mode"}.issubset(sub_columns))
+            self.assertTrue({"width", "height"}.issubset(cache_columns))
+            self.assertEqual((await database.get_all_user_subscriptions(1))[0][0], "keep")
+        finally:
+            database.DB_PATH = old_path
+            shutil.rmtree(tempdir, ignore_errors=True)
+
     async def test_init_migrates_legacy_blacklist_without_data_loss(self):
         tempdir = f"test_migration_{uuid.uuid4().hex}"
         os.makedirs(tempdir)

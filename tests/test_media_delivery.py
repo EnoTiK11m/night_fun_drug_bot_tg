@@ -68,6 +68,17 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         message.reply_text.assert_not_awaited()
 
+    async def test_send_post_media_passes_spoiler_to_telegram(self):
+        message = AsyncMock()
+        post = {"id": 1, "file_url": "https://example.test/1.jpg", "rating": "e"}
+
+        delivered = await bot.send_post_media(
+            message, post, settings={"spoiler_mode": "explicit"}
+        )
+
+        self.assertTrue(delivered)
+        self.assertTrue(message.reply_photo.await_args.kwargs["has_spoiler"])
+
     async def test_send_post_media_to_chat_tries_preview_url_after_failures(self):
         telegram_bot = AsyncMock()
         telegram_bot.send_photo = AsyncMock(side_effect=[

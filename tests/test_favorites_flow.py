@@ -40,6 +40,10 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         bot_state.DB_PATH = self.old_payload_db_path
         shutil.rmtree(self.tempdir, ignore_errors=True)
         bot.user_states.pop(1, None)
+        bot.search_builders.pop(1, None)
+        bot.pending_preset_queries.pop(1, None)
+        bot.pending_bulk_posts.pop(1, None)
+        bot.pending_subscription_options.pop(1, None)
         bot.favorites_export_users.clear()
         bot.favorites_export_last_finished_at.clear()
 
@@ -68,6 +72,26 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved_post["id"], "123")
         self.assertEqual(saved_post["file_url"], "https://example.test/123.jpg")
         query.answer.assert_awaited_once()
+
+    async def test_start_message_describes_current_features(self):
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+
+        with patch.object(bot, "get_subscription_pause_until", AsyncMock(return_value=None)):
+            await bot.start(update, SimpleNamespace())
+
+        text = update.message.reply_text.await_args.args[0]
+        self.assertIn("альбомы до 10 изображений", text)
+        self.assertIn("поисковые пресеты", text)
+        self.assertIn("накопительный дайджест", text)
+        self.assertIn("очередь «На потом»", text)
+        self.assertIn("18+", text)
+        self.assertIs(
+            update.message.reply_text.await_args.kwargs["reply_markup"].is_persistent,
+            True,
+        )
 
     async def test_favorite_button_without_cache_saves_id_without_blocking_api(self):
         update, query = make_callback_update("fav_456")
@@ -158,8 +182,14 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[1][0].callback_data, "more")
         self.assertEqual(rows[1][1].callback_data, "search")
         self.assertEqual(rows[2][0].callback_data, "fav_123")
-        self.assertEqual(rows[3][0].callback_data, "post_tags_123")
-        self.assertIn("id=123", rows[4][0].url)
+        callbacks = [
+            button.callback_data
+            for row in rows for button in row if button.callback_data
+        ]
+        self.assertIn("similar_123", callbacks)
+        self.assertIn("later_add_123", callbacks)
+        self.assertIn("post_tags_123", callbacks)
+        self.assertTrue(any("id=123" in (button.url or "") for row in rows for button in row))
 
     def test_persistent_keyboard_contains_only_primary_actions(self):
         keyboard = bot.get_persistent_keyboard()
@@ -174,6 +204,42 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(bot.PERSISTENT_MENU, labels)
         self.assertTrue(keyboard.resize_keyboard)
         self.assertTrue(keyboard.is_persistent)
+
+    def test_main_menu_exposes_new_user_features(self):
+        callbacks = {
+            button.callback_data
+            for row in bot.get_main_keyboard().inline_keyboard
+            for button in row if button.callback_data
+        }
+
+        self.assertTrue({
+            "search_builder", "presets", "recommendations", "later_list", "storage"
+        }.issubset(callbacks))
+
+    def test_spoiler_mode_respects_rating(self):
+        self.assertTrue(bot.should_spoiler({"spoiler_mode": "all"}, {"rating": "s"}))
+        self.assertTrue(bot.should_spoiler({"spoiler_mode": "explicit"}, {"rating": "e"}))
+        self.assertFalse(bot.should_spoiler({"spoiler_mode": "explicit"}, {"rating": "s"}))
+        self.assertFalse(bot.should_spoiler({"spoiler_mode": "off"}, {"rating": "e"}))
+
+    async def test_search_builder_creates_runnable_query(self):
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            message=SimpleNamespace(text="ellen_joe solo", reply_text=AsyncMock()),
+        )
+        bot.user_states[1] = "waiting_builder_include"
+
+        await bot.message_handler(update, SimpleNamespace())
+        self.assertEqual(bot.user_states[1], "waiting_builder_exclude")
+
+        update.message.text = "comic text"
+        await bot.message_handler(update, SimpleNamespace())
+
+        self.assertNotIn(1, bot.user_states)
+        text = update.message.reply_text.await_args_list[-1].args[0]
+        self.assertIn("ellen_joe solo -comic -text", text)
+        markup = update.message.reply_text.await_args_list[-1].kwargs["reply_markup"]
+        self.assertEqual(len(markup.inline_keyboard[0]), 2)
 
     async def test_persistent_menu_button_opens_advanced_inline_menu(self):
         bot.user_states[1] = "waiting_search"
@@ -436,16 +502,10 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
             message=SimpleNamespace(text="solo", reply_text=AsyncMock()),
         )
 
-        with patch.object(bot, "show_favorites_list", AsyncMock()) as show_list:
+        with patch.object(bot, "show_favorite_search_results", AsyncMock()) as show_list:
             await bot.message_handler(update, SimpleNamespace())
 
-        show_list.assert_awaited_once_with(
-            update.message,
-            1,
-            edit=False,
-            page=0,
-            tag_filter="solo",
-        )
+        show_list.assert_awaited_once_with(update.message, 1, "solo")
         self.assertNotIn(1, bot.user_states)
 
     async def test_restart_command_rejects_non_admin(self):

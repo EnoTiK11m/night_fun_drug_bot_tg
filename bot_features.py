@@ -10,6 +10,7 @@ RATING_FILTERS = {"all", "s", "q", "e"}
 MEDIA_TYPES = {"all", "images", "animations", "videos"}
 ORIENTATIONS = {"any", "portrait", "landscape", "square"}
 QUALITY_MODES = {"auto", "preview", "sample", "original"}
+SPOILER_MODES = {"off", "explicit", "all"}
 MEDIA_GROUP_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".mp4")
 
 
@@ -159,11 +160,14 @@ def normalize_feature_settings(settings: dict) -> dict:
         result["orientation"] = "any"
     if result.get("quality_mode") not in QUALITY_MODES:
         result["quality_mode"] = "auto"
+    if result.get("spoiler_mode") not in SPOILER_MODES:
+        result["spoiler_mode"] = "off"
     for key, default, low, high in (
         ("gallery_size", 10, 2, 10),
         ("min_width", 0, 0, 10000),
         ("min_height", 0, 0, 10000),
         ("max_file_mb", 10, 1, 50),
+        ("read_later_days", 30, 1, 365),
     ):
         try:
             result[key] = max(low, min(int(result.get(key, default)), high))

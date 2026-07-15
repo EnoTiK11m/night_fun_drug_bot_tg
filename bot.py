@@ -33,7 +33,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from config import (
     ALLOW_GROUP_CHATS,
     ALLOWED_CHAT_IDS,
@@ -102,6 +102,7 @@ from bot_media import (
     send_post_media_to_chat as send_post_media_to_chat_with_retries,
     send_text_to_chat,
 )
+from bot_delivery import telegram_rate_limiter
 from bot_state import (
     get_callback_payload,
     get_callback_payload_by_token,
@@ -179,6 +180,23 @@ from database import (
     get_delivery_failures,
     delete_delivery_failure,
     get_admin_database_stats,
+    create_search_preset,
+    get_search_presets,
+    get_search_preset,
+    delete_search_preset,
+    get_subscription_options,
+    update_subscription_options,
+    add_read_later,
+    get_read_later,
+    remove_read_later,
+    enqueue_subscription_digest,
+    pop_subscription_digest,
+    get_due_digest_users,
+    get_favorite_tag_profile,
+    search_favorites,
+    get_user_storage_stats,
+    cleanup_user_storage,
+    cleanup_empty_collections,
 )
 from api_handler import api, APITemporaryError
 
@@ -262,6 +280,10 @@ logger = logging.getLogger(__name__)
 
 # Состояния пользователей
 user_states = {}
+search_builders: dict[int, dict] = {}
+pending_preset_queries: dict[int, str] = {}
+pending_bulk_posts: dict[int, list[int]] = {}
+pending_subscription_options: dict[int, str] = {}
 # Глобальная задача для подписок
 subscription_task = None
 heartbeat_task = None
@@ -356,18 +378,27 @@ async def build_subscription_added_text(query: str, interval: int, user_id: int)
     return text
 
 
-def media_from_post(post: dict, caption: str = ""):
+def should_spoiler(settings: dict | None, post: dict) -> bool:
+    mode = (settings or {}).get("spoiler_mode", "off")
+    return mode == "all" or (mode == "explicit" and post.get("rating") == "e")
+
+
+def media_from_post(post: dict, caption: str = "", has_spoiler: bool = False):
     candidates = get_media_url_candidates(post)
     file_url = candidates[0][1] if candidates else ""
     media_caption = caption if caption else None
     url_path = media_url_path_lower(file_url)
     if url_path.endswith((".mp4", ".webm")):
-        return InputMediaVideo(file_url, caption=media_caption, parse_mode="Markdown")
+        return InputMediaVideo(
+            file_url, caption=media_caption, parse_mode="Markdown", has_spoiler=has_spoiler
+        )
     if url_path.endswith(".gif"):
         return InputMediaAnimation(
-            file_url, caption=media_caption, parse_mode="Markdown"
+            file_url, caption=media_caption, parse_mode="Markdown", has_spoiler=has_spoiler
         )
-    return InputMediaPhoto(file_url, caption=media_caption, parse_mode="Markdown")
+    return InputMediaPhoto(
+        file_url, caption=media_caption, parse_mode="Markdown", has_spoiler=has_spoiler
+    )
 
 
 def should_show_tags_button(settings: dict | None = None) -> bool:
@@ -426,8 +457,24 @@ def build_caption_settings_text(settings: dict) -> str:
 
 async def send_full_post_tags(message, post_id: int):
     post = await get_known_post(post_id) or minimal_post(post_id)
-    for text in build_full_tags_messages(post):
-        await message.reply_text(text, parse_mode="Markdown")
+    messages = build_full_tags_messages(post)
+    tags = [tag for tag in str(post.get("tags") or "").split() if tag][:8]
+    for index, text in enumerate(messages):
+        keyboard = None
+        if index == len(messages) - 1 and tags:
+            rows = []
+            for tag in tags:
+                rows.append([
+                    InlineKeyboardButton(
+                        f"🔍 {tag[:28]}",
+                        callback_data=store_callback_payload("tag_search", tag),
+                    ),
+                    InlineKeyboardButton(
+                        "🚫", callback_data=store_callback_payload("tag_block", tag)
+                    ),
+                ])
+            keyboard = InlineKeyboardMarkup(rows)
+        await message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -441,17 +488,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else ""
     )
     await update.message.reply_text(
-        "👋 Привет! Я бот для поиска изображений на rule34.\n\n"
-        "🔍 *Основные функции:*\n"
-        "• *Поиск* - поиск по тегам\n"
-        "• *Рандомная картинка* - случайный пост с учётом blacklist\n"
-        "• *Подписки* - автоматическая отправка каждые 10 минут\n"
-        "• *Blacklist* - фильтрация нежелательных тегов\n"
-        "• *Настройки* - управление описанием картинок\n\n"
-        "⚙️ *Настройки описания:*\n"
-        "Вы можете выбрать какие элементы показывать в описании:\n"
-        "- Запрос поиска\n- ID поста\n- Очки (score)\n- Рейтинг\n- Теги\n- Метку подписки\n\n"
-        "⚠️ Бот предназначен только для пользователей 18+."
+        "👋 Привет! Я помогу найти и удобно организовать изображения с Rule34.\n\n"
+        "🔍 *Поиск и подборки*\n"
+        "• поиск по тегам, ID и случайная выдача;\n"
+        "• альбомы до 10 изображений и расширенные фильтры;\n"
+        "• похожие посты, рекомендации и конструктор запросов;\n"
+        "• сохранённые поисковые пресеты.\n\n"
+        "⭐ *Личная библиотека*\n"
+        "• избранное, коллекции и заметки;\n"
+        "• очередь «На потом» и поиск по сохранённым постам;\n"
+        "• массовое сохранение и ZIP-экспорт.\n\n"
+        "🔔 *Подписки*\n"
+        "• отдельные фильтры для каждого запроса;\n"
+        "• мгновенная доставка или накопительный дайджест;\n"
+        "• пауза подписок и повтор неудачных доставок.\n\n"
+        "🛡 *Контроль выдачи*\n"
+        "• постоянный и временный blacklist;\n"
+        "• выбор качества, спойлеров и состава описания.\n\n"
+        "Используйте кнопки под полем ввода. Все остальные возможности находятся в `⚙️ Меню`.\n\n"
+        "⚠️ Бот предназначен только для совершеннолетних пользователей 18+."
         f"{pause_text}",
         reply_markup=get_persistent_keyboard(),
         parse_mode="Markdown",
@@ -594,6 +649,247 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context, send_search_gallery(query.message, user_id, tags, page)
         )
 
+    elif data == "search_builder":
+        search_builders[user_id] = {}
+        user_states[user_id] = "waiting_builder_include"
+        await query.message.reply_text(
+            "🧩 *Конструктор поиска*\n\nВведите обязательные теги через пробел.",
+            parse_mode="Markdown",
+        )
+
+    elif data == "presets":
+        await show_search_presets(query.message, user_id)
+
+    elif data == "preset_save_current":
+        saved = await get_user_query(user_id)
+        if not saved or not saved[0]:
+            await query.message.reply_text("Сначала выполните поиск.")
+        else:
+            pending_preset_queries[user_id] = saved[0]
+            user_states[user_id] = "waiting_preset_name"
+            await query.message.reply_text("Введите название пресета (до 40 символов):")
+
+    elif data.startswith("preset_run_"):
+        value = data.replace("preset_run_", "", 1)
+        preset = await get_search_preset(user_id, int(value)) if value.isdigit() else None
+        if not preset:
+            await query.message.reply_text("Пресет не найден.")
+        else:
+            settings = await get_user_settings(user_id)
+            settings.update(preset["settings"])
+            await save_user_settings(user_id, settings)
+            schedule_background_task(context, send_search_gallery(query.message, user_id, preset["query"]))
+
+    elif data.startswith("preset_del_"):
+        value = data.replace("preset_del_", "", 1)
+        if value.isdigit():
+            await delete_search_preset(user_id, int(value))
+        await show_search_presets(query.message, user_id)
+
+    elif data.startswith("preset_from_"):
+        preset_query = get_callback_payload("preset_from", data)
+        if preset_query:
+            pending_preset_queries[user_id] = preset_query
+            user_states[user_id] = "waiting_preset_name"
+            await query.message.reply_text("Введите название пресета:")
+
+    elif data.startswith("builder_run_"):
+        built_query = get_callback_payload("builder_run", data)
+        if built_query:
+            schedule_background_task(context, send_search_gallery(query.message, user_id, built_query))
+
+    elif data == "recommendations":
+        schedule_background_task(context, send_recommendations(query.message, user_id))
+
+    elif data.startswith("rec_hide_"):
+        tag = get_callback_payload("rec_hide", data)
+        if tag:
+            settings = await get_user_settings(user_id)
+            excluded = set(str(settings.get("recommendation_excluded_tags", "")).split())
+            excluded.add(tag)
+            settings["recommendation_excluded_tags"] = " ".join(sorted(excluded)[:100])
+            await save_user_settings(user_id, settings)
+            await query.message.reply_text(f"🚫 `{md_code(tag)}` исключён из рекомендаций.", parse_mode="Markdown")
+
+    elif data.startswith("similar_"):
+        value = data.replace("similar_", "", 1)
+        post = await get_known_post(int(value)) if value.isdigit() else None
+        if not post:
+            await query.message.reply_text("Не удалось получить теги поста.")
+        else:
+            similar_tags = similar_query_from_post(post)
+            if similar_tags:
+                schedule_background_task(
+                    context, send_search_gallery(query.message, user_id, similar_tags)
+                )
+            else:
+                await query.message.reply_text("Недостаточно характерных тегов для похожей подборки.")
+
+    elif data.startswith("tag_search_"):
+        tag = get_callback_payload("tag_search", data)
+        if tag:
+            schedule_background_task(context, send_search_gallery(query.message, user_id, tag))
+
+    elif data.startswith("tag_block_"):
+        tag = get_callback_payload("tag_block", data)
+        if tag:
+            added = await add_to_blacklist(user_id, tag)
+            await query.message.reply_text(
+                f"🚫 `{md_code(tag)}` добавлен в blacklist." if added
+                else f"`{md_code(tag)}` уже находится в blacklist.",
+                parse_mode="Markdown",
+            )
+
+    elif data.startswith("later_add_"):
+        value = data.replace("later_add_", "", 1)
+        post = await get_known_post(int(value)) if value.isdigit() else None
+        settings = normalize_feature_settings(await get_user_settings(user_id))
+        added = bool(post) and await add_read_later(
+            user_id, post, settings.get("read_later_days", 30)
+        )
+        await query.message.reply_text(
+            "⏳ Добавлено в «На потом»." if added else "ℹ️ Пост уже сохранён или недоступен."
+        )
+
+    elif data == "later_list":
+        await show_read_later(query.message, user_id)
+
+    elif data.startswith("later_open_"):
+        value = data.replace("later_open_", "", 1)
+        posts = await get_read_later(user_id, 100)
+        post = next((item for item in posts if str(item.get("id")) == value), None)
+        if post:
+            settings = await get_user_settings(user_id)
+            await send_post_media(query.message, post, settings=settings)
+        else:
+            await query.message.reply_text("Пост больше не находится в списке.")
+
+    elif data.startswith("later_del_"):
+        value = data.replace("later_del_", "", 1)
+        if value.isdigit():
+            await remove_read_later(user_id, int(value))
+        await show_read_later(query.message, user_id)
+
+    elif data == "storage":
+        await show_storage(query.message, user_id)
+
+    elif data == "storage_cleanup_90":
+        removed = await cleanup_user_storage(user_id, 90)
+        await query.message.reply_text(
+            "🧹 Удалено старых записей: " + str(sum(removed.values()))
+        )
+        await show_storage(query.message, user_id)
+
+    elif data == "storage_empty_collections":
+        removed = await cleanup_empty_collections(user_id)
+        await query.message.reply_text(f"🗑 Удалено пустых коллекций: {removed}.")
+        await show_storage(query.message, user_id)
+
+    elif data.startswith("gallery_bulk_fav_"):
+        raw_ids = get_callback_payload("gallery_bulk_fav", data) or ""
+        added = 0
+        for value in raw_ids.split(",")[:10]:
+            post = await get_known_post(int(value)) if value.isdigit() else None
+            if post and await add_favorite(user_id, post):
+                added += 1
+        await query.message.reply_text(f"⭐ Добавлено в избранное: {added}.")
+
+    elif data.startswith("gallery_collection_"):
+        raw_ids = get_callback_payload("gallery_collection", data) or ""
+        pending_bulk_posts[user_id] = [int(value) for value in raw_ids.split(",") if value.isdigit()][:10]
+        collections = await get_favorite_collections(user_id)
+        rows = [[InlineKeyboardButton(
+            f"🗂 {item['name'][:28]}", callback_data=f"gallery_col_add_{item['id']}"
+        )] for item in collections]
+        rows.append([InlineKeyboardButton("➕ Новая коллекция", callback_data="gallery_col_new")])
+        await query.message.reply_text(
+            "Выберите коллекцию для всей подборки:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    elif data.startswith("gallery_col_add_"):
+        value = data.replace("gallery_col_add_", "", 1)
+        collection_id = int(value) if value.isdigit() else 0
+        added = 0
+        for post_id in pending_bulk_posts.pop(user_id, []):
+            post = await get_known_post(post_id)
+            if post:
+                await add_favorite(user_id, post)
+                if await add_favorite_to_collection(user_id, collection_id, post_id):
+                    added += 1
+        await query.message.reply_text(f"🗂 Добавлено в коллекцию: {added}.")
+
+    elif data == "gallery_col_new":
+        user_states[user_id] = "waiting_bulk_collection_name"
+        await query.message.reply_text("Введите название новой коллекции для этой подборки:")
+
+    elif data == "settings_spoiler":
+        settings = normalize_feature_settings(await get_user_settings(user_id))
+        values = ["off", "explicit", "all"]
+        settings["spoiler_mode"] = values[(values.index(settings["spoiler_mode"]) + 1) % len(values)]
+        await save_user_settings(user_id, settings)
+        labels = {"off": "выключены", "explicit": "только explicit", "all": "для всех медиа"}
+        await query.message.reply_text(
+            f"🙈 Спойлеры: {labels[settings['spoiler_mode']]}",
+            reply_markup=get_settings_keyboard(),
+        )
+
+    elif data == "sub_digest_send":
+        posts = await pop_subscription_digest(user_id, 10)
+        if posts and not await send_digest_posts(query.message, user_id, posts):
+            for post in posts:
+                await enqueue_subscription_digest(
+                    user_id, post.get("subscription_query", "digest"), post
+                )
+
+    elif data.startswith("sub_options_"):
+        sub_query = get_callback_payload("sub_options", data)
+        if sub_query:
+            await show_subscription_options(query.message, user_id, sub_query)
+
+    elif data.startswith((
+        "subopt_rating_", "subopt_type_", "subopt_orientation_", "subopt_resolution_",
+        "subopt_quality_", "subopt_blacklist_", "subopt_digest_",
+    )):
+        action, token = data.split("_", 2)[1:]
+        sub_query = get_callback_payload_by_token("sub_options", token)
+        if not sub_query:
+            await query.message.reply_text("Настройки подписки устарели.")
+            return
+        options = await get_subscription_options(user_id, sub_query)
+        if action == "rating":
+            values = ["all", "s", "q", "e"]
+            current = options.get("rating_filter", "all")
+            options["rating_filter"] = values[(values.index(current) + 1) % len(values)]
+        elif action == "type":
+            values = ["all", "images", "animations", "videos"]
+            current = options.get("media_type", "all")
+            options["media_type"] = values[(values.index(current) + 1) % len(values)]
+        elif action == "orientation":
+            values = ["any", "portrait", "landscape", "square"]
+            current = options.get("orientation", "any")
+            options["orientation"] = values[(values.index(current) + 1) % len(values)]
+        elif action == "resolution":
+            values = [(0, 0), (1280, 720), (1920, 1080), (2560, 1440)]
+            current = (int(options.get("min_width", 0)), int(options.get("min_height", 0)))
+            choice = values[(values.index(current) + 1) % len(values)] if current in values else values[0]
+            options["min_width"], options["min_height"] = choice
+        elif action == "quality":
+            values = ["auto", "preview", "sample", "original"]
+            current = options.get("quality_mode", "auto")
+            options["quality_mode"] = values[(values.index(current) + 1) % len(values)]
+        elif action == "blacklist":
+            pending_subscription_options[user_id] = sub_query
+            user_states[user_id] = "waiting_subscription_blacklist"
+            await query.message.reply_text(
+                "Введите дополнительные blacklist-теги подписки через пробел или `-` для сброса."
+            )
+            return
+        else:
+            options["digest_mode"] = "instant" if options.get("digest_mode") == "digest" else "digest"
+        await update_subscription_options(user_id, sub_query, options)
+        await show_subscription_options(query.message, user_id, sub_query)
+
     elif data == "stats":
         await show_user_stats(query.message, user_id)
 
@@ -686,8 +982,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "fav_find":
         user_states[user_id] = "waiting_fav_tag"
         await query.edit_message_text(
-            "🔎 Введите тег для поиска в избранном:\n\n"
-            "Пример: `blonde_hair`",
+            "🔎 Введите теги или слова из заметки для поиска в избранном:\n\n"
+            "Пример: `blonde_hair wallpaper`",
             parse_mode="Markdown",
         )
 
@@ -993,6 +1289,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton(
                         "📷 Фото",
                         callback_data=store_callback_payload("sub_posts", sub_query),
+                    ),
+                    InlineKeyboardButton(
+                        "🎛", callback_data=store_callback_payload("sub_options", sub_query)
                     ),
                     InlineKeyboardButton(
                         f"❌ {sub_query[:18]}",
@@ -1694,6 +1993,7 @@ async def send_post_media(
         caption,
         keyboard,
         retries=MEDIA_SEND_RETRIES,
+        has_spoiler=should_spoiler(settings, post),
     )
 
 
@@ -1710,6 +2010,7 @@ async def send_post_media_to_chat(
         caption,
         keyboard,
         retries=MEDIA_SEND_RETRIES,
+        has_spoiler=should_spoiler(settings, post),
     )
 
 
@@ -2022,7 +2323,8 @@ async def edit_subscription_gallery(
     )
     try:
         await query.edit_message_media(
-            media=media_from_post(post, caption), reply_markup=keyboard
+            media=media_from_post(post, caption, should_spoiler(settings, post)),
+            reply_markup=keyboard,
         )
     except Exception as e:
         logger.error(f"Ошибка обновления галереи подписки: {e}")
@@ -2079,7 +2381,8 @@ async def edit_favorites_gallery(query, user_id: int, index: int):
     )
     try:
         await query.edit_message_media(
-            media=media_from_post(post, caption), reply_markup=keyboard
+            media=media_from_post(post, caption, should_spoiler(settings, post)),
+            reply_markup=keyboard,
         )
     except Exception as e:
         logger.error(f"Ошибка обновления галереи избранного: {e}")
@@ -2271,6 +2574,8 @@ async def send_search_gallery(message, user_id: int, tags: str, page: int = 0):
         media_group_compatible_url(post.get("file_url", ""))
         for post in prepared
     )
+    for post in prepared:
+        await remember_and_cache_post(post)
     delivered_ids = []
     if can_group:
         try:
@@ -2280,7 +2585,9 @@ async def send_search_gallery(message, user_id: int, tags: str, page: int = 0):
                     f"🖼 Галерея: `{md_code(tags or 'random')}`"
                     if index == 0 else ""
                 )
-                media.append(media_from_post(post, caption))
+                media.append(
+                    media_from_post(post, caption, should_spoiler(settings, post))
+                )
             await message.reply_media_group(media=media)
             delivered_ids = [int(post["id"]) for post in prepared]
             runtime_metrics.increment("gallery_albums")
@@ -2317,7 +2624,18 @@ async def send_search_gallery(message, user_id: int, tags: str, page: int = 0):
         )
     await message.reply_text(
         f"Показано: {len(delivered_ids)}. Страница источника: {page + 1}.",
-        reply_markup=get_gallery_result_keyboard(next_callback, previous_callback),
+        reply_markup=get_gallery_result_keyboard(
+            next_callback,
+            previous_callback,
+            store_callback_payload(
+                "gallery_bulk_fav", ",".join(str(post_id) for post_id in delivered_ids)
+            ) if delivered_ids else None,
+            store_callback_payload("preset_from", tags) if tags else None,
+            store_callback_payload("subscribe", tags) if tags else None,
+            store_callback_payload(
+                "gallery_collection", ",".join(str(post_id) for post_id in delivered_ids)
+            ) if delivered_ids else None,
+        ),
     )
     return bool(delivered_ids)
 
@@ -2448,6 +2766,215 @@ async def show_user_stats(message, user_id: int):
         f"*Частые запросы:*\n{top_queries}\n\n"
         f"*Теги избранного:* {top_tags}"
     )
+
+
+async def show_search_presets(message, user_id: int):
+    presets = await get_search_presets(user_id)
+    rows = []
+    lines = []
+    for item in presets:
+        lines.append(f"• *{md_text(item['name'])}*: `{md_code(item['query'])}`")
+        rows.append([
+            InlineKeyboardButton("▶️ " + item["name"][:24], callback_data=f"preset_run_{item['id']}"),
+            InlineKeyboardButton("🗑", callback_data=f"preset_del_{item['id']}"),
+        ])
+    rows.extend([
+        [InlineKeyboardButton("➕ Сохранить текущий поиск", callback_data="preset_save_current")],
+        [InlineKeyboardButton("🧩 Конструктор", callback_data="search_builder")],
+        [InlineKeyboardButton("◀️ Меню", callback_data="back")],
+    ])
+    text = "💾 *Поисковые пресеты*"
+    text += "\n\n" + ("\n".join(lines) if lines else "Пока нет сохранённых пресетов.")
+    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown")
+
+
+async def show_read_later(message, user_id: int):
+    posts = await get_read_later(user_id, limit=20)
+    if not posts:
+        await message.reply_text("⏳ Список «На потом» пуст.", reply_markup=get_main_keyboard())
+        return
+    rows = []
+    lines = []
+    for post in posts[:10]:
+        post_id = int(post.get("id") or 0)
+        tags = str(post.get("tags") or "")[:45]
+        lines.append(f"• `{post_id}` {md_text(tags)}")
+        rows.append([
+            InlineKeyboardButton(f"📤 {post_id}", callback_data=f"later_open_{post_id}"),
+            InlineKeyboardButton("✅ Убрать", callback_data=f"later_del_{post_id}"),
+        ])
+    rows.append([InlineKeyboardButton("◀️ Меню", callback_data="back")])
+    await message.reply_text(
+        "⏳ *Посмотреть позже*\n\n" + "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode="Markdown",
+    )
+
+
+async def show_storage(message, user_id: int):
+    stats = await get_user_storage_stats(user_id)
+    text = (
+        "💽 *Ваше хранилище*\n\n"
+        f"Избранное: {stats['favorites']}\n"
+        f"Коллекции: {stats['collections']}\n"
+        f"История запросов: {stats['history']}\n"
+        f"Просмотренные: {stats['viewed']}\n"
+        f"На потом: {stats['read_later']}\n"
+        f"Пресеты: {stats['presets']}\n"
+        f"В дайджесте: {stats['digest']}\n"
+        f"Пустые коллекции: {stats['empty_collections']}\n"
+        f"Избранное без URL: {stats['favorites_without_url']}"
+    )
+    await message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧹 Удалить историю старше 90 дней", callback_data="storage_cleanup_90")],
+            [InlineKeyboardButton("🗑 Удалить пустые коллекции", callback_data="storage_empty_collections")],
+            [InlineKeyboardButton("◀️ Меню", callback_data="back")],
+        ]),
+        parse_mode="Markdown",
+    )
+
+
+async def send_recommendations(message, user_id: int):
+    profile = await get_favorite_tag_profile(user_id, limit=5)
+    settings = await get_user_settings(user_id)
+    excluded = set(str(settings.get("recommendation_excluded_tags", "")).split())
+    profile = [item for item in profile if item[0] not in excluded]
+    if not profile:
+        await message.reply_text("Добавьте несколько постов в избранное, чтобы появились рекомендации.")
+        return False
+    tags = " ".join(tag for tag, _count in profile[:3])
+    await message.reply_text(
+        "✨ Подборка по частым тегам избранного: "
+        + ", ".join(f"`{md_code(tag)}`" for tag, _count in profile[:3]),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"🚫 Не рекомендовать {tag[:24]}",
+                callback_data=store_callback_payload("rec_hide", tag),
+            )]
+            for tag, _count in profile[:3]
+        ]),
+        parse_mode="Markdown",
+    )
+    return await send_search_gallery(message, user_id, tags)
+
+
+async def show_favorite_search_results(message, user_id: int, text: str):
+    posts = await search_favorites(user_id, text, limit=20)
+    if not posts:
+        await message.reply_text("🔎 В избранном ничего не найдено.")
+        return
+    rows = []
+    lines = []
+    for post in posts:
+        post_id = int(post["id"])
+        lines.append(f"• `{post_id}` {md_text(str(post.get('tags') or '')[:55])}")
+        rows.append([InlineKeyboardButton(f"📤 Открыть {post_id}", callback_data=f"fav_open_{post_id}")])
+    rows.append([InlineKeyboardButton("◀️ Избранное", callback_data="favorites")])
+    await message.reply_text(
+        f"🔎 *Найдено в избранном: {len(posts)}*\n\n" + "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown",
+    )
+
+
+def similar_query_from_post(post: dict) -> str:
+    ignored = {
+        "solo", "1girl", "1boy", "highres", "absurdres", "explicit", "safe",
+        "questionable", "looking_at_viewer", "simple_background",
+    }
+    tags = [
+        tag for tag in str(post.get("tags") or "").split()
+        if tag.lower() not in ignored and len(tag) > 2
+    ]
+    return " ".join(tags[:4])
+
+
+async def show_subscription_options(message, user_id: int, sub_query: str):
+    options = await get_subscription_options(user_id, sub_query)
+    rating = options.get("rating_filter", "all")
+    media_type = options.get("media_type", "all")
+    orientation = options.get("orientation", "any")
+    resolution = f"{options.get('min_width', 0)}×{options.get('min_height', 0)}"
+    quality = options.get("quality_mode", "auto")
+    extra_blacklist = str(options.get("extra_blacklist", ""))
+    digest = options.get("digest_mode", "instant")
+    token = store_callback_payload("sub_options", sub_query)
+    await message.reply_text(
+        f"🎛 *Фильтры подписки* `{md_code(sub_query)}`",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"Rating: {rating}", callback_data=f"subopt_rating_{token}")],
+            [InlineKeyboardButton(f"Тип: {media_type}", callback_data=f"subopt_type_{token}")],
+            [InlineKeyboardButton(f"Ориентация: {orientation}", callback_data=f"subopt_orientation_{token}")],
+            [InlineKeyboardButton(f"Разрешение: {resolution}", callback_data=f"subopt_resolution_{token}")],
+            [InlineKeyboardButton(f"Качество: {quality}", callback_data=f"subopt_quality_{token}")],
+            [InlineKeyboardButton(
+                f"Blacklist: {extra_blacklist[:20] or 'общий'}",
+                callback_data=f"subopt_blacklist_{token}",
+            )],
+            [InlineKeyboardButton(
+                "📨 Дайджест" if digest == "digest" else "⚡ Сразу",
+                callback_data=f"subopt_digest_{token}",
+            )],
+            [InlineKeyboardButton("◀️ Подписки", callback_data="sub_manage")],
+        ]),
+        parse_mode="Markdown",
+    )
+
+
+async def send_digest_posts(message, user_id: int, posts: list[dict]) -> bool:
+    if not posts:
+        await message.reply_text("📨 Дайджест пока пуст.")
+        return False
+    settings = normalize_feature_settings(await get_user_settings(user_id))
+    prepared = prepare_gallery_album_posts(posts, settings, 10)
+    if len(prepared) > 1:
+        media = []
+        for index, post in enumerate(prepared):
+            caption = "📨 Дайджест подписок" if index == 0 else ""
+            media.append(media_from_post(post, caption, should_spoiler(settings, post)))
+        try:
+            await message.reply_media_group(media=media)
+            return True
+        except Exception as exc:
+            logger.warning("Digest album failed, using sequential delivery: %s", exc)
+    delivered = False
+    for post in prepared or posts[:10]:
+        delivered = await send_post_media(message, post, settings=settings) or delivered
+    return delivered
+
+
+async def send_digest_to_chat(bot, user_id: int, posts: list[dict]) -> bool:
+    if not posts:
+        return False
+    settings = normalize_feature_settings(await get_user_settings(user_id))
+    prepared = prepare_gallery_album_posts(posts, settings, 10)
+    if len(prepared) > 1:
+        media = [
+            media_from_post(
+                post,
+                "📨 Дайджест подписок" if index == 0 else "",
+                should_spoiler(settings, post),
+            )
+            for index, post in enumerate(prepared)
+        ]
+        try:
+            await telegram_rate_limiter.wait_for_slot(user_id)
+            await bot.send_media_group(chat_id=user_id, media=media)
+            return True
+        except RetryAfter as exc:
+            telegram_rate_limiter.apply_retry_after(user_id, exc)
+        except Exception as exc:
+            logger.warning("Scheduled digest album failed, using sequential delivery: %s", exc)
+    delivered = 0
+    for index, post in enumerate(posts[:10]):
+        caption = "📨 Дайджест подписок" if index == 0 else ""
+        delivered += bool(
+            await send_post_media_to_chat(
+                bot, user_id, post, caption=caption, settings=settings
+            )
+        )
+    return delivered > 0
     await message.reply_text(
         text,
         reply_markup=InlineKeyboardMarkup([
@@ -2513,6 +3040,72 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states.pop(user_id, None)
         tags = "" if text.lower() in {"random", "рандом", "случайно"} else text
         schedule_background_task(context, send_search_gallery(update.message, user_id, tags))
+
+    elif state == "waiting_builder_include":
+        search_builders[user_id] = {"include": " ".join(text.split()[:12])}
+        user_states[user_id] = "waiting_builder_exclude"
+        await update.message.reply_text(
+            "Введите исключаемые теги без минуса или отправьте `-`, если исключений нет."
+        )
+
+    elif state == "waiting_builder_exclude":
+        user_states.pop(user_id, None)
+        builder = search_builders.pop(user_id, {})
+        include = builder.get("include", "")
+        excluded = [] if text == "-" else text.split()[:12]
+        built_query = " ".join([include] + [f"-{tag.lstrip('-')}" for tag in excluded]).strip()
+        pending_preset_queries[user_id] = built_query
+        await update.message.reply_text(
+            f"🧩 Готовый запрос: `{md_code(built_query)}`",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "▶️ Запустить",
+                    callback_data=store_callback_payload("builder_run", built_query),
+                ),
+                InlineKeyboardButton(
+                    "💾 Сохранить",
+                    callback_data=store_callback_payload("preset_from", built_query),
+                ),
+            ]]),
+            parse_mode="Markdown",
+        )
+
+    elif state == "waiting_preset_name":
+        user_states.pop(user_id, None)
+        preset_query = pending_preset_queries.pop(user_id, "")
+        settings = normalize_feature_settings(await get_user_settings(user_id))
+        preset_id = await create_search_preset(user_id, text, preset_query, settings)
+        await update.message.reply_text(
+            "✅ Пресет сохранён." if preset_id else "❌ Пустое имя или такой пресет уже существует."
+        )
+        await show_search_presets(update.message, user_id)
+
+    elif state == "waiting_bulk_collection_name":
+        user_states.pop(user_id, None)
+        post_ids = pending_bulk_posts.pop(user_id, [])
+        collection_id = await create_favorite_collection(user_id, text)
+        added = 0
+        if collection_id:
+            for post_id in post_ids:
+                post = await get_known_post(post_id)
+                if post:
+                    await add_favorite(user_id, post)
+                    if await add_favorite_to_collection(user_id, collection_id, post_id):
+                        added += 1
+        await update.message.reply_text(
+            f"🗂 Коллекция создана, добавлено: {added}." if collection_id
+            else "❌ Не удалось создать коллекцию: имя уже занято или пустое."
+        )
+
+    elif state == "waiting_subscription_blacklist":
+        user_states.pop(user_id, None)
+        sub_query = pending_subscription_options.pop(user_id, "")
+        options = await get_subscription_options(user_id, sub_query)
+        options["extra_blacklist"] = "" if text == "-" else " ".join(text.lower().split()[:30])
+        saved = await update_subscription_options(user_id, sub_query, options)
+        await update.message.reply_text(
+            "✅ Фильтр подписки обновлён." if saved else "❌ Подписка не найдена."
+        )
 
     elif state == "waiting_collection_create":
         user_states.pop(user_id, None)
@@ -2621,13 +3214,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif state == "waiting_fav_tag":
         user_states.pop(user_id, None)
-        await show_favorites_list(
-            update.message,
-            user_id,
-            edit=False,
-            page=0,
-            tag_filter=text,
-        )
+        await show_favorite_search_results(update.message, user_id, text)
 
     elif state == "waiting_sub_new":
         user_states.pop(user_id, None)
@@ -2817,6 +3404,24 @@ async def gallery_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def collections_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_collections(update.message, update.effective_user.id)
+
+
+async def presets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_search_presets(update.message, update.effective_user.id)
+
+
+async def recommendations_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    schedule_background_task(
+        context, send_recommendations(update.message, update.effective_user.id)
+    )
+
+
+async def later_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_read_later(update.message, update.effective_user.id)
+
+
+async def storage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_storage(update.message, update.effective_user.id)
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3067,15 +3672,29 @@ async def process_one_subscription(app, subscription):
 
         blacklist = await get_user_blacklist(user_id)
         settings = await get_user_settings(user_id)
+        subscription_options = await get_subscription_options(user_id, query)
+        blacklist |= set(str(subscription_options.get("extra_blacklist", "")).split())
+        settings.update({
+            key: value for key, value in subscription_options.items()
+            if key in {"rating_filter", "media_type", "orientation", "min_width", "min_height", "quality_mode"}
+        })
+        settings = normalize_feature_settings(settings)
         excluded_post_ids = await get_sent_post_ids(user_id)
         result = await get_subscription_cached_image(
-            user_id, query, blacklist, excluded_post_ids
+            user_id, query, blacklist, excluded_post_ids, settings
         )
         reset_upstream_failure_streak()
 
         if result:
             await remember_and_cache_post(result)
             post_id = result.get("id", 0)
+            if subscription_options.get("digest_mode") == "digest":
+                queued = await enqueue_subscription_digest(user_id, query, result)
+                updated = await update_subscription_time(user_id, query, processing_token)
+                if updated and post_id:
+                    await mark_post_sent(user_id, int(post_id))
+                runtime_metrics.increment("subscription_digest_queued", int(queued))
+                return bool(updated)
             keyboard = get_subscription_image_keyboard(
                 post_id,
                 query,
@@ -3150,11 +3769,19 @@ async def process_one_subscription(app, subscription):
         return False
 
 
-async def get_subscription_cached_image(user_id: int, query: str, blacklist: set, excluded_post_ids: set):
+async def get_subscription_cached_image(
+    user_id: int,
+    query: str,
+    blacklist: set,
+    excluded_post_ids: set,
+    settings: dict | None = None,
+):
     cached_posts, _ = await get_subscription_cache(user_id, query)
     available_posts = [
         post for post in cached_posts
-        if post.get("file_url") and post.get("id") not in excluded_post_ids
+        if post.get("file_url")
+        and post.get("id") not in excluded_post_ids
+        and (settings is None or post_matches_preferences(post, settings))
     ]
     should_refresh = (
         await is_subscription_cache_stale(user_id, query)
@@ -3184,7 +3811,9 @@ async def get_subscription_cached_image(user_id: int, query: str, blacklist: set
             cached_posts, _ = await get_subscription_cache(user_id, query)
             available_posts = [
                 post for post in cached_posts
-                if post.get("file_url") and post.get("id") not in excluded_post_ids
+                if post.get("file_url")
+                and post.get("id") not in excluded_post_ids
+                and (settings is None or post_matches_preferences(post, settings))
             ]
             logger.info(
                 "Refreshed subscription cache user=%s query=%r api=%s new=%s total=%s available=%s",
@@ -3229,6 +3858,13 @@ async def process_subscriptions(app):
                 guarded_user(subscriptions)
                 for subscriptions in subscriptions_by_user.values()
             ))
+            for digest_user_id in await get_due_digest_users():
+                digest_posts = await pop_subscription_digest(digest_user_id, 10)
+                if not await send_digest_to_chat(app.bot, digest_user_id, digest_posts):
+                    for post in digest_posts:
+                        await enqueue_subscription_digest(
+                            digest_user_id, post.get("subscription_query", "digest"), post
+                        )
             logger.info(
                 "Subscription pass complete users=%s due=%s",
                 len(subscriptions_by_user),
@@ -3280,6 +3916,10 @@ async def post_init(application):
         BotCommand("history", "История"),
         BotCommand("favorites", "Избранное"),
         BotCommand("collections", "Коллекции избранного"),
+        BotCommand("presets", "Поисковые пресеты"),
+        BotCommand("recommendations", "Рекомендации"),
+        BotCommand("later", "Посмотреть позже"),
+        BotCommand("storage", "Хранилище"),
         BotCommand("stats", "Личная статистика"),
         BotCommand("settings", "Настройки"),
         BotCommand("tags", "Поиск по тегу"),
@@ -3369,6 +4009,10 @@ def main():
     application.add_handler(CommandHandler("history", require_access(history_command)))
     application.add_handler(CommandHandler("favorites", require_access(favorites_command)))
     application.add_handler(CommandHandler("collections", require_access(collections_command)))
+    application.add_handler(CommandHandler("presets", require_access(presets_command)))
+    application.add_handler(CommandHandler("recommendations", require_access(recommendations_command)))
+    application.add_handler(CommandHandler("later", require_access(later_command)))
+    application.add_handler(CommandHandler("storage", require_access(storage_command)))
     application.add_handler(CommandHandler("stats", require_access(stats_command)))
     application.add_handler(CommandHandler("whyblocked", require_access(whyblocked_command)))
     application.add_handler(CommandHandler("settings", require_access(settings_command)))

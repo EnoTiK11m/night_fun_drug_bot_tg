@@ -179,7 +179,7 @@ async def _download_photo_file(
     return photo
 
 
-async def reply_media_url(message, url: str, caption: str, reply_markup):
+async def reply_media_url(message, url: str, caption: str, reply_markup, has_spoiler: bool = False):
     user_id = _message_user_id(message)
     if not await telegram_rate_limiter.wait_for_slot(user_id):
         return False
@@ -190,6 +190,7 @@ async def reply_media_url(message, url: str, caption: str, reply_markup):
             caption=caption if caption else None,
             parse_mode="Markdown",
             reply_markup=reply_markup,
+            has_spoiler=has_spoiler,
         )
     elif url_path.endswith(".gif"):
         await message.reply_animation(
@@ -197,6 +198,7 @@ async def reply_media_url(message, url: str, caption: str, reply_markup):
             caption=caption if caption else None,
             parse_mode="Markdown",
             reply_markup=reply_markup,
+            has_spoiler=has_spoiler,
         )
     else:
         await message.reply_photo(
@@ -204,11 +206,12 @@ async def reply_media_url(message, url: str, caption: str, reply_markup):
             caption=caption if caption else None,
             parse_mode="Markdown",
             reply_markup=reply_markup,
+            has_spoiler=has_spoiler,
         )
     return True
 
 
-async def reply_downloaded_photo(message, url: str, caption: str, reply_markup):
+async def reply_downloaded_photo(message, url: str, caption: str, reply_markup, has_spoiler: bool = False):
     user_id = _message_user_id(message)
     photo = await _download_photo_file(url)
     try:
@@ -219,13 +222,14 @@ async def reply_downloaded_photo(message, url: str, caption: str, reply_markup):
             caption=caption if caption else None,
             parse_mode="Markdown",
             reply_markup=reply_markup,
+            has_spoiler=has_spoiler,
         )
         return True
     finally:
         photo.close()
 
 
-async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup):
+async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup, has_spoiler: bool = False):
     if not await telegram_rate_limiter.wait_for_slot(chat_id):
         return False
     url_path = media_url_path_lower(url)
@@ -236,6 +240,7 @@ async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup
             caption=caption if caption else None,
             parse_mode="Markdown",
             reply_markup=reply_markup,
+            has_spoiler=has_spoiler,
         )
     elif url_path.endswith(".gif"):
         await bot.send_animation(
@@ -244,6 +249,7 @@ async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup
             caption=caption if caption else None,
             parse_mode="Markdown",
             reply_markup=reply_markup,
+            has_spoiler=has_spoiler,
         )
     else:
         await bot.send_photo(
@@ -252,11 +258,12 @@ async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup
             caption=caption if caption else None,
             parse_mode="Markdown",
             reply_markup=reply_markup,
+            has_spoiler=has_spoiler,
         )
     return True
 
 
-async def send_downloaded_photo(bot, chat_id: int, url: str, caption: str, reply_markup):
+async def send_downloaded_photo(bot, chat_id: int, url: str, caption: str, reply_markup, has_spoiler: bool = False):
     photo = await _download_photo_file(url)
     try:
         if not await telegram_rate_limiter.wait_for_slot(chat_id):
@@ -267,6 +274,7 @@ async def send_downloaded_photo(bot, chat_id: int, url: str, caption: str, reply
             caption=caption if caption else None,
             parse_mode="Markdown",
             reply_markup=reply_markup,
+            has_spoiler=has_spoiler,
         )
         return True
     finally:
@@ -302,6 +310,7 @@ async def send_post_media(
     caption: str = "",
     keyboard=None,
     retries: int = 2,
+    has_spoiler: bool = False,
 ):
     reply_markup = keyboard or get_subscription_image_keyboard(post.get("id", 0))
     candidates = get_media_url_candidates(post)
@@ -320,7 +329,9 @@ async def send_post_media(
     for url_kind, media_url in candidates:
         for attempt in range(1, retries + 1):
             try:
-                sent = await reply_media_url(message, media_url, caption, reply_markup)
+                sent = await reply_media_url(
+                    message, media_url, caption, reply_markup, has_spoiler
+                )
                 if not sent:
                     return False
                 logger.info(
@@ -346,7 +357,7 @@ async def send_post_media(
                 if _telegram_url_fetch_failed(exc) and _is_downloadable_photo_url(media_url):
                     try:
                         sent = await reply_downloaded_photo(
-                            message, media_url, caption, reply_markup
+                            message, media_url, caption, reply_markup, has_spoiler
                         )
                         if sent:
                             logger.info(
@@ -402,6 +413,7 @@ async def send_post_media_to_chat(
     caption: str = "",
     keyboard=None,
     retries: int = 2,
+    has_spoiler: bool = False,
 ):
     reply_markup = keyboard or get_subscription_image_keyboard(post.get("id", 0))
     candidates = get_media_url_candidates(post)
@@ -427,7 +439,9 @@ async def send_post_media_to_chat(
     for url_kind, media_url in candidates:
         for attempt in range(1, retries + 1):
             try:
-                sent = await send_media_url(bot, chat_id, media_url, caption, reply_markup)
+                sent = await send_media_url(
+                    bot, chat_id, media_url, caption, reply_markup, has_spoiler
+                )
                 if not sent:
                     return False
                 logger.info(
@@ -455,7 +469,7 @@ async def send_post_media_to_chat(
                 if _telegram_url_fetch_failed(exc) and _is_downloadable_photo_url(media_url):
                     try:
                         sent = await send_downloaded_photo(
-                            bot, chat_id, media_url, caption, reply_markup
+                            bot, chat_id, media_url, caption, reply_markup, has_spoiler
                         )
                         if sent:
                             logger.info(

@@ -67,6 +67,10 @@ def build_post_keyboard(
         keyboard.extend(action_rows)
 
     keyboard.append([get_favorite_button(post_id, sub_query)])
+    keyboard.append([
+        InlineKeyboardButton("🧠 Похожее", callback_data=f"similar_{post_id}"),
+        InlineKeyboardButton("⏳ На потом", callback_data=f"later_add_{post_id}"),
+    ])
     if show_tags_button:
         keyboard.append([get_tags_button(post_id)])
     keyboard.append([get_site_button(post_id)])
@@ -136,9 +140,16 @@ def get_favorites_gallery_keyboard(
 
 def get_main_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
-        [InlineKeyboardButton("🔍 Поиск", callback_data="search")],
+        [
+            InlineKeyboardButton("🔍 Поиск", callback_data="search"),
+            InlineKeyboardButton("🧩 Конструктор", callback_data="search_builder"),
+        ],
         [InlineKeyboardButton("🎲 Рандомная картинка", callback_data="random")],
         [InlineKeyboardButton("🖼 Галерея поиска", callback_data="gallery")],
+        [
+            InlineKeyboardButton("💾 Пресеты", callback_data="presets"),
+            InlineKeyboardButton("✨ Рекомендации", callback_data="recommendations"),
+        ],
         [InlineKeyboardButton("🔄 Ещё", callback_data="more")],
         [
             InlineKeyboardButton("🚫 Blacklist", callback_data="blacklist"),
@@ -151,6 +162,10 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
             InlineKeyboardButton("📊 Статистика", callback_data="stats"),
+        ],
+        [
+            InlineKeyboardButton("⏳ На потом", callback_data="later_list"),
+            InlineKeyboardButton("💽 Хранилище", callback_data="storage"),
         ],
         [InlineKeyboardButton("❓ Помощь", callback_data="help")],
     ]
@@ -188,6 +203,7 @@ def get_subscriptions_keyboard() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("📋 Мои подписки", callback_data="sub_list")],
         [InlineKeyboardButton("⚙️ Управление подписками", callback_data="sub_manage")],
+        [InlineKeyboardButton("📨 Отправить дайджест", callback_data="sub_digest_send")],
         [InlineKeyboardButton("◀️ Назад", callback_data="back")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -198,6 +214,7 @@ def get_settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📝 Настройки описания", callback_data="settings_caption")],
         [InlineKeyboardButton("🖼 Галерея и фильтры", callback_data="settings_gallery")],
         [InlineKeyboardButton("📦 Качество медиа", callback_data="settings_quality")],
+        [InlineKeyboardButton("🙈 Спойлеры", callback_data="settings_spoiler")],
         [
             InlineKeyboardButton(
                 "⏸ Остановить все подписки на время",
@@ -265,18 +282,38 @@ def get_quality_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
 
 
 def get_gallery_result_keyboard(
-    next_callback: str, previous_callback: str | None = None
+    next_callback: str,
+    previous_callback: str | None = None,
+    bulk_favorite_callback: str | None = None,
+    save_preset_callback: str | None = None,
+    subscribe_callback: str | None = None,
+    collection_callback: str | None = None,
 ) -> InlineKeyboardMarkup:
     navigation = []
     if previous_callback:
         navigation.append(InlineKeyboardButton("⬅️ Предыдущая", callback_data=previous_callback))
     navigation.append(InlineKeyboardButton("Следующая ➡️", callback_data=next_callback))
-    return InlineKeyboardMarkup([
+    rows = [
         navigation,
         [InlineKeyboardButton("🔍 Новый запрос", callback_data="gallery")],
         [InlineKeyboardButton("⚙️ Фильтры", callback_data="settings_gallery")],
-        [InlineKeyboardButton("◀️ Меню", callback_data="back")],
-    ])
+    ]
+    bulk = []
+    if bulk_favorite_callback:
+        bulk.append(InlineKeyboardButton("⭐ Сохранить все", callback_data=bulk_favorite_callback))
+    if save_preset_callback:
+        bulk.append(InlineKeyboardButton("💾 Пресет", callback_data=save_preset_callback))
+    if bulk:
+        rows.append(bulk)
+    secondary = []
+    if subscribe_callback:
+        secondary.append(InlineKeyboardButton("🔔 Подписка", callback_data=subscribe_callback))
+    if collection_callback:
+        secondary.append(InlineKeyboardButton("🗂 В коллекцию", callback_data=collection_callback))
+    if secondary:
+        rows.append(secondary)
+    rows.append([InlineKeyboardButton("◀️ Меню", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def get_caption_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
