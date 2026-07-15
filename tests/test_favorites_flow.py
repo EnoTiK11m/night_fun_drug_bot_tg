@@ -146,13 +146,128 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         post = {"id": "123", "tags": "alpha beta gamma"}
         update, query = make_callback_update("post_tags_123")
 
-        with patch.object(bot, "get_known_post", AsyncMock(return_value=post)):
+        with (
+            patch.object(bot, "get_known_post", AsyncMock(return_value=post)),
+            patch.object(
+                bot.tag_translation_service,
+                "translate_tags",
+                AsyncMock(return_value={"alpha": "альфа", "beta": "бета"}),
+            ) as translate_tags,
+        ):
             await bot.button_handler(update, SimpleNamespace())
 
+        translate_tags.assert_awaited_once_with(["alpha", "beta", "gamma"])
         query.message.reply_text.assert_awaited_once()
         text = query.message.reply_text.await_args.args[0]
-        self.assertIn("• `alpha`", text)
-        self.assertIn("• `beta`", text)
+        self.assertIn("• `alpha` — альфа", text)
+        self.assertIn("• `beta` — бета", text)
+
+    async def test_post_tags_actions_are_paginated_for_every_tag(self):
+        tags = [f"tag_{index}" for index in range(18)]
+        post = {"id": 123, "tags": " ".join(tags)}
+        update, query = make_callback_update("post_tags_123")
+
+        with (
+            patch.object(bot, "get_known_post", AsyncMock(return_value=post)),
+            patch.object(
+                bot.tag_translation_service,
+                "translate_tags",
+                AsyncMock(return_value={}),
+            ),
+        ):
+            await bot.button_handler(update, SimpleNamespace())
+
+        first_text = query.message.reply_text.await_args.args[0]
+        first_markup = query.message.reply_text.await_args.kwargs["reply_markup"]
+        first_callbacks = [
+            button.callback_data
+            for row in first_markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("Страница 1/3", first_text)
+        self.assertIn("`tag_7`", first_text)
+        self.assertNotIn("`tag_8`", first_text)
+        self.assertIn("post_tags_page_123_1", first_callbacks)
+        self.assertEqual(len(first_markup.inline_keyboard), 9)
+
+        update, query = make_callback_update("post_tags_page_123_1")
+        with (
+            patch.object(bot, "get_known_post", AsyncMock(return_value=post)),
+            patch.object(
+                bot.tag_translation_service,
+                "translate_tags",
+                AsyncMock(return_value={}),
+            ) as translate_tags,
+        ):
+            await bot.button_handler(update, SimpleNamespace())
+
+        translate_tags.assert_awaited_once_with(tags[8:16])
+        second_text = query.message.edit_text.await_args.args[0]
+        second_markup = query.message.edit_text.await_args.kwargs["reply_markup"]
+        second_callbacks = [
+            button.callback_data
+            for row in second_markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("Страница 2/3", second_text)
+        self.assertIn("`tag_8`", second_text)
+        self.assertIn("`tag_15`", second_text)
+        self.assertNotIn("`tag_16`", second_text)
+        self.assertIn("post_tags_page_123_0", second_callbacks)
+        self.assertIn("post_tags_page_123_2", second_callbacks)
+
+        update, query = make_callback_update("post_tags_page_123_2")
+        with (
+            patch.object(bot, "get_known_post", AsyncMock(return_value=post)),
+            patch.object(
+                bot.tag_translation_service,
+                "translate_tags",
+                AsyncMock(return_value={}),
+            ) as translate_tags,
+        ):
+            await bot.button_handler(update, SimpleNamespace())
+
+        translate_tags.assert_awaited_once_with(tags[16:18])
+        last_text = query.message.edit_text.await_args.args[0]
+        last_markup = query.message.edit_text.await_args.kwargs["reply_markup"]
+        last_callbacks = [
+            button.callback_data
+            for row in last_markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("Страница 3/3", last_text)
+        self.assertIn("`tag_16`", last_text)
+        self.assertIn("`tag_17`", last_text)
+        self.assertEqual(len(last_markup.inline_keyboard), 3)
+        self.assertIn("post_tags_page_123_1", last_callbacks)
+        self.assertNotIn("post_tags_page_123_3", last_callbacks)
+
+    async def test_blacklist_view_shows_english_and_russian_tags(self):
+        update, query = make_callback_update("bl_show")
+        entries = [
+            {"tag": "blue_hair", "expires_at": None, "source": "manual"},
+            {"tag": "gore", "expires_at": "2030-01-01", "source": "temporary"},
+        ]
+
+        with (
+            patch.object(bot, "get_blacklist_entries", AsyncMock(return_value=entries)),
+            patch.object(
+                bot.tag_translation_service,
+                "translate_tags",
+                AsyncMock(return_value={
+                    "blue_hair": "голубые волосы",
+                    "gore": "жестокий контент",
+                }),
+            ) as translate_tags,
+        ):
+            await bot.button_handler(update, SimpleNamespace())
+
+        translate_tags.assert_awaited_once_with(
+            ["blue_hair", "gore"], immediate_limit=50
+        )
+        text = query.edit_message_text.await_args.args[0]
+        self.assertIn("`blue_hair` — голубые волосы", text)
+        self.assertIn("`gore` — жестокий контент", text)
 
     def test_tags_button_can_be_hidden_from_image_keyboard(self):
         visible_keyboard = bot.get_image_keyboard(123, show_tags_button=True)

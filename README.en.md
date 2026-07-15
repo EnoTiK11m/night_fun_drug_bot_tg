@@ -42,7 +42,7 @@ favorites, collections, a blacklist, and automatic subscriptions.
 - tag autocomplete;
 - a query builder with required and excluded tags;
 - saved search presets with their own filters;
-- similar-result searches and quick tag actions;
+- similar-result searches and paginated quick actions for every post tag;
 - Telegram-compatible GIF handling: a static preview is used in albums and
   incompatible media is skipped.
 

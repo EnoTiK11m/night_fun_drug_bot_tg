@@ -297,6 +297,7 @@ HEARTBEAT_INTERVAL_SECONDS = 5 * 60
 FAVORITES_EXPORT_ZIP_LIMIT_BYTES = 45 * 1024 * 1024
 FAVORITES_EXPORT_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 FAVORITES_EXPORT_COOLDOWN_SECONDS = 5 * 60
+POST_TAGS_PAGE_SIZE = 8
 RESTART_EXIT_CODE = 42
 restart_requested = False
 RESTART_TEXT_COMMANDS = {"restart", "рестарт"}
@@ -458,26 +459,51 @@ def build_caption_settings_text(settings: dict) -> str:
     return text
 
 
-async def send_full_post_tags(message, post_id: int):
+async def send_full_post_tags(
+    message, post_id: int, page: int = 0, edit: bool = False
+):
     post = await get_known_post(post_id) or minimal_post(post_id)
-    messages = build_full_tags_messages(post)
-    tags = [tag for tag in str(post.get("tags") or "").split() if tag][:8]
-    for index, text in enumerate(messages):
-        keyboard = None
-        if index == len(messages) - 1 and tags:
-            rows = []
-            for tag in tags:
-                rows.append([
-                    InlineKeyboardButton(
-                        f"🔍 {tag[:28]}",
-                        callback_data=store_callback_payload("tag_search", tag),
-                    ),
-                    InlineKeyboardButton(
-                        "🚫", callback_data=store_callback_payload("tag_block", tag)
-                    ),
-                ])
-            keyboard = InlineKeyboardMarkup(rows)
-        await message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    all_tags = [tag for tag in str(post.get("tags") or "").split() if tag]
+    total_pages = max(1, (len(all_tags) + POST_TAGS_PAGE_SIZE - 1) // POST_TAGS_PAGE_SIZE)
+    page = max(0, min(int(page), total_pages - 1))
+    start = page * POST_TAGS_PAGE_SIZE
+    page_tags = all_tags[start:start + POST_TAGS_PAGE_SIZE]
+    translations = await tag_translation_service.translate_tags(page_tags)
+    page_post = dict(post, tags=" ".join(page_tags))
+    text = build_full_tags_messages(page_post, translations)[0]
+    if all_tags:
+        text += f"\n\nСтраница {page + 1}/{total_pages} · тегов: {len(all_tags)}"
+
+    rows = []
+    for tag in page_tags:
+        rows.append([
+            InlineKeyboardButton(
+                f"🔍 {tag[:28]}",
+                callback_data=store_callback_payload("tag_search", tag),
+            ),
+            InlineKeyboardButton(
+                "🚫 В blacklist",
+                callback_data=store_callback_payload("tag_block", tag),
+            ),
+        ])
+    if total_pages > 1:
+        navigation = []
+        if page > 0:
+            navigation.append(InlineKeyboardButton(
+                "◀️", callback_data=f"post_tags_page_{post_id}_{page - 1}"
+            ))
+        navigation.append(InlineKeyboardButton(
+            f"{page + 1}/{total_pages}", callback_data="post_tags_noop"
+        ))
+        if page + 1 < total_pages:
+            navigation.append(InlineKeyboardButton(
+                "▶️", callback_data=f"post_tags_page_{post_id}_{page + 1}"
+            ))
+        rows.append(navigation)
+    keyboard = InlineKeyboardMarkup(rows) if rows else None
+
+    send = message.edit_text if edit else message.reply_text
+    await send(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1043,6 +1069,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             settings=settings,
         )
+
+    elif data == "post_tags_noop":
+        return
+
+    elif data.startswith("post_tags_page_"):
+        payload = data.replace("post_tags_page_", "", 1)
+        try:
+            post_id_text, page_text = payload.rsplit("_", 1)
+            post_id, page = int(post_id_text), int(page_text)
+        except (TypeError, ValueError):
+            await query.message.reply_text("❌ Не удалось открыть страницу тегов.")
+            return
+        await send_full_post_tags(query.message, post_id, page=page, edit=True)
 
     elif data.startswith("post_tags_"):
         post_id_text = data.replace("post_tags_", "", 1)
