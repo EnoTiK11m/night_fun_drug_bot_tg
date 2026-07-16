@@ -83,10 +83,7 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
             await bot.start(update, SimpleNamespace())
 
         text = update.message.reply_text.await_args.args[0]
-        self.assertIn("альбомы до 10 изображений", text)
-        self.assertIn("поисковые пресеты", text)
-        self.assertIn("накопительный дайджест", text)
-        self.assertIn("очередь «На потом»", text)
+        self.assertIn("поиска, подборок и своей библиотеки", text)
         self.assertIn("18+", text)
         self.assertIs(
             update.message.reply_text.await_args.kwargs["reply_markup"].is_persistent,
@@ -270,8 +267,8 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("`gore` — жестокий контент", text)
 
     def test_tags_button_can_be_hidden_from_image_keyboard(self):
-        visible_keyboard = bot.get_image_keyboard(123, show_tags_button=True)
-        hidden_keyboard = bot.get_image_keyboard(123, show_tags_button=False)
+        visible_keyboard = bot.get_post_more_keyboard(123, show_tags_button=True)
+        hidden_keyboard = bot.get_post_more_keyboard(123, show_tags_button=False)
 
         visible_callbacks = [
             button.callback_data
@@ -293,18 +290,25 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         keyboard = bot.get_image_keyboard(123, query="tag", show_tags_button=True)
         rows = keyboard.inline_keyboard
 
-        self.assertEqual(rows[0][0].text, "🔔 Подписаться")
-        self.assertEqual(rows[1][0].callback_data, "more")
-        self.assertEqual(rows[1][1].callback_data, "search")
-        self.assertEqual(rows[2][0].callback_data, "fav_123")
         callbacks = [
             button.callback_data
             for row in rows for button in row if button.callback_data
         ]
         self.assertIn("similar_123", callbacks)
         self.assertIn("later_add_123", callbacks)
-        self.assertIn("post_tags_123", callbacks)
-        self.assertTrue(any("id=123" in (button.url or "") for row in rows for button in row))
+        self.assertIn("post_more_123", callbacks)
+        self.assertTrue(any(data.startswith("subscribe_") for data in callbacks))
+        self.assertNotIn("post_tags_123", callbacks)
+
+        expanded = bot.get_post_more_keyboard(123)
+        expanded_callbacks = [
+            button.callback_data
+            for row in expanded.inline_keyboard
+            for button in row if button.callback_data
+        ]
+        self.assertIn("post_tags_123", expanded_callbacks)
+        self.assertIn("post_original_123", expanded_callbacks)
+        self.assertTrue(any("id=123" in (button.url or "") for row in expanded.inline_keyboard for button in row))
 
     def test_persistent_keyboard_contains_only_primary_actions(self):
         keyboard = bot.get_persistent_keyboard()
@@ -327,9 +331,36 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
             for button in row if button.callback_data
         }
 
-        self.assertTrue({
-            "search_builder", "presets", "recommendations", "later_list", "storage"
-        }.issubset(callbacks))
+        self.assertTrue({"search_hub", "library", "storage"}.issubset(callbacks))
+        search_callbacks = {
+            button.callback_data for row in bot.get_search_hub_keyboard().inline_keyboard
+            for button in row if button.callback_data
+        }
+        library_callbacks = {
+            button.callback_data for row in bot.get_library_keyboard().inline_keyboard
+            for button in row if button.callback_data
+        }
+        self.assertTrue({"search_builder", "presets"}.issubset(search_callbacks))
+        self.assertTrue({"recommendations", "later_list", "fav_gallery"}.issubset(library_callbacks))
+
+    async def test_post_more_opens_secondary_actions_without_replacing_media(self):
+        update, query = make_callback_update("post_more_123")
+        query.edit_message_reply_markup = AsyncMock()
+
+        with patch.object(
+            bot, "get_user_settings", AsyncMock(return_value={"show_tags_button": True})
+        ):
+            await bot.button_handler(update, SimpleNamespace())
+
+        query.edit_message_reply_markup.assert_awaited_once()
+        markup = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+        callbacks = [
+            button.callback_data for row in markup.inline_keyboard
+            for button in row if button.callback_data
+        ]
+        self.assertIn("post_tags_123", callbacks)
+        self.assertIn("post_original_123", callbacks)
+        query.edit_message_text.assert_not_awaited()
 
     def test_spoiler_mode_respects_rating(self):
         self.assertTrue(bot.should_spoiler({"spoiler_mode": "all"}, {"rating": "s"}))

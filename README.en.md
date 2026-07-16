@@ -258,8 +258,10 @@ The project includes:
 | `/subscriptions` | Manage automatic subscriptions |
 | `/settings` | Configure captions, galleries, and media quality |
 
-After the first `/start`, primary actions remain available on the persistent
-keyboard without reopening the start menu.
+After the first `/start`, the persistent keyboard keeps only six primary
+actions: search, random, gallery, library, subscriptions, and menu. Presets,
+collections, recommendations, and “Read later” live in grouped submenus, while
+rare post actions are available through `••• More`.
 
 ### Administrator Commands
 

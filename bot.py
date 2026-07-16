@@ -72,6 +72,9 @@ from bot_keyboards import (
     get_favorites_album_keyboard,
     get_image_keyboard,
     get_main_keyboard,
+    get_library_keyboard,
+    get_search_hub_keyboard,
+    get_post_more_keyboard,
     get_random_image_keyboard,
     get_settings_keyboard,
     get_subscription_gallery_keyboard,
@@ -627,25 +630,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else ""
     )
     await update.message.reply_text(
-        "👋 Привет! Я помогу найти и удобно организовать изображения с Rule34.\n\n"
-        "🔍 *Поиск и подборки*\n"
-        "• поиск по тегам, ID и случайная выдача;\n"
-        "• альбомы до 10 изображений и расширенные фильтры;\n"
-        "• похожие посты, рекомендации и конструктор запросов;\n"
-        "• сохранённые поисковые пресеты.\n\n"
-        "⭐ *Личная библиотека*\n"
-        "• избранное, коллекции и заметки;\n"
-        "• очередь «На потом» и поиск по сохранённым постам;\n"
-        "• массовое сохранение и ZIP-экспорт.\n\n"
-        "🔔 *Подписки*\n"
-        "• отдельные фильтры для каждого запроса;\n"
-        "• мгновенная доставка или накопительный дайджест;\n"
-        "• пауза подписок и повтор неудачных доставок.\n\n"
-        "🛡 *Контроль выдачи*\n"
-        "• постоянный и временный blacklist;\n"
-        "• выбор качества, спойлеров и состава описания.\n\n"
-        "Используйте кнопки под полем ввода. Все остальные возможности находятся в `⚙️ Меню`.\n\n"
-        "⚠️ Бот предназначен только для совершеннолетних пользователей 18+."
+        "👋 *Привет!* Я помогу найти и сохранить изображения с Rule34.\n\n"
+        "Используйте кнопки ниже для поиска, подборок и своей библиотеки.\n\n"
+        "⚠️ Только для пользователей 18+."
         f"{pause_text}",
         reply_markup=get_persistent_keyboard(),
         parse_mode="Markdown",
@@ -730,6 +717,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
+    elif data == "search_hub":
+        await query.edit_message_text(
+            "🔍 *Поиск*\n\nВыберите способ поиска.",
+            reply_markup=get_search_hub_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    elif data == "library":
+        total = await count_favorites(user_id)
+        later_count = (await get_user_storage_stats(user_id)).get("read_later", 0)
+        await query.edit_message_text(
+            f"⭐ *Моя библиотека*\n\nИзбранное: `{total}`\nНа потом: `{later_count}`",
+            reply_markup=get_library_keyboard(),
+            parse_mode="Markdown",
+        )
+
     elif data == "random":
         schedule_background_task(context, send_random_image(query.message, user_id))
 
@@ -745,6 +748,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ Сначала выполните поиск!", reply_markup=get_main_keyboard()
             )
 
+    elif data.startswith("post_more_"):
+        post_id_text = data.replace("post_more_", "", 1)
+        if post_id_text.isdigit():
+            settings = await get_user_settings(user_id)
+            await query.edit_message_reply_markup(
+                reply_markup=get_post_more_keyboard(
+                    int(post_id_text), should_show_tags_button(settings)
+                )
+            )
+
+    elif data.startswith("post_compact_"):
+        post_id_text = data.replace("post_compact_", "", 1)
+        if post_id_text.isdigit():
+            settings = await get_user_settings(user_id)
+            await query.edit_message_reply_markup(
+                reply_markup=get_image_keyboard(
+                    int(post_id_text),
+                    show_tags_button=should_show_tags_button(settings),
+                )
+            )
     elif data == "blacklist":
         await query.edit_message_text(
             "🚫 *Настройки Blacklist*\n\n"
@@ -3223,10 +3246,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = user_states.get(user_id)
 
     if text == PERSISTENT_SEARCH:
-        user_states[user_id] = "waiting_search"
         await update.message.reply_text(
-            "🔍 Введите теги для поиска через пробел.\n"
-            "Например: `blonde_hair blue_eyes`",
+            "🔍 *Поиск*\n\nВыберите способ поиска.",
+            reply_markup=get_search_hub_keyboard(),
             parse_mode="Markdown",
         )
 
@@ -3243,7 +3265,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == PERSISTENT_FAVORITES:
         user_states.pop(user_id, None)
-        await show_favorites(update.message, user_id)
+        total = await count_favorites(user_id)
+        later_count = (await get_user_storage_stats(user_id)).get("read_later", 0)
+        await update.message.reply_text(
+            f"⭐ *Моя библиотека*\n\nИзбранное: `{total}`\nНа потом: `{later_count}`",
+            reply_markup=get_library_keyboard(),
+            parse_mode="Markdown",
+        )
 
     elif text == PERSISTENT_SUBSCRIPTIONS:
         user_states.pop(user_id, None)
@@ -3256,8 +3284,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == PERSISTENT_MENU:
         user_states.pop(user_id, None)
         await update.message.reply_text(
-            await build_main_menu_text(user_id),
+            "☰ *Меню*\n\nФильтры, настройки и служебные разделы.",
             reply_markup=get_main_keyboard(),
+            parse_mode="Markdown",
         )
 
     elif text.lower() in RESTART_TEXT_COMMANDS:
