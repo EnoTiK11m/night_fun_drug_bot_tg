@@ -233,6 +233,31 @@ def get_settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def get_favorites_album_keyboard(
+    page: int,
+    total_pages: int,
+) -> InlineKeyboardMarkup:
+    navigation = []
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton("◀️", callback_data=f"fav_page_{page - 1}")
+        )
+    navigation.append(
+        InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop")
+    )
+    if page + 1 < total_pages:
+        navigation.append(
+            InlineKeyboardButton("▶️", callback_data=f"fav_page_{page + 1}")
+        )
+    return InlineKeyboardMarkup([
+        navigation,
+        [
+            InlineKeyboardButton("📋 Список", callback_data="fav_list"),
+            InlineKeyboardButton("⭐ Меню", callback_data="favorites"),
+        ],
+    ])
+
+
 def get_gallery_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
     labels = {"random": "случайно", "new": "новые", "popular": "популярные"}
     ratings = {"all": "все", "s": "safe", "q": "questionable", "e": "explicit"}

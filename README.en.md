@@ -60,7 +60,7 @@ favorites, collections, a blacklist, and automatic subscriptions.
 ### Favorites and Collections
 
 - saving posts to favorites;
-- list and gallery views for favorites;
+- list view or persistent Telegram albums with 10 favorites per page;
 - custom collections;
 - notes attached to saved posts;
 - a separate “Read later” queue with automatic expiration;

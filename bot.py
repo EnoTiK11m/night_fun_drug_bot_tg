@@ -69,6 +69,7 @@ from bot_keyboards import (
     get_blacklist_keyboard,
     get_caption_settings_keyboard,
     get_favorites_gallery_keyboard,
+    get_favorites_album_keyboard,
     get_image_keyboard,
     get_main_keyboard,
     get_random_image_keyboard,
@@ -299,6 +300,7 @@ FAVORITES_EXPORT_ZIP_LIMIT_BYTES = 45 * 1024 * 1024
 FAVORITES_EXPORT_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 FAVORITES_EXPORT_COOLDOWN_SECONDS = 5 * 60
 POST_TAGS_PAGE_SIZE = 8
+FAVORITES_GALLERY_PAGE_SIZE = 10
 RESTART_EXIT_CODE = 42
 restart_requested = False
 RESTART_TEXT_COMMANDS = {"restart", "рестарт"}
@@ -431,6 +433,86 @@ def gallery_fallback_post(post: dict) -> dict | None:
     if not fallback_url:
         return None
     return dict(post, file_url=fallback_url)
+
+
+async def send_resilient_media_group(
+    message,
+    posts: list[dict],
+    settings: dict,
+    caption: str,
+    log_context: str = "Gallery",
+) -> tuple[list[dict], list[dict]]:
+    """Send an album, repairing or removing only the item rejected by Telegram.
+
+    The first list contains posts delivered as one album. The second contains
+    rejected posts that may still be attempted sequentially. When album delivery
+    is impossible, the first list is empty and all remaining posts are returned
+    in the second list.
+    """
+    album_posts = list(posts)
+    rejected_posts = []
+    fallback_post_ids = set()
+    max_album_attempts = min(5, len(album_posts) + 1)
+    for attempt in range(1, max_album_attempts + 1):
+        media = [
+            media_from_post(
+                post,
+                caption if index == 0 else "",
+                should_spoiler(settings, post),
+            )
+            for index, post in enumerate(album_posts)
+        ]
+        try:
+            await message.reply_media_group(media=media)
+            return album_posts, rejected_posts
+        except Exception as exc:
+            failed_index = gallery_failed_item_index(exc, len(album_posts))
+            if failed_index is None:
+                logger.warning(
+                    "%s album failed without item index; using sequential "
+                    "fallback: %s",
+                    log_context,
+                    exc,
+                )
+                break
+
+            failed_post = album_posts[failed_index]
+            failed_post_id = int(failed_post.get("id") or 0)
+            replacement = (
+                gallery_fallback_post(failed_post)
+                if failed_post_id not in fallback_post_ids
+                else None
+            )
+            if replacement is not None:
+                fallback_post_ids.add(failed_post_id)
+                album_posts[failed_index] = replacement
+                logger.warning(
+                    "%s album item failed; retrying with fallback URL "
+                    "attempt=%s/%s item=%s post=%s error=%s",
+                    log_context,
+                    attempt,
+                    max_album_attempts,
+                    failed_index + 1,
+                    failed_post_id,
+                    exc,
+                )
+                continue
+
+            removed = album_posts.pop(failed_index)
+            rejected_posts.append(removed)
+            logger.warning(
+                "%s album item failed without usable fallback; removing "
+                "item=%s post=%s remaining=%s error=%s",
+                log_context,
+                failed_index + 1,
+                removed.get("id"),
+                len(album_posts),
+                exc,
+            )
+            if len(album_posts) < 2:
+                break
+
+    return [], album_posts + rejected_posts
 
 
 def should_show_tags_button(settings: dict | None = None) -> bool:
@@ -1592,12 +1674,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_favorites_gallery(query.message, user_id)
 
     elif data.startswith("fav_page_"):
-        index_text = data.replace("fav_page_", "", 1)
-        if not index_text.isdigit():
-            await query.message.reply_text("❌ Не удалось открыть пост.")
+        page_text = data.replace("fav_page_", "", 1)
+        if not page_text.isdigit():
+            await query.message.reply_text("❌ Не удалось открыть страницу.")
             return
 
-        await edit_favorites_gallery(query, user_id, int(index_text))
+        await send_favorites_gallery(query.message, user_id, int(page_text))
 
     elif data.startswith("fav_del_"):
         parts = data.split("_")
@@ -2432,32 +2514,79 @@ async def edit_subscription_gallery(
         await send_post_media(query.message, post, caption, keyboard, settings=settings)
 
 
-async def send_favorites_gallery(message, user_id: int, index: int = 0):
+async def send_favorites_gallery(message, user_id: int, page: int = 0):
     total = await count_favorites(user_id)
     if total <= 0:
         await message.reply_text("❌ Избранное пока пустое.")
-        return
+        return False
 
-    index = max(0, min(index, total - 1))
-    post = await get_favorite_by_index(user_id, index)
-    if not post:
-        await message.reply_text("❌ Избранное пока пустое.")
-        return
-
-    settings = await get_user_settings(user_id)
-    caption = build_favorites_gallery_caption(post, index, total)
-    await send_post_media(
-        message,
-        post,
-        caption,
-        get_favorites_gallery_keyboard(
-            index,
-            total,
-            post.get("id", 0),
-            should_show_tags_button(settings),
-        ),
-        settings=settings,
+    total_pages = max(1, (total + FAVORITES_GALLERY_PAGE_SIZE - 1) // FAVORITES_GALLERY_PAGE_SIZE)
+    page = max(0, min(int(page), total_pages - 1))
+    favorites = await get_favorites(
+        user_id,
+        limit=FAVORITES_GALLERY_PAGE_SIZE,
+        offset=page * FAVORITES_GALLERY_PAGE_SIZE,
     )
+    if not favorites:
+        await message.reply_text("❌ Избранное пока пустое.")
+        return False
+
+    settings = normalize_feature_settings(await get_user_settings(user_id))
+    prepared = prepare_gallery_album_posts(
+        favorites, settings, FAVORITES_GALLERY_PAGE_SIZE
+    )
+    prepared_ids = {int(post.get("id") or 0) for post in prepared}
+    standalone_posts = [
+        prepare_post_quality(post, settings)
+        for post in favorites
+        if int(post.get("id") or 0) not in prepared_ids
+    ]
+    if not prepared:
+        prepared, standalone_posts = standalone_posts, []
+
+    first_number = page * FAVORITES_GALLERY_PAGE_SIZE + 1
+    last_number = min(first_number + len(favorites) - 1, total)
+    caption = (
+        f"⭐ Избранное · страница {page + 1}/{total_pages}\n"
+        f"Посты {first_number}–{last_number} из {total}"
+    )
+    delivered_posts = []
+    rejected_posts = []
+    can_group = len(prepared) > 1 and all(
+        media_group_compatible_url(post.get("file_url", "")) for post in prepared
+    )
+    if can_group:
+        delivered_posts, rejected_posts = await send_resilient_media_group(
+            message,
+            prepared,
+            settings,
+            caption,
+            log_context="Favorites gallery",
+        )
+
+    sequential_posts = standalone_posts + (
+        rejected_posts if can_group else prepared
+    )
+    for index, post in enumerate(sequential_posts):
+        delivered = await send_post_media(
+            message,
+            post,
+            caption if not delivered_posts and index == 0 else "",
+            get_image_keyboard(
+                int(post.get("id") or 0),
+                show_tags_button=should_show_tags_button(settings),
+            ),
+            settings=settings,
+        )
+        if delivered:
+            delivered_posts.append(post)
+
+    await message.reply_text(
+        f"⭐ Показано: {len(delivered_posts)} · "
+        f"страница {page + 1}/{total_pages}",
+        reply_markup=get_favorites_album_keyboard(page, total_pages),
+    )
+    return bool(delivered_posts)
 
 
 async def edit_favorites_gallery(query, user_id: int, index: int):
@@ -2686,70 +2815,16 @@ async def send_search_gallery(message, user_id: int, tags: str, page: int = 0):
         await remember_and_cache_post(source_posts.get(str(post.get("id")), post))
     delivered_ids = []
     if can_group:
-        album_posts = list(prepared)
-        fallback_post_ids = set()
-        max_album_attempts = min(5, len(album_posts) + 1)
-        for attempt in range(1, max_album_attempts + 1):
-            media = []
-            for index, post in enumerate(album_posts):
-                caption = (
-                    f"🖼 Галерея: `{md_code(tags or 'random')}`"
-                    if index == 0 else ""
-                )
-                media.append(
-                        media_from_post(post, caption, should_spoiler(settings, post))
-                    )
-            try:
-                await message.reply_media_group(media=media)
-                delivered_ids = [int(post["id"]) for post in album_posts]
-                runtime_metrics.increment("gallery_albums")
-                runtime_metrics.increment("gallery_items", len(delivered_ids))
-                break
-            except Exception as exc:
-                failed_index = gallery_failed_item_index(exc, len(album_posts))
-                if failed_index is None:
-                    logger.warning(
-                        "Gallery album failed without item index; using sequential "
-                        "fallback: %s",
-                        exc,
-                    )
-                    break
-
-                failed_post = album_posts[failed_index]
-                failed_post_id = int(failed_post.get("id") or 0)
-                replacement = (
-                    gallery_fallback_post(failed_post)
-                    if failed_post_id not in fallback_post_ids
-                    else None
-                )
-                if replacement is not None:
-                    fallback_post_ids.add(failed_post_id)
-                    album_posts[failed_index] = replacement
-                    logger.warning(
-                        "Gallery album item failed; retrying with fallback URL "
-                        "attempt=%s/%s item=%s post=%s error=%s",
-                        attempt,
-                        max_album_attempts,
-                        failed_index + 1,
-                        failed_post_id,
-                        exc,
-                    )
-                    continue
-
-                removed = album_posts.pop(failed_index)
-                logger.warning(
-                    "Gallery album item failed without usable fallback; removing "
-                    "item=%s post=%s remaining=%s error=%s",
-                    failed_index + 1,
-                    removed.get("id"),
-                    len(album_posts),
-                    exc,
-                )
-                if len(album_posts) < 2:
-                    break
-
-        if not delivered_ids and album_posts != prepared:
-            prepared = album_posts
+        delivered_posts, prepared = await send_resilient_media_group(
+            message,
+            prepared,
+            settings,
+            f"🖼 Галерея: `{md_code(tags or 'random')}`",
+        )
+        delivered_ids = [int(post["id"]) for post in delivered_posts]
+        if delivered_ids:
+            runtime_metrics.increment("gallery_albums")
+            runtime_metrics.increment("gallery_items", len(delivered_ids))
 
     if not delivered_ids:
         for post in prepared:

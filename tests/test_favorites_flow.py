@@ -697,28 +697,84 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         text = message.reply_text.await_args.args[0]
         self.assertIn("Экспорт уже недавно запускался", text)
 
-    async def test_favorites_gallery_loads_single_post_by_index(self):
-        message = SimpleNamespace(reply_text=AsyncMock())
-        post = {
-            "id": 20,
-            "file_url": "https://example.test/20.jpg",
-            "tags": "tag",
-            "rating": "s",
-            "score": 1,
-        }
+    async def test_favorites_gallery_sends_ten_post_pages_as_new_albums(self):
+        message = SimpleNamespace(
+            reply_media_group=AsyncMock(),
+            reply_text=AsyncMock(),
+        )
+        posts = [
+            {
+                "id": post_id,
+                "file_url": f"https://example.test/{post_id}.jpg",
+                "tags": "tag",
+                "rating": "s",
+                "score": 1,
+            }
+            for post_id in range(1, 11)
+        ]
 
         with (
-            patch.object(bot, "count_favorites", AsyncMock(return_value=3)),
-            patch.object(bot, "get_favorite_by_index", AsyncMock(return_value=post)) as get_by_index,
+            patch.object(bot, "count_favorites", AsyncMock(return_value=23)),
+            patch.object(bot, "get_favorites", AsyncMock(return_value=posts)) as get_favorites,
             patch.object(bot, "get_user_settings", AsyncMock(return_value={"show_tags_button": True})),
             patch.object(bot, "send_post_media", AsyncMock()) as send_post_media,
-            patch.object(bot, "get_favorites", AsyncMock()) as get_favorites,
         ):
-            await bot.send_favorites_gallery(message, 1, index=99)
+            delivered = await bot.send_favorites_gallery(message, 1, page=0)
 
-        get_by_index.assert_awaited_once_with(1, 2)
-        get_favorites.assert_not_awaited()
-        send_post_media.assert_awaited_once()
+        self.assertTrue(delivered)
+        get_favorites.assert_awaited_once_with(1, limit=10, offset=0)
+        message.reply_media_group.assert_awaited_once()
+        media = message.reply_media_group.await_args.kwargs["media"]
+        self.assertEqual(len(media), 10)
+        self.assertIn("страница 1/3", media[0].caption)
+        navigation = message.reply_text.await_args.kwargs["reply_markup"]
+        callbacks = [
+            button.callback_data
+            for row in navigation.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("fav_page_1", callbacks)
+        self.assertNotIn("fav_page_-1", callbacks)
+        send_post_media.assert_not_awaited()
+
+    async def test_favorites_gallery_next_page_sends_new_album(self):
+        update, query = make_callback_update("fav_page_2")
+
+        with patch.object(
+            bot, "send_favorites_gallery", AsyncMock(return_value=True)
+        ) as send_gallery:
+            await bot.button_handler(update, SimpleNamespace())
+
+        send_gallery.assert_awaited_once_with(query.message, 1, 2)
+        query.edit_message_text.assert_not_awaited()
+
+    async def test_favorites_gallery_keeps_gif_without_preview_as_single_item(self):
+        message = SimpleNamespace(
+            reply_media_group=AsyncMock(),
+            reply_text=AsyncMock(),
+        )
+        posts = [
+            {"id": 1, "file_url": "https://example.test/1.gif"},
+            *[
+                {"id": post_id, "file_url": f"https://example.test/{post_id}.jpg"}
+                for post_id in range(2, 11)
+            ],
+        ]
+
+        with (
+            patch.object(bot, "count_favorites", AsyncMock(return_value=10)),
+            patch.object(bot, "get_favorites", AsyncMock(return_value=posts)),
+            patch.object(bot, "get_user_settings", AsyncMock(return_value={})),
+            patch.object(bot, "send_post_media", AsyncMock(return_value=True)) as send_single,
+        ):
+            delivered = await bot.send_favorites_gallery(message, 1)
+
+        self.assertTrue(delivered)
+        album = message.reply_media_group.await_args.kwargs["media"]
+        self.assertEqual(len(album), 9)
+        send_single.assert_awaited_once()
+        self.assertEqual(send_single.await_args.args[1]["id"], 1)
+        self.assertIn("Показано: 10", message.reply_text.await_args.args[0])
 
     async def test_pause_and_resume_subscription_settings_flow(self):
         update, query = make_callback_update("settings_pause_subscriptions")
