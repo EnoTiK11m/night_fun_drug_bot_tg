@@ -6,8 +6,10 @@
 [![RU](https://img.shields.io/badge/lang-RU-0078D4?logo=googletranslate&logoColor=white)](README.md)
 
 A Telegram bot for finding, viewing, and organizing media from
-[Rule34](https://rule34.xxx/) by tags. It supports single-post results, albums,
-favorites, collections, a blacklist, and automatic subscriptions.
+[Rule34](https://rule34.xxx/) by tags. It combines single-post results and
+galleries with a personal library, collections, a blacklist, recommendations,
+and automatic subscriptions. The interface adapts to the user: simple mode
+keeps only primary actions, while advanced mode exposes every tool directly.
 
 > [!WARNING]
 > This project is intended for adults only (18+). Content is provided by a
@@ -18,6 +20,7 @@ favorites, collections, a blacklist, and automatic subscriptions.
 ## Table of Contents
 
 - [Features](#features)
+- [Interface and Navigation](#interface-and-navigation)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [Docker](#docker)
@@ -41,7 +44,7 @@ favorites, collections, a blacklist, and automatic subscriptions.
 - exclusion of posts the user has already viewed;
 - tag autocomplete;
 - a query builder with required and excluded tags;
-- saved search presets with their own filters;
+- saved queries with their own filters;
 - similar-result searches and paginated quick actions for every post tag;
 - resilient Telegram albums: GIFs use static previews and an unavailable
   original is replaced with its sample without splitting the gallery into
@@ -50,6 +53,10 @@ favorites, collections, a blacklist, and automatic subscriptions.
 ### Personalization
 
 - a compact persistent keyboard for primary actions;
+- simple and advanced interface modes;
+- a quick-start screen for first-time users;
+- breadcrumbs, contextual help, and consistent back navigation;
+- cancellation of any multi-step input with a button or `/cancel`;
 - configurable image captions;
 - configurable maximum download size;
 - spoilers for all media or only posts rated `explicit`;
@@ -78,6 +85,7 @@ favorites, collections, a blacklist, and automatic subscriptions.
 ### Subscriptions and Reliability
 
 - periodic delivery of new posts for saved queries;
+- a query and interval preview before subscription creation;
 - per-subscription filters for rating, type, orientation, resolution, quality,
   and blacklist;
 - accumulated digests sent after five posts or at least once every six hours;
@@ -96,8 +104,46 @@ favorites, collections, a blacklist, and automatic subscriptions.
   to an external AI service;
 - exclusion of unwanted tags from future recommendations;
 - saving an entire search gallery to favorites or a new collection;
-- creating a preset or subscription directly from gallery results;
+- creating a saved query or subscription directly from gallery results;
 - storage usage statistics and cleanup of old history.
+
+### Safe Interaction Flows
+
+- confirmation before deleting subscriptions, collections, favorites, or user data;
+- informative empty states that suggest the next useful action;
+- compact notifications for quick actions instead of extra chat messages;
+- automatic cancellation of unfinished input when entering another primary section;
+- a dedicated “My data” section for statistics, storage, and exports.
+
+## Interface and Navigation
+
+After `/start`, the bot displays a short onboarding screen and installs the
+persistent keyboard. New users begin in simple mode with four primary buttons.
+The mode can be changed under `Settings → Interface`.
+
+```text
+Main menu
+├── 🔎 Search
+│   ├── Tag search
+│   ├── Random posts and galleries
+│   ├── Query builder
+│   └── History and saved queries
+├── ⭐ Library
+│   ├── Favorites and collections
+│   ├── Read later
+│   └── Search and recommendations
+├── 🔔 Subscriptions
+│   ├── Creation preview
+│   ├── Per-subscription filters
+│   └── Global pause and digest
+├── 🚫 Blacklist
+├── ⚙️ Settings
+└── 👤 My data (advanced mode)
+```
+
+Every multi-step input screen includes a `❌ Cancel` button. The `/cancel`
+command performs the same action. Contextual `ℹ️` buttons explain the current
+section, while the full guide is available through `❓ Help`.
 
 ## Technology
 
@@ -237,7 +283,7 @@ The project includes:
 
 | Command | Purpose |
 | --- | --- |
-| `/start` | Install the persistent keyboard and open the start screen |
+| `/start` | Refresh the persistent keyboard and open quick start |
 | `/search <tags>` | Find one post by tags |
 | `/random` | Get a random post |
 | `/gallery <tags>` | Get up to 10 items; use `random` for a random gallery |
@@ -249,19 +295,20 @@ The project includes:
 | `/whyblocked <post_id or tags>` | Show blacklist matches |
 | `/favorites` | Open favorites |
 | `/collections` | Manage favorite collections |
-| `/presets` | Manage search presets |
+| `/presets` | Manage saved queries |
 | `/recommendations` | Get recommendations based on favorites |
 | `/later` | Open the “Read later” queue |
 | `/storage` | Show user storage usage |
 | `/history` | Show search history |
 | `/stats` | Show personal statistics |
 | `/subscriptions` | Manage automatic subscriptions |
-| `/settings` | Configure captions, galleries, and media quality |
+| `/settings` | Configure captions, galleries, media quality, and interface mode |
+| `/cancel` | Cancel the current multi-step input |
 
-After the first `/start`, the persistent keyboard keeps only six primary
-actions: search, random, gallery, library, subscriptions, and menu. Presets,
-collections, recommendations, and “Read later” live in grouped submenus, while
-rare post actions are available through `••• More`.
+In simple mode, the persistent keyboard contains four actions: search, random,
+library, and all sections. Advanced mode adds quick gallery and subscription
+buttons. Saved queries, collections, recommendations, and “Read later” live in
+grouped submenus, while rare post actions are available through `••• More`.
 
 ### Administrator Commands
 
