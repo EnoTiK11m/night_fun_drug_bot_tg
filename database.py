@@ -48,6 +48,7 @@ DEFAULT_USER_SETTINGS = {
     "max_file_mb": 10,
     "spoiler_mode": "off",
     "read_later_days": 30,
+    "interface_mode": "simple",
 }
 
 BLACKLIST_PRESETS = {

@@ -9,25 +9,50 @@ from bot_state import store_callback_payload
 from database import get_user_settings
 
 
-PERSISTENT_SEARCH = "🔍 Поиск"
+PERSISTENT_SEARCH = "🔎 Найти"
 PERSISTENT_GALLERY = "🖼 Подборка"
-PERSISTENT_RANDOM = "🎲 Рандом"
-PERSISTENT_FAVORITES = "⭐ Моя библиотека"
+PERSISTENT_RANDOM = "🎲 Случайное"
+PERSISTENT_FAVORITES = "⭐ Библиотека"
 PERSISTENT_SUBSCRIPTIONS = "🔔 Подписки"
-PERSISTENT_MENU = "☰ Меню"
+PERSISTENT_MENU = "☰ Все разделы"
+
+LEGACY_PERSISTENT_SEARCH = "🔍 Поиск"
+LEGACY_PERSISTENT_RANDOM = "🎲 Рандом"
+LEGACY_PERSISTENT_FAVORITES = "⭐ Моя библиотека"
+LEGACY_PERSISTENT_MENU = "☰ Меню"
 
 
-def get_persistent_keyboard() -> ReplyKeyboardMarkup:
+def get_persistent_keyboard(interface_mode: str = "simple") -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(PERSISTENT_SEARCH), KeyboardButton(PERSISTENT_RANDOM)],
+        [KeyboardButton(PERSISTENT_FAVORITES), KeyboardButton(PERSISTENT_MENU)],
+    ]
+    if interface_mode == "advanced":
+        rows.insert(
+            1,
+            [KeyboardButton(PERSISTENT_GALLERY), KeyboardButton(PERSISTENT_SUBSCRIPTIONS)],
+        )
     return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton(PERSISTENT_SEARCH), KeyboardButton(PERSISTENT_RANDOM)],
-            [KeyboardButton(PERSISTENT_GALLERY), KeyboardButton(PERSISTENT_FAVORITES)],
-            [KeyboardButton(PERSISTENT_SUBSCRIPTIONS), KeyboardButton(PERSISTENT_MENU)],
-        ],
+        rows,
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="Выберите действие или введите теги",
+        input_field_placeholder="Выберите раздел или отправьте теги",
     )
+
+
+def get_onboarding_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Найти изображение", callback_data="search")],
+        [InlineKeyboardButton("🎲 Показать случайное", callback_data="random")],
+        [InlineKeyboardButton("📖 Как пользоваться", callback_data="context_help_start")],
+    ])
+
+
+def get_cancel_keyboard(back_callback: str = "back") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_input")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)],
+    ])
 
 
 def get_tags_button(post_id: int) -> InlineKeyboardButton:
@@ -145,95 +170,190 @@ def get_favorites_gallery_keyboard(
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_main_keyboard() -> InlineKeyboardMarkup:
+def get_main_keyboard(interface_mode: str = "simple") -> InlineKeyboardMarkup:
     keyboard = [
-        [InlineKeyboardButton("🚫 Фильтры", callback_data="blacklist"), InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="stats"), InlineKeyboardButton("💽 Хранилище", callback_data="storage")],
-        [InlineKeyboardButton("🕘 История", callback_data="history"), InlineKeyboardButton("❓ Помощь", callback_data="help")],
         [
-            InlineKeyboardButton("🔍 Поиск", callback_data="search_hub"),
+            InlineKeyboardButton("🔎 Поиск", callback_data="search_hub"),
+            InlineKeyboardButton("🖼 Подборка", callback_data="gallery"),
+        ],
+        [
             InlineKeyboardButton("⭐ Библиотека", callback_data="library"),
+            InlineKeyboardButton("🔔 Подписки", callback_data="subscriptions"),
+        ],
+        [
+            InlineKeyboardButton("🚫 Чёрный список", callback_data="blacklist"),
+            InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
         ],
     ]
+    if interface_mode == "advanced":
+        keyboard.append([
+            InlineKeyboardButton("👤 Мои данные", callback_data="my_data"),
+            InlineKeyboardButton("❓ Помощь", callback_data="help"),
+        ])
+    else:
+        keyboard.append([InlineKeyboardButton("❓ Помощь", callback_data="help")])
     return InlineKeyboardMarkup(keyboard)
+
+
+def get_data_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Активность", callback_data="stats"),
+            InlineKeyboardButton("💽 Хранилище", callback_data="storage"),
+        ],
+        [InlineKeyboardButton("📤 Экспорт библиотеки", callback_data="fav_export")],
+        [InlineKeyboardButton("⬅️ Главное меню", callback_data="back")],
+    ])
+
+
+def get_help_keyboard(interface_mode: str = "simple") -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("🔎 Поиск", callback_data="search_hub"),
+            InlineKeyboardButton("⭐ Библиотека", callback_data="library"),
+        ],
+        [
+            InlineKeyboardButton("🔔 Подписки", callback_data="subscriptions"),
+            InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
+        ],
+        [InlineKeyboardButton("🚫 Чёрный список", callback_data="blacklist")],
+    ]
+    if interface_mode == "advanced":
+        rows.append([InlineKeyboardButton("👤 Мои данные", callback_data="my_data")])
+    rows.append([InlineKeyboardButton("⬅️ Главное меню", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
 
 
 def get_library_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🖼 Смотреть избранное", callback_data="fav_gallery")],
-        [InlineKeyboardButton("🗂 Коллекции", callback_data="fav_collections"), InlineKeyboardButton("⏳ На потом", callback_data="later_list")],
-        [InlineKeyboardButton("🔎 Найти", callback_data="fav_find"), InlineKeyboardButton("✨ Рекомендации", callback_data="recommendations")],
-        [InlineKeyboardButton("📦 Экспорт", callback_data="fav_export")],
-        [InlineKeyboardButton("◀️ Меню", callback_data="back")],
+        [InlineKeyboardButton("⭐ Смотреть избранное", callback_data="fav_gallery")],
+        [
+            InlineKeyboardButton("🗂 Коллекции", callback_data="fav_collections"),
+            InlineKeyboardButton("🕓 На потом", callback_data="later_list"),
+        ],
+        [
+            InlineKeyboardButton("🔎 Найти в библиотеке", callback_data="fav_find"),
+            InlineKeyboardButton("✨ Рекомендации", callback_data="recommendations"),
+        ],
+        [InlineKeyboardButton("ℹ️ Как устроена библиотека", callback_data="context_help_library")],
+        [InlineKeyboardButton("⬅️ Главное меню", callback_data="back")],
     ])
 
 
 def get_search_hub_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Обычный поиск", callback_data="search")],
-        [InlineKeyboardButton("🧩 Конструктор", callback_data="search_builder"), InlineKeyboardButton("💾 Пресеты", callback_data="presets")],
-        [InlineKeyboardButton("🕘 История", callback_data="history")],
-        [InlineKeyboardButton("◀️ Меню", callback_data="back")],
+        [
+            InlineKeyboardButton("🔎 Поиск по тегам", callback_data="search"),
+            InlineKeyboardButton("🎲 Случайное", callback_data="random"),
+        ],
+        [InlineKeyboardButton("🖼 Подборка изображений", callback_data="gallery")],
+        [
+            InlineKeyboardButton("🧩 Конструктор запроса", callback_data="search_builder"),
+            InlineKeyboardButton("💾 Сохранённые запросы", callback_data="presets"),
+        ],
+        [InlineKeyboardButton("🕘 История поиска", callback_data="history")],
+        [InlineKeyboardButton("ℹ️ Как работает поиск", callback_data="context_help_search")],
+        [InlineKeyboardButton("⬅️ Главное меню", callback_data="back")],
     ])
 
 
 def get_blacklist_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
-        [InlineKeyboardButton("➕ Добавить тег", callback_data="bl_add")],
-        [InlineKeyboardButton("➖ Удалить тег", callback_data="bl_remove")],
-        [InlineKeyboardButton("📋 Показать список", callback_data="bl_show")],
-        [InlineKeyboardButton("⏳ Временно скрыть", callback_data="bl_temp")],
-        [InlineKeyboardButton("🧰 Готовые пресеты", callback_data="bl_presets")],
+        [
+            InlineKeyboardButton("➕ Добавить", callback_data="bl_add"),
+            InlineKeyboardButton("➖ Удалить", callback_data="bl_remove"),
+        ],
+        [InlineKeyboardButton("📋 Посмотреть чёрный список", callback_data="bl_show")],
+        [InlineKeyboardButton("🕓 Скрыть тег временно", callback_data="bl_temp")],
+        [
+            InlineKeyboardButton("🧰 Готовые наборы", callback_data="bl_presets"),
+            InlineKeyboardButton("💡 Подобрать похожие", callback_data="bl_suggest"),
+        ],
         [
             InlineKeyboardButton("📥 Импорт", callback_data="bl_import"),
             InlineKeyboardButton("📤 Экспорт", callback_data="bl_export"),
         ],
-        [InlineKeyboardButton("💡 Похожие теги", callback_data="bl_suggest")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back")],
+        [InlineKeyboardButton("ℹ️ Как работает чёрный список", callback_data="context_help_blacklist")],
+        [InlineKeyboardButton("⬅️ Главное меню", callback_data="back")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_subscriptions_keyboard() -> InlineKeyboardMarkup:
+def get_subscriptions_keyboard(subscriptions_paused: bool = False) -> InlineKeyboardMarkup:
+    subscription_control = (
+        InlineKeyboardButton(
+            "▶️ Возобновить все подписки",
+            callback_data="settings_resume_subscriptions",
+        )
+        if subscriptions_paused
+        else InlineKeyboardButton(
+            "⏸ Приостановить все подписки",
+            callback_data="settings_pause_subscriptions",
+        )
+    )
     keyboard = [
         [
             InlineKeyboardButton(
-                "➕ Подписаться на текущий поиск", callback_data="sub_add_current"
+                "➕ Новая подписка", callback_data="sub_add_new"
             )
         ],
         [
             InlineKeyboardButton(
-                "➕ Подписаться на новый поиск", callback_data="sub_add_new"
+                "🔎 Подписаться на текущий поиск", callback_data="sub_add_current"
             )
         ],
-        [InlineKeyboardButton("📋 Мои подписки", callback_data="sub_list")],
-        [InlineKeyboardButton("⚙️ Управление подписками", callback_data="sub_manage")],
+        [
+            InlineKeyboardButton("📋 Мои подписки", callback_data="sub_list"),
+            InlineKeyboardButton("⚙️ Управление", callback_data="sub_manage"),
+        ],
+        [subscription_control],
         [InlineKeyboardButton("📨 Отправить дайджест", callback_data="sub_digest_send")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back")],
+        [InlineKeyboardButton("ℹ️ Как работают подписки", callback_data="context_help_subscriptions")],
+        [InlineKeyboardButton("⬅️ Главное меню", callback_data="back")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_settings_keyboard() -> InlineKeyboardMarkup:
+def get_settings_keyboard(settings: dict | None = None) -> InlineKeyboardMarkup:
+    settings = settings or {}
+    caption_state = "включены ✅" if settings.get("show_caption", True) else "выключены ❌"
+    spoiler_labels = {
+        "off": "выключены",
+        "explicit": "только explicit",
+        "all": "для всех",
+    }
+    quality_labels = {
+        "auto": "автоматически",
+        "preview": "preview",
+        "sample": "sample",
+        "original": "оригинал",
+    }
+    interface_mode = settings.get("interface_mode", "simple")
+    interface_label = "простой" if interface_mode == "simple" else "расширенный"
     keyboard = [
-        [InlineKeyboardButton("📝 Настройки описания", callback_data="settings_caption")],
-        [InlineKeyboardButton("🖼 Галерея и фильтры", callback_data="settings_gallery")],
-        [InlineKeyboardButton("📦 Качество медиа", callback_data="settings_quality")],
-        [InlineKeyboardButton("🙈 Спойлеры", callback_data="settings_spoiler")],
         [
-            InlineKeyboardButton(
-                "⏸ Остановить все подписки на время",
-                callback_data="settings_pause_subscriptions",
-            )
+            InlineKeyboardButton(f"📝 Подписи: {caption_state}", callback_data="settings_caption"),
         ],
         [
             InlineKeyboardButton(
-                "▶️ Возобновить подписки",
-                callback_data="settings_resume_subscriptions",
-            )
+                f"🙈 Спойлеры: {spoiler_labels.get(settings.get('spoiler_mode'), 'выключены')}",
+                callback_data="settings_spoiler",
+            ),
         ],
-        [InlineKeyboardButton("🔄 Сброс настроек", callback_data="settings_reset")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back")],
+        [
+            InlineKeyboardButton(
+                f"🖼 Подборка: {settings.get('gallery_size', 10)} изображений",
+                callback_data="settings_gallery",
+            ),
+            InlineKeyboardButton(
+                f"📦 Качество: {quality_labels.get(settings.get('quality_mode'), 'автоматически')}",
+                callback_data="settings_quality",
+            ),
+        ],
+        [InlineKeyboardButton(f"🧭 Интерфейс: {interface_label}", callback_data="settings_interface_mode")],
+        [InlineKeyboardButton("🔄 Сбросить настройки", callback_data="settings_reset")],
+        [InlineKeyboardButton("ℹ️ Что можно настроить", callback_data="context_help_settings")],
+        [InlineKeyboardButton("⬅️ Главное меню", callback_data="back")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -332,7 +452,7 @@ def get_gallery_result_keyboard(
     if bulk_favorite_callback:
         bulk.append(InlineKeyboardButton("⭐ Сохранить все", callback_data=bulk_favorite_callback))
     if save_preset_callback:
-        bulk.append(InlineKeyboardButton("💾 Пресет", callback_data=save_preset_callback))
+        bulk.append(InlineKeyboardButton("💾 Сохранить запрос", callback_data=save_preset_callback))
     if bulk:
         rows.append(bulk)
     secondary = []

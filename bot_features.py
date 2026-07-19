@@ -150,6 +150,8 @@ def prepare_gallery_album_posts(
 
 def normalize_feature_settings(settings: dict) -> dict:
     result = dict(settings)
+    if result.get("interface_mode") not in {"simple", "advanced"}:
+        result["interface_mode"] = "simple"
     if result.get("gallery_sort") not in GALLERY_SORTS:
         result["gallery_sort"] = "random"
     if result.get("rating_filter") not in RATING_FILTERS:
