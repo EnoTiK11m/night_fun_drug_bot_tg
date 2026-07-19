@@ -148,9 +148,11 @@ class FeatureDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await database.remove_read_later(1, 77))
 
         self.assertTrue(await database.enqueue_subscription_digest(1, "alpha", post))
+        self.assertEqual(await database.count_subscription_digest(1), 1)
         digest = await database.pop_subscription_digest(1, 10)
         self.assertEqual(digest[0]["subscription_query"], "alpha")
         self.assertEqual(await database.pop_subscription_digest(1, 10), [])
+        self.assertEqual(await database.count_subscription_digest(1), 0)
 
     async def test_favorite_profile_search_and_storage_stats(self):
         post = {

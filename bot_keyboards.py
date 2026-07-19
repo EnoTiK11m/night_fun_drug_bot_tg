@@ -279,7 +279,10 @@ def get_blacklist_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_subscriptions_keyboard(subscriptions_paused: bool = False) -> InlineKeyboardMarkup:
+def get_subscriptions_keyboard(
+    subscriptions_paused: bool = False,
+    has_digest_posts: bool = False,
+) -> InlineKeyboardMarkup:
     subscription_control = (
         InlineKeyboardButton(
             "▶️ Возобновить все подписки",
@@ -307,10 +310,18 @@ def get_subscriptions_keyboard(subscriptions_paused: bool = False) -> InlineKeyb
             InlineKeyboardButton("⚙️ Управление", callback_data="sub_manage"),
         ],
         [subscription_control],
-        [InlineKeyboardButton("📨 Отправить дайджест", callback_data="sub_digest_send")],
+    ]
+    if has_digest_posts:
+        keyboard.append([
+            InlineKeyboardButton(
+                "📨 Отправить накопленный дайджест",
+                callback_data="sub_digest_send",
+            )
+        ])
+    keyboard.extend([
         [InlineKeyboardButton("ℹ️ Как работают подписки", callback_data="context_help_subscriptions")],
         [InlineKeyboardButton("⬅️ Главное меню", callback_data="back")],
-    ]
+    ])
     return InlineKeyboardMarkup(keyboard)
 
 

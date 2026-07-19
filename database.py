@@ -2230,6 +2230,16 @@ async def enqueue_subscription_digest(user_id: int, query: str, post: Dict[str, 
         return cursor.rowcount > 0
 
 
+async def count_subscription_digest(user_id: int) -> int:
+    async with connect_db() as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM subscription_digest_queue WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        return int(row[0] or 0)
+
+
 async def pop_subscription_digest(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
     async with connect_db() as db:
         cursor = await db.execute("""

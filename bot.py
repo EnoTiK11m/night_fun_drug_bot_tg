@@ -205,6 +205,7 @@ from database import (
     get_read_later,
     remove_read_later,
     enqueue_subscription_digest,
+    count_subscription_digest,
     pop_subscription_digest,
     get_due_digest_users,
     get_favorite_tag_profile,
@@ -434,7 +435,11 @@ async def get_user_persistent_keyboard(user_id: int):
 
 async def get_user_subscriptions_keyboard(user_id: int) -> InlineKeyboardMarkup:
     pause_until = await get_subscription_pause_until(user_id)
-    return get_subscriptions_keyboard(subscriptions_paused=bool(pause_until))
+    digest_count = await count_subscription_digest(user_id)
+    return get_subscriptions_keyboard(
+        subscriptions_paused=bool(pause_until),
+        has_digest_posts=digest_count > 0,
+    )
 
 
 async def build_subscriptions_menu_text(user_id: int) -> str:
@@ -1173,7 +1178,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "sub_digest_send":
         posts = await pop_subscription_digest(user_id, 10)
-        if posts and not await send_digest_posts(query.message, user_id, posts):
+        delivered = await send_digest_posts(query.message, user_id, posts)
+        if posts and not delivered:
             for post in posts:
                 await enqueue_subscription_digest(
                     user_id, post.get("subscription_query", "digest"), post
@@ -1564,7 +1570,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "▶️ Подписки возобновлены.\n\n"
             f"Активных подписок: {resumed_count}.",
-            reply_markup=get_subscriptions_keyboard(subscriptions_paused=False),
+            reply_markup=await get_user_subscriptions_keyboard(user_id),
         )
 
     elif data.startswith("toggle_"):
@@ -3866,7 +3872,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{format_pause_duration(pause_minutes)}.\n\n"
             f"Затронуто активных подписок: {paused_count}.\n"
             "Новые подписки во время паузы тоже начнут работать только после неё.",
-            reply_markup=get_subscriptions_keyboard(subscriptions_paused=True),
+            reply_markup=await get_user_subscriptions_keyboard(user_id),
         )
 
     elif state == "waiting_fav_tag":

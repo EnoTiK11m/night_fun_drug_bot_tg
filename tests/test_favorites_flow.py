@@ -79,7 +79,14 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
             message=SimpleNamespace(reply_text=AsyncMock()),
         )
 
-        with patch.object(bot, "get_subscription_pause_until", AsyncMock(return_value=None)):
+        with (
+            patch.object(bot, "get_subscription_pause_until", AsyncMock(return_value=None)),
+            patch.object(
+                bot,
+                "get_user_settings",
+                AsyncMock(return_value={"interface_mode": "simple"}),
+            ),
+        ):
             await bot.start(update, SimpleNamespace())
 
         first_call = update.message.reply_text.await_args_list[0]
@@ -143,6 +150,7 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(bot, "add_subscription", AsyncMock(return_value=True)) as add_subscription,
             patch.object(bot, "get_subscription_pause_until", AsyncMock(return_value=None)),
+            patch.object(bot, "count_subscription_digest", AsyncMock(return_value=0)),
         ):
             await bot.button_handler(confirm_update, SimpleNamespace())
 
@@ -450,7 +458,14 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
             message=SimpleNamespace(text=bot.PERSISTENT_MENU, reply_text=AsyncMock()),
         )
 
-        with patch.object(bot, "build_main_menu_text", AsyncMock(return_value="menu")):
+        with (
+            patch.object(bot, "build_main_menu_text", AsyncMock(return_value="menu")),
+            patch.object(
+                bot,
+                "get_user_settings",
+                AsyncMock(return_value={"interface_mode": "advanced"}),
+            ),
+        ):
             await bot.message_handler(update, SimpleNamespace())
 
         self.assertNotIn(1, bot.user_states)
@@ -873,11 +888,15 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         query.edit_message_text.assert_awaited_once()
 
         update, query = make_callback_update("settings_resume_subscriptions")
-        with patch.object(
-            bot,
-            "resume_all_active_subscriptions",
-            AsyncMock(return_value=3),
-        ) as resume_subscriptions:
+        with (
+            patch.object(
+                bot,
+                "resume_all_active_subscriptions",
+                AsyncMock(return_value=3),
+            ) as resume_subscriptions,
+            patch.object(bot, "get_subscription_pause_until", AsyncMock(return_value=None)),
+            patch.object(bot, "count_subscription_digest", AsyncMock(return_value=0)),
+        ):
             await bot.button_handler(update, SimpleNamespace())
 
         resume_subscriptions.assert_awaited_once_with(1)
@@ -901,6 +920,29 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("settings_resume_subscriptions", paused_callbacks)
         self.assertNotIn("settings_pause_subscriptions", paused_callbacks)
 
+    def test_subscriptions_keyboard_shows_digest_action_only_when_queue_has_posts(self):
+        empty_callbacks = {
+            button.callback_data
+            for row in bot.get_subscriptions_keyboard(has_digest_posts=False).inline_keyboard
+            for button in row
+        }
+        queued_callbacks = {
+            button.callback_data
+            for row in bot.get_subscriptions_keyboard(has_digest_posts=True).inline_keyboard
+            for button in row
+        }
+
+        self.assertNotIn("sub_digest_send", empty_callbacks)
+        self.assertIn("sub_digest_send", queued_callbacks)
+
+    async def test_empty_digest_button_reports_that_queue_is_empty(self):
+        update, query = make_callback_update("sub_digest_send")
+
+        with patch.object(bot, "pop_subscription_digest", AsyncMock(return_value=[])):
+            await bot.button_handler(update, SimpleNamespace())
+
+        query.message.reply_text.assert_awaited_once_with("📨 Дайджест пока пуст.")
+
     def test_settings_keyboard_shows_current_values_and_interface_mode(self):
         keyboard = bot.get_settings_keyboard({
             "show_caption": False,
@@ -919,10 +961,17 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         bot.user_states[1] = "waiting_search"
         update, query = make_callback_update("cancel_input")
 
-        with patch.object(
-            bot,
-            "get_user_settings",
-            AsyncMock(return_value={"interface_mode": "simple"}),
+        with (
+            patch.object(
+                bot,
+                "get_user_settings",
+                AsyncMock(return_value={"interface_mode": "simple"}),
+            ),
+            patch.object(
+                bot,
+                "get_subscription_pause_until",
+                AsyncMock(return_value=None),
+            ),
         ):
             await bot.button_handler(update, SimpleNamespace())
 
