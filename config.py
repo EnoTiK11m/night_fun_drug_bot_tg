@@ -64,7 +64,7 @@ SUBSCRIPTION_MAX_POSTS_PER_USER_PASS = max(
 )
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 ADMIN_USER_IDS = _get_int_set_env("ADMIN_USER_IDS")
-ALLOWED_USER_IDS = _get_int_set_env("ALLOWED_USER_IDS") | ADMIN_USER_IDS
+ALLOWED_USER_IDS = _get_int_set_env("ALLOWED_USER_IDS")
 ALLOWED_CHAT_IDS = _get_int_set_env("ALLOWED_CHAT_IDS")
 ALLOW_GROUP_CHATS = _get_bool_env("ALLOW_GROUP_CHATS", False)
 TAG_TRANSLATION_ENABLED = _get_bool_env("TAG_TRANSLATION_ENABLED", True)
