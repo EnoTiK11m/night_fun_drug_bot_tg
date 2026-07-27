@@ -125,10 +125,12 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "send_post_media_to_chat", AsyncMock(return_value=True)),
             patch.object(bot, "update_subscription_time", AsyncMock(return_value=False)),
             patch.object(bot, "mark_post_sent", AsyncMock()) as mark_sent,
+            patch.object(bot, "release_subscription_claim", AsyncMock()) as release_claim,
         ):
             await bot.process_one_subscription(app, (1, "tag", 10, 0))
 
         mark_sent.assert_not_awaited()
+        release_claim.assert_awaited_once_with(1, "tag", "token")
 
     async def test_api_temporary_error_releases_claim_without_empty_backoff(self):
         app = SimpleNamespace(bot=object())
