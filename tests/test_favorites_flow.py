@@ -938,7 +938,11 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_digest_button_reports_that_queue_is_empty(self):
         update, query = make_callback_update("sub_digest_send")
 
-        with patch.object(bot, "pop_subscription_digest", AsyncMock(return_value=[])):
+        with patch.object(
+            bot,
+            "claim_subscription_digest",
+            AsyncMock(return_value=(None, [])),
+        ):
             await bot.button_handler(update, SimpleNamespace())
 
         query.message.reply_text.assert_awaited_once_with("📨 Дайджест пока пуст.")

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import shutil
 import unittest
@@ -24,6 +25,17 @@ class TempDatabaseTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class SubscriptionClaimTests(TempDatabaseTestCase):
+    async def test_concurrent_claims_have_exactly_one_winner(self):
+        self.assertTrue(await database.add_subscription(1, "tag", 10))
+
+        claims = await asyncio.gather(*(
+            database.claim_due_subscription(1, "tag")
+            for _ in range(8)
+        ))
+
+        winners = [token for token in claims if token is not None]
+        self.assertEqual(len(winners), 1)
+
     async def test_claim_blocks_second_claim_until_release(self):
         self.assertTrue(await database.add_subscription(1, "tag", 10))
 
@@ -74,6 +86,88 @@ class SubscriptionClaimTests(TempDatabaseTestCase):
         self.assertTrue(await database.update_subscription_time(1, "tag", token))
         self.assertIsNone(await database.claim_due_subscription(1, "tag"))
 
+    async def test_expired_claim_token_cannot_complete_reclaimed_subscription(self):
+        self.assertTrue(await database.add_subscription(1, "tag", 10))
+        expired_token = await database.claim_due_subscription(1, "tag")
+        self.assertIsNotNone(expired_token)
+
+        async with database.connect_db() as db:
+            await db.execute("""
+                UPDATE subscriptions
+                SET processing_until = datetime('now', '-1 minute')
+                WHERE user_id = ? AND query = ?
+            """, (1, "tag"))
+            await db.commit()
+
+        replacement_token = await database.claim_due_subscription(1, "tag")
+        self.assertIsNotNone(replacement_token)
+        self.assertNotEqual(expired_token, replacement_token)
+        self.assertFalse(
+            await database.update_subscription_time(1, "tag", expired_token)
+        )
+        self.assertTrue(
+            await database.update_subscription_time(1, "tag", replacement_token)
+        )
+
+    async def test_wrong_token_does_not_mark_subscription_empty_or_notify(self):
+        self.assertTrue(await database.add_subscription(1, "tag", 10))
+        token = await database.claim_due_subscription(1, "tag")
+        self.assertIsNotNone(token)
+
+        empty_count, backoff_minutes, should_notify = (
+            await database.mark_subscription_empty(1, "tag", "wrong-token")
+        )
+
+        self.assertEqual((empty_count, backoff_minutes, should_notify), (0, 0, False))
+        async with database.connect_db() as db:
+            cursor = await db.execute("""
+                SELECT no_new_posts_count, processing_token
+                FROM subscriptions WHERE user_id = ? AND query = ?
+            """, (1, "tag"))
+            row = await cursor.fetchone()
+        self.assertEqual(row, (0, token))
+
+    async def test_removed_and_readded_subscription_rejects_old_claim_token(self):
+        self.assertTrue(await database.add_subscription(1, "tag", 10))
+        old_token = await database.claim_due_subscription(1, "tag")
+        self.assertIsNotNone(old_token)
+        self.assertTrue(await database.remove_subscription(1, "tag"))
+        self.assertTrue(await database.add_subscription(1, "tag", 10))
+
+        self.assertFalse(
+            await database.update_subscription_time(1, "tag", old_token)
+        )
+        new_token = await database.claim_due_subscription(1, "tag")
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+
+    async def test_readding_existing_subscription_preserves_options_and_schedule(self):
+        self.assertTrue(await database.add_subscription(1, "tag", 10))
+        await database.update_subscription_options(1, "tag", {
+            "digest_mode": "digest",
+            "rating_filter": "s",
+        })
+        fixed_next_check = "2030-01-02 03:04:05"
+        async with database.connect_db() as db:
+            await db.execute("""
+                UPDATE subscriptions SET next_check_at = ?
+                WHERE user_id = ? AND query = ?
+            """, (fixed_next_check, 1, "tag"))
+            await db.commit()
+
+        self.assertTrue(await database.add_subscription(1, "tag", 30))
+
+        options = await database.get_subscription_options(1, "tag")
+        async with database.connect_db() as db:
+            cursor = await db.execute("""
+                SELECT interval_minutes, is_active, next_check_at
+                FROM subscriptions WHERE user_id = ? AND query = ?
+            """, (1, "tag"))
+            row = await cursor.fetchone()
+        self.assertEqual(options["digest_mode"], "digest")
+        self.assertEqual(options["rating_filter"], "s")
+        self.assertEqual(row, (30, 1, fixed_next_check))
+
     async def test_pause_all_active_subscriptions_defers_due_work(self):
         self.assertTrue(await database.add_subscription(1, "tag-a", 10))
         self.assertTrue(await database.add_subscription(1, "tag-b", 10))
@@ -101,6 +195,178 @@ class SubscriptionClaimTests(TempDatabaseTestCase):
         self.assertIsNone(await database.get_subscription_pause_until(1))
         due = await database.get_due_subscriptions()
         self.assertIn((1, "paused-new", 10, 0), due)
+
+
+class DigestClaimTests(TempDatabaseTestCase):
+    async def _enqueue_same_post_for_two_queries(self):
+        post = {"id": 42, "file_url": "https://example.test/42.jpg"}
+        for query in ("tag-b", "tag-a"):
+            self.assertTrue(await database.add_subscription(1, query, 10))
+            self.assertTrue(await database.enqueue_subscription_digest(1, query, post))
+        async with database.connect_db() as db:
+            await db.execute("""
+                UPDATE subscription_digest_queue
+                SET queued_at = '2026-01-01 00:00:00'
+                WHERE user_id = ?
+            """, (1,))
+            await db.commit()
+
+    async def test_claim_is_atomic_and_preserves_stable_query_post_identity(self):
+        await self._enqueue_same_post_for_two_queries()
+
+        claims = await asyncio.gather(
+            database.claim_subscription_digest(1, 10),
+            database.claim_subscription_digest(1, 10),
+        )
+
+        non_empty = [(token, posts) for token, posts in claims if token]
+        self.assertEqual(len(non_empty), 1)
+        _token, posts = non_empty[0]
+        self.assertEqual(
+            [post["digest_item_key"] for post in posts],
+            [("tag-a", 42), ("tag-b", 42)],
+        )
+
+    async def test_partial_finish_deletes_confirmed_item_and_releases_remainder(self):
+        await self._enqueue_same_post_for_two_queries()
+        token, posts = await database.claim_subscription_digest(1, 10)
+
+        delivered, released = await database.finish_subscription_digest_claim(
+            1, token, [posts[0]["digest_item_key"]]
+        )
+
+        self.assertEqual((delivered, released), (1, 1))
+        next_token, remaining = await database.claim_subscription_digest(1, 10)
+        self.assertIsNotNone(next_token)
+        expected_remaining = [
+            post["digest_item_key"] for post in posts[1:]
+        ]
+        self.assertEqual(
+            [post["digest_item_key"] for post in remaining],
+            expected_remaining,
+        )
+
+    async def test_finishing_three_of_ten_releases_other_seven_in_stable_order(self):
+        self.assertTrue(await database.add_subscription(1, "tag", 10))
+        for post_id in range(1, 11):
+            self.assertTrue(await database.enqueue_subscription_digest(
+                1,
+                "tag",
+                {"id": post_id, "file_url": f"https://example.test/{post_id}.jpg"},
+            ))
+        token, posts = await database.claim_subscription_digest(1, 10)
+        delivered_keys = [post["digest_item_key"] for post in posts[:3]]
+
+        self.assertEqual(
+            await database.finish_subscription_digest_claim(
+                1, token, delivered_keys
+            ),
+            (3, 7),
+        )
+        _next_token, remaining = await database.claim_subscription_digest(1, 10)
+        self.assertEqual(
+            [post["digest_item_key"] for post in remaining],
+            [("tag", post_id) for post_id in range(4, 11)],
+        )
+
+    async def test_wrong_claim_token_cannot_delete_or_release_items(self):
+        await self._enqueue_same_post_for_two_queries()
+        token, _posts = await database.claim_subscription_digest(1, 10)
+
+        self.assertEqual(
+            await database.finish_subscription_digest_claim(
+                1, "wrong-token", [("tag-a", 42)]
+            ),
+            (0, 0),
+        )
+        self.assertEqual(
+            await database.release_subscription_digest_claim(1, "wrong-token"),
+            0,
+        )
+        blocked_token, blocked_posts = await database.claim_subscription_digest(1, 10)
+        self.assertIsNone(blocked_token)
+        self.assertEqual(blocked_posts, [])
+        self.assertEqual(await database.release_subscription_digest_claim(1, token), 2)
+
+    async def test_expired_claim_can_be_reclaimed_and_old_token_cannot_ack(self):
+        await self._enqueue_same_post_for_two_queries()
+        old_token, _posts = await database.claim_subscription_digest(1, 10)
+        async with database.connect_db() as db:
+            await db.execute("""
+                UPDATE subscription_digest_queue
+                SET claim_until = datetime('now', '-1 minute')
+                WHERE user_id = ? AND claim_token = ?
+            """, (1, old_token))
+            await db.commit()
+
+        self.assertFalse(
+            await database.renew_subscription_digest_claim(1, old_token)
+        )
+        new_token, posts = await database.claim_subscription_digest(1, 10)
+
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertEqual(
+            await database.finish_subscription_digest_claim(
+                1, old_token, [posts[0]["digest_item_key"]]
+            ),
+            (0, 0),
+        )
+        self.assertEqual(
+            await database.release_subscription_digest_claim(1, old_token), 0
+        )
+        self.assertFalse(
+            await database.renew_subscription_digest_claim(1, old_token)
+        )
+        self.assertEqual(
+            await database.get_subscription_digest_claim_keys(1, new_token),
+            {("tag-a", 42), ("tag-b", 42)},
+        )
+        self.assertEqual(await database.count_subscription_digest(1), 2)
+
+    async def test_expired_digest_lease_cannot_be_renewed(self):
+        await self._enqueue_same_post_for_two_queries()
+        token, _posts = await database.claim_subscription_digest(1, 10)
+        async with database.connect_db() as db:
+            await db.execute("""
+                UPDATE subscription_digest_queue
+                SET claim_until = datetime('now', '-1 second')
+                WHERE user_id = ? AND claim_token = ?
+            """, (1, token))
+            await db.commit()
+
+        self.assertFalse(
+            await database.renew_subscription_digest_claim(1, token)
+        )
+
+    async def test_removing_subscription_removes_only_its_digest_items(self):
+        await self._enqueue_same_post_for_two_queries()
+
+        self.assertTrue(await database.remove_subscription(1, "tag-a"))
+
+        token, posts = await database.claim_subscription_digest(1, 10)
+        self.assertIsNotNone(token)
+        self.assertEqual(
+            [post["digest_item_key"] for post in posts],
+            [("tag-b", 42)],
+        )
+
+    async def test_renew_and_active_keys_are_guarded_by_claim_ownership(self):
+        await self._enqueue_same_post_for_two_queries()
+        token, _posts = await database.claim_subscription_digest(1, 10)
+
+        self.assertTrue(await database.renew_subscription_digest_claim(1, token))
+        self.assertEqual(
+            await database.get_subscription_digest_claim_keys(1, token),
+            {("tag-a", 42), ("tag-b", 42)},
+        )
+        self.assertFalse(
+            await database.renew_subscription_digest_claim(1, "wrong-token")
+        )
+        self.assertEqual(
+            await database.get_subscription_digest_claim_keys(1, "wrong-token"),
+            set(),
+        )
 
 
 class RetentionTests(TempDatabaseTestCase):

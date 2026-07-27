@@ -147,11 +147,18 @@ class FeatureDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await database.get_read_later(1))[0]["id"], 77)
         self.assertTrue(await database.remove_read_later(1, 77))
 
+        self.assertTrue(await database.add_subscription(1, "alpha", 10))
         self.assertTrue(await database.enqueue_subscription_digest(1, "alpha", post))
         self.assertEqual(await database.count_subscription_digest(1), 1)
-        digest = await database.pop_subscription_digest(1, 10)
+        token, digest = await database.claim_subscription_digest(1, 10)
         self.assertEqual(digest[0]["subscription_query"], "alpha")
-        self.assertEqual(await database.pop_subscription_digest(1, 10), [])
+        self.assertEqual(
+            await database.finish_subscription_digest_claim(
+                1, token, [digest[0]["digest_item_key"]]
+            ),
+            (1, 0),
+        )
+        self.assertEqual(await database.claim_subscription_digest(1, 10), (None, []))
         self.assertEqual(await database.count_subscription_digest(1), 0)
 
     async def test_favorite_profile_search_and_storage_stats(self):
@@ -291,12 +298,22 @@ class LegacyMigrationTests(unittest.IsolatedAsyncioTestCase):
                 PRIMARY KEY(user_id, query, post_id)
             )
         """)
+        connection.execute("""
+            CREATE TABLE subscription_digest_queue (
+                user_id INTEGER NOT NULL, query TEXT NOT NULL,
+                post_id INTEGER NOT NULL, post_json TEXT NOT NULL,
+                queued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, query, post_id)
+            )
+        """)
         connection.execute("INSERT INTO subscriptions (user_id, query) VALUES (1, 'keep')")
         connection.commit()
         connection.close()
         old_path = database.DB_PATH
         database.DB_PATH = path
         try:
+            await database.init_db()
+            # Migrations must be safe to run again on every application start.
             await database.init_db()
             async with database.connect_db() as db:
                 sub_columns = {
@@ -305,8 +322,29 @@ class LegacyMigrationTests(unittest.IsolatedAsyncioTestCase):
                 cache_columns = {
                     row[1] for row in await (await db.execute("PRAGMA table_info(subscription_cache)" )).fetchall()
                 }
-            self.assertTrue({"settings_json", "digest_mode"}.issubset(sub_columns))
+            self.assertTrue({
+                "settings_json",
+                "digest_mode",
+                "processing_until",
+                "processing_token",
+                "next_check_at",
+            }.issubset(sub_columns))
             self.assertTrue({"width", "height"}.issubset(cache_columns))
+            async with database.connect_db() as db:
+                digest_columns = {
+                    row[1] for row in await (
+                        await db.execute("PRAGMA table_info(subscription_digest_queue)")
+                    ).fetchall()
+                }
+                migration_versions = {
+                    row[0] for row in await (
+                        await db.execute("SELECT version FROM schema_migrations")
+                    ).fetchall()
+                }
+            self.assertTrue({
+                "claim_token", "claimed_at", "claim_until"
+            }.issubset(digest_columns))
+            self.assertIn(1, migration_versions)
             self.assertEqual((await database.get_all_user_subscriptions(1))[0][0], "keep")
         finally:
             database.DB_PATH = old_path

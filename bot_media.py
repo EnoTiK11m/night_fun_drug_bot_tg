@@ -6,7 +6,7 @@ import socket
 from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, TimedOut
 
 from bot_delivery import telegram_rate_limiter
 from bot_features import runtime_metrics
@@ -311,6 +311,7 @@ async def send_post_media(
     keyboard=None,
     retries: int = 2,
     has_spoiler: bool = False,
+    raise_on_timeout: bool = False,
 ):
     reply_markup = keyboard or get_subscription_image_keyboard(post.get("id", 0))
     candidates = get_media_url_candidates(post)
@@ -346,6 +347,8 @@ async def send_post_media(
                 if attempt == retries:
                     return False
             except Exception as exc:
+                if raise_on_timeout and isinstance(exc, TimedOut):
+                    raise
                 logger.warning(
                     "Media send failed post=%s url_kind=%s attempt=%s/%s: %s",
                     post.get("id"),
@@ -374,6 +377,8 @@ async def send_post_media(
                         if attempt == retries:
                             return False
                     except Exception as fallback_exc:
+                        if raise_on_timeout and isinstance(fallback_exc, TimedOut):
+                            raise
                         logger.warning(
                             "Media downloaded fallback failed post=%s url_kind=%s attempt=%s/%s: %s",
                             post.get("id"),
@@ -414,6 +419,7 @@ async def send_post_media_to_chat(
     keyboard=None,
     retries: int = 2,
     has_spoiler: bool = False,
+    raise_on_timeout: bool = False,
 ):
     reply_markup = keyboard or get_subscription_image_keyboard(post.get("id", 0))
     candidates = get_media_url_candidates(post)
@@ -457,6 +463,8 @@ async def send_post_media_to_chat(
                 if attempt == retries:
                     return False
             except Exception as exc:
+                if raise_on_timeout and isinstance(exc, TimedOut):
+                    raise
                 logger.warning(
                     "Subscription media send failed user=%s post=%s url_kind=%s attempt=%s/%s: %s",
                     chat_id,
@@ -485,6 +493,8 @@ async def send_post_media_to_chat(
                         if attempt == retries:
                             return False
                     except Exception as fallback_exc:
+                        if raise_on_timeout and isinstance(fallback_exc, TimedOut):
+                            raise
                         logger.warning(
                             "Subscription media downloaded fallback failed user=%s post=%s url_kind=%s attempt=%s/%s: %s",
                             chat_id,

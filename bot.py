@@ -10,6 +10,8 @@ import json
 import shutil
 import io
 import re
+from dataclasses import dataclass, field
+from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse
 
@@ -34,7 +36,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, RetryAfter, TimedOut
 from config import (
     ALLOW_GROUP_CHATS,
     ALLOWED_CHAT_IDS,
@@ -206,7 +208,11 @@ from database import (
     remove_read_later,
     enqueue_subscription_digest,
     count_subscription_digest,
-    pop_subscription_digest,
+    claim_subscription_digest,
+    finish_subscription_digest_claim,
+    release_subscription_digest_claim,
+    renew_subscription_digest_claim,
+    get_subscription_digest_claim_keys,
     get_due_digest_users,
     get_favorite_tag_profile,
     search_favorites,
@@ -299,6 +305,18 @@ user_states = {}
 search_builders: dict[int, dict] = {}
 pending_preset_queries: dict[int, str] = {}
 pending_bulk_posts: dict[int, list[int]] = {}
+
+
+@dataclass
+class DigestSubscriptionLockEntry:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    references: int = 0
+
+
+DigestSubscriptionLockHandle = tuple[tuple[int, str], DigestSubscriptionLockEntry]
+digest_subscription_locks: dict[
+    tuple[int, str], DigestSubscriptionLockEntry
+] = {}
 pending_subscription_options: dict[int, str] = {}
 # Глобальная задача для подписок
 subscription_task = None
@@ -1177,13 +1195,58 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "sub_digest_send":
-        posts = await pop_subscription_digest(user_id, 10)
-        delivered = await send_digest_posts(query.message, user_id, posts)
-        if posts and not delivered:
-            for post in posts:
-                await enqueue_subscription_digest(
-                    user_id, post.get("subscription_query", "digest"), post
+        claim_token, posts = await claim_subscription_digest(user_id, 10)
+        if not claim_token:
+            await query.message.reply_text("📨 Дайджест пока пуст.")
+        else:
+            claim_open = True
+            locks: list[DigestSubscriptionLockHandle] = []
+            lease: DigestClaimLease | None = None
+            try:
+                locks = await acquire_digest_subscription_locks(user_id, posts)
+                active_keys = await get_subscription_digest_claim_keys(
+                    user_id, claim_token
                 )
+                posts = [post for post in posts if digest_item_key(post) in active_keys]
+                lease = DigestClaimLease(user_id, claim_token)
+                if not posts or not await lease.start():
+                    await cancellation_safe_digest_finish(user_id, claim_token, [])
+                    claim_open = False
+                    await query.message.reply_text("📨 Дайджест пока пуст.")
+                    return
+                delivery = await send_digest_posts(
+                    query.message, user_id, posts, lease=lease
+                )
+                await cancellation_safe_digest_finish(
+                    user_id, claim_token, delivery.delivered_ids
+                )
+                claim_open = False
+                total = len(posts)
+                delivered_count = len(delivery.delivered_ids)
+                logger.info(
+                    "Manual digest result user=%s delivered=%s failed=%s ambiguous=%s",
+                    user_id,
+                    delivered_count,
+                    len(delivery.failed_ids),
+                    len(delivery.ambiguous_ids),
+                )
+                if delivered_count < total:
+                    await query.message.reply_text(
+                        f"⚠️ Доставлено {delivered_count} из {total} постов. "
+                        "Остальные будут повторены позже."
+                    )
+            except DigestDeliveryCancelled as exc:
+                await cancellation_safe_digest_finish(
+                    user_id, claim_token, exc.result.delivered_ids
+                )
+                claim_open = False
+                raise
+            finally:
+                if lease is not None:
+                    await lease.stop()
+                if claim_open:
+                    await cancellation_safe_digest_release(user_id, claim_token)
+                release_digest_subscription_locks(locks)
 
     elif data.startswith("sub_options_"):
         sub_query = get_callback_payload("sub_options", data)
@@ -1913,7 +1976,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not sub_query:
             await query.edit_message_text("❌ Подтверждение устарело.")
             return
-        success = await remove_subscription(user_id, sub_query)
+        async with digest_subscription_lock(user_id, sub_query):
+            success = await remove_subscription(user_id, sub_query)
 
         if success:
             await query.edit_message_text(
@@ -2526,7 +2590,8 @@ async def send_image(
 
 
 async def send_post_media(
-    message, post: dict, caption: str = "", keyboard=None, settings: dict | None = None
+    message, post: dict, caption: str = "", keyboard=None, settings: dict | None = None,
+    raise_on_timeout: bool = False,
 ):
     if settings:
         post = prepare_post_quality(post, normalize_feature_settings(settings))
@@ -2537,12 +2602,13 @@ async def send_post_media(
         keyboard,
         retries=MEDIA_SEND_RETRIES,
         has_spoiler=should_spoiler(settings, post),
+        raise_on_timeout=raise_on_timeout,
     )
 
 
 async def send_post_media_to_chat(
     bot, chat_id: int, post: dict, caption: str = "", keyboard=None,
-    settings: dict | None = None,
+    settings: dict | None = None, raise_on_timeout: bool = False,
 ):
     if settings:
         post = prepare_post_quality(post, normalize_feature_settings(settings))
@@ -2554,6 +2620,7 @@ async def send_post_media_to_chat(
         keyboard,
         retries=MEDIA_SEND_RETRIES,
         has_spoiler=should_spoiler(settings, post),
+        raise_on_timeout=raise_on_timeout,
     )
 
 
@@ -3555,59 +3622,339 @@ async def show_subscription_options(message, user_id: int, sub_query: str):
     )
 
 
-async def send_digest_posts(message, user_id: int, posts: list[dict]) -> bool:
+DigestItemKey = tuple[str, int]
+
+
+@dataclass
+class DigestDeliveryResult:
+    delivered_ids: list[DigestItemKey] = field(default_factory=list)
+    failed_ids: list[DigestItemKey] = field(default_factory=list)
+    ambiguous_ids: list[DigestItemKey] = field(default_factory=list)
+
+    def add(self, bucket: str, keys) -> None:
+        target = getattr(self, bucket)
+        for key in keys:
+            if key not in target:
+                target.append(key)
+
+
+class DigestDeliveryCancelled(asyncio.CancelledError):
+    def __init__(self, result: DigestDeliveryResult):
+        super().__init__("Digest delivery cancelled")
+        self.result = result
+
+
+class DigestClaimLease:
+    """Keeps a claimed batch alive and stops delivery if ownership is lost."""
+
+    HEARTBEAT_SECONDS = 60
+
+    def __init__(self, user_id: int, claim_token: str):
+        self.user_id = user_id
+        self.claim_token = claim_token
+        self.lost = False
+        self._task: asyncio.Task | None = None
+
+    async def start(self) -> bool:
+        if not await self.ensure_owned():
+            return False
+        self._task = asyncio.create_task(self._heartbeat())
+        return True
+
+    async def ensure_owned(self) -> bool:
+        if self.lost:
+            return False
+        try:
+            owned = await renew_subscription_digest_claim(
+                self.user_id, self.claim_token
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Failed to renew digest claim user=%s", self.user_id
+            )
+            owned = False
+        self.lost = not owned
+        return owned
+
+    async def _heartbeat(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self.HEARTBEAT_SECONDS)
+                if not await self.ensure_owned():
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        self._task = None
+
+
+def reserve_digest_subscription_lock(
+    user_id: int, query: str
+) -> DigestSubscriptionLockHandle:
+    key = (user_id, query)
+    entry = digest_subscription_locks.get(key)
+    if entry is None:
+        entry = DigestSubscriptionLockEntry()
+        digest_subscription_locks[key] = entry
+    entry.references += 1
+    return key, entry
+
+
+def unreserve_digest_subscription_lock(
+    handle: DigestSubscriptionLockHandle,
+) -> None:
+    key, entry = handle
+    entry.references -= 1
+    if entry.references == 0 and digest_subscription_locks.get(key) is entry:
+        del digest_subscription_locks[key]
+
+
+@asynccontextmanager
+async def digest_subscription_lock(user_id: int, query: str):
+    handle = reserve_digest_subscription_lock(user_id, query)
+    entry = handle[1]
+    acquired = False
+    try:
+        await entry.lock.acquire()
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            entry.lock.release()
+        unreserve_digest_subscription_lock(handle)
+
+
+async def acquire_digest_subscription_locks(
+    user_id: int, posts: list[dict]
+) -> list[DigestSubscriptionLockHandle]:
+    handles = [
+        reserve_digest_subscription_lock(user_id, query)
+        for query in sorted({digest_item_key(post)[0] for post in posts})
+    ]
+    acquired: list[DigestSubscriptionLockHandle] = []
+    try:
+        for handle in handles:
+            await handle[1].lock.acquire()
+            acquired.append(handle)
+        return handles
+    except BaseException:
+        for handle in reversed(acquired):
+            handle[1].lock.release()
+        for handle in handles:
+            unreserve_digest_subscription_lock(handle)
+        raise
+
+
+def release_digest_subscription_locks(
+    handles: list[DigestSubscriptionLockHandle],
+) -> None:
+    for handle in reversed(handles):
+        handle[1].lock.release()
+    for handle in handles:
+        unreserve_digest_subscription_lock(handle)
+
+
+def digest_item_key(post: dict) -> DigestItemKey:
+    stored = post.get("digest_item_key")
+    if isinstance(stored, (tuple, list)) and len(stored) == 2:
+        return str(stored[0]), int(stored[1])
+    return str(post.get("subscription_query", "digest")), int(post.get("id") or 0)
+
+
+def partition_digest_posts(posts: list[dict], settings: dict) -> tuple[list[dict], list[dict]]:
+    album_posts = prepare_gallery_album_posts(posts, settings, 10)
+    album_keys = {digest_item_key(post) for post in album_posts}
+    standalone_posts = [post for post in posts[:10] if digest_item_key(post) not in album_keys]
+    return album_posts, standalone_posts
+
+
+async def send_digest_posts(
+    message, user_id: int, posts: list[dict], lease: DigestClaimLease | None = None
+) -> DigestDeliveryResult:
+    result = DigestDeliveryResult()
     if not posts:
         await message.reply_text("📨 Дайджест пока пуст.")
-        return False
+        return result
     settings = normalize_feature_settings(await get_user_settings(user_id))
-    prepared = prepare_gallery_album_posts(posts, settings, 10)
-    if len(prepared) > 1:
+    album_posts, standalone_posts = partition_digest_posts(posts, settings)
+    sequential_posts = list(standalone_posts)
+    in_flight: list[DigestItemKey] = []
+    if len(album_posts) > 1:
         media = []
-        for index, post in enumerate(prepared):
+        for index, post in enumerate(album_posts):
             caption = "📨 Дайджест подписок" if index == 0 else ""
             media.append(media_from_post(post, caption, should_spoiler(settings, post)))
+        album_item_keys = [digest_item_key(post) for post in album_posts]
+        if lease is not None and not await lease.ensure_owned():
+            result.add("failed_ids", album_item_keys)
+            result.add("failed_ids", [digest_item_key(post) for post in standalone_posts])
+            return result
+        in_flight = album_item_keys
         try:
             await message.reply_media_group(media=media)
-            return True
+            result.add("delivered_ids", in_flight)
+            in_flight = []
+        except TimedOut:
+            result.add("ambiguous_ids", in_flight)
+            in_flight = []
+        except RetryAfter as exc:
+            telegram_rate_limiter.apply_retry_after(user_id, exc)
+            result.add("failed_ids", in_flight)
+            result.add("failed_ids", [digest_item_key(post) for post in standalone_posts])
+            return result
+        except asyncio.CancelledError as exc:
+            result.add("ambiguous_ids", in_flight)
+            raise DigestDeliveryCancelled(result) from exc
         except Exception as exc:
             logger.warning("Digest album failed, using sequential delivery: %s", exc)
-    delivered = False
-    for post in prepared or posts[:10]:
-        delivered = await send_post_media(message, post, settings=settings) or delivered
-    return delivered
+            sequential_posts = album_posts + standalone_posts
+            in_flight = []
+    elif album_posts:
+        sequential_posts = album_posts + standalone_posts
+
+    try:
+        for index, post in enumerate(sequential_posts):
+            key = digest_item_key(post)
+            if lease is not None and not await lease.ensure_owned():
+                result.add("failed_ids", [
+                    digest_item_key(item) for item in sequential_posts[index:]
+                ])
+                return result
+            in_flight = [key]
+            try:
+                delivered = await send_post_media(
+                    message,
+                    post,
+                    caption="📨 Дайджест подписок" if index == 0 else "",
+                    settings=settings,
+                    raise_on_timeout=True,
+                )
+            except TimedOut:
+                result.add("ambiguous_ids", [key])
+            else:
+                result.add("delivered_ids" if delivered else "failed_ids", [key])
+            in_flight = []
+    except asyncio.CancelledError as exc:
+        result.add("ambiguous_ids", in_flight)
+        raise DigestDeliveryCancelled(result) from exc
+    return result
 
 
-async def send_digest_to_chat(bot, user_id: int, posts: list[dict]) -> bool:
+async def send_digest_to_chat(
+    bot, user_id: int, posts: list[dict], lease: DigestClaimLease | None = None
+) -> DigestDeliveryResult:
+    result = DigestDeliveryResult()
     if not posts:
-        return False
+        return result
     settings = normalize_feature_settings(await get_user_settings(user_id))
-    prepared = prepare_gallery_album_posts(posts, settings, 10)
-    if len(prepared) > 1:
+    album_posts, standalone_posts = partition_digest_posts(posts, settings)
+    sequential_posts = list(standalone_posts)
+    in_flight: list[DigestItemKey] = []
+    if len(album_posts) > 1:
         media = [
             media_from_post(
                 post,
                 "📨 Дайджест подписок" if index == 0 else "",
                 should_spoiler(settings, post),
             )
-            for index, post in enumerate(prepared)
+            for index, post in enumerate(album_posts)
         ]
+        album_item_keys = [digest_item_key(post) for post in album_posts]
         try:
+            if lease is not None and not await lease.ensure_owned():
+                result.add("failed_ids", album_item_keys)
+                result.add("failed_ids", [digest_item_key(post) for post in standalone_posts])
+                return result
             await telegram_rate_limiter.wait_for_slot(user_id)
+            if lease is not None and not await lease.ensure_owned():
+                result.add("failed_ids", album_item_keys)
+                result.add("failed_ids", [digest_item_key(post) for post in standalone_posts])
+                return result
+            in_flight = album_item_keys
             await bot.send_media_group(chat_id=user_id, media=media)
-            return True
+            result.add("delivered_ids", in_flight)
+            in_flight = []
+        except TimedOut:
+            result.add("ambiguous_ids", in_flight)
+            in_flight = []
         except RetryAfter as exc:
             telegram_rate_limiter.apply_retry_after(user_id, exc)
+            result.add("failed_ids", in_flight)
+            result.add("failed_ids", [digest_item_key(post) for post in standalone_posts])
+            return result
+        except asyncio.CancelledError as exc:
+            if in_flight:
+                result.add("ambiguous_ids", in_flight)
+            else:
+                result.add("failed_ids", album_item_keys)
+            raise DigestDeliveryCancelled(result) from exc
         except Exception as exc:
             logger.warning("Scheduled digest album failed, using sequential delivery: %s", exc)
-    delivered = 0
-    for index, post in enumerate(posts[:10]):
-        caption = "📨 Дайджест подписок" if index == 0 else ""
-        delivered += bool(
-            await send_post_media_to_chat(
-                bot, user_id, post, caption=caption, settings=settings
-            )
-        )
-    return delivered > 0
+            sequential_posts = album_posts + standalone_posts
+            in_flight = []
+    elif album_posts:
+        sequential_posts = album_posts + standalone_posts
+
+    try:
+        for index, post in enumerate(sequential_posts):
+            key = digest_item_key(post)
+            if lease is not None and not await lease.ensure_owned():
+                result.add("failed_ids", [
+                    digest_item_key(item) for item in sequential_posts[index:]
+                ])
+                return result
+            in_flight = [key]
+            try:
+                delivered = await send_post_media_to_chat(
+                    bot,
+                    user_id,
+                    post,
+                    caption="📨 Дайджест подписок" if index == 0 else "",
+                    settings=settings,
+                    raise_on_timeout=True,
+                )
+            except TimedOut:
+                result.add("ambiguous_ids", [key])
+            else:
+                result.add("delivered_ids" if delivered else "failed_ids", [key])
+            in_flight = []
+    except asyncio.CancelledError as exc:
+        result.add("ambiguous_ids", in_flight)
+        raise DigestDeliveryCancelled(result) from exc
+    return result
+
+
+async def _cancellation_safe_db_call(coroutine):
+    cleanup_task = asyncio.create_task(coroutine)
+    try:
+        return await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        await cleanup_task
+        raise
+
+
+async def cancellation_safe_digest_finish(
+    user_id: int, claim_token: str, delivered_ids
+):
+    return await _cancellation_safe_db_call(
+        finish_subscription_digest_claim(user_id, claim_token, delivered_ids)
+    )
+
+
+async def cancellation_safe_digest_release(user_id: int, claim_token: str):
+    return await _cancellation_safe_db_call(
+        release_subscription_digest_claim(user_id, claim_token)
+    )
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4342,6 +4689,7 @@ async def process_one_subscription(app, subscription):
 
     result = None
     caption = ""
+    claim_completed = False
     try:
         logger.info("Отправляем подписку пользователю %s: %s", user_id, query)
 
@@ -4366,6 +4714,7 @@ async def process_one_subscription(app, subscription):
             if subscription_options.get("digest_mode") == "digest":
                 queued = await enqueue_subscription_digest(user_id, query, result)
                 updated = await update_subscription_time(user_id, query, processing_token)
+                claim_completed = bool(updated)
                 if updated and post_id:
                     await mark_post_sent(user_id, int(post_id))
                 runtime_metrics.increment("subscription_digest_queued", int(queued))
@@ -4386,6 +4735,7 @@ async def process_one_subscription(app, subscription):
             if delivered:
                 runtime_metrics.increment("subscription_delivered")
                 updated = await update_subscription_time(user_id, query, processing_token)
+                claim_completed = bool(updated)
                 if updated and post_id:
                     await mark_post_sent(user_id, int(post_id))
                 elif not updated:
@@ -4397,12 +4747,12 @@ async def process_one_subscription(app, subscription):
             else:
                 runtime_metrics.increment("subscription_failed")
                 await save_delivery_failure(user_id, result, caption)
-                await release_subscription_claim(user_id, query, processing_token)
             return bool(delivered)
 
         empty_count, backoff_minutes, should_notify = await mark_subscription_empty(
             user_id, query, processing_token
         )
+        claim_completed = backoff_minutes > 0
         logger.info(
             "No new post for subscription user=%s query=%r; empty_count=%s backoff=%s",
             user_id,
@@ -4425,7 +4775,6 @@ async def process_one_subscription(app, subscription):
         return False
 
     except APITemporaryError as e:
-        await release_subscription_claim(user_id, query, processing_token)
         await note_upstream_failure(app, str(e))
         logger.warning(
             "Temporary Rule34 API error for subscription user=%s query=%r: %s",
@@ -4439,9 +4788,13 @@ async def process_one_subscription(app, subscription):
             await save_delivery_failure(
                 user_id, result, caption, error=f"{type(exc).__name__}: {exc}"
             )
-        await release_subscription_claim(user_id, query, processing_token)
         logger.exception("Subscription processing error for user %s", user_id)
         return False
+    finally:
+        if not claim_completed:
+            await _cancellation_safe_db_call(
+                release_subscription_claim(user_id, query, processing_token)
+            )
 
 
 async def get_subscription_cached_image(
@@ -4534,12 +4887,60 @@ async def process_subscriptions(app):
                 for subscriptions in subscriptions_by_user.values()
             ))
             for digest_user_id in await get_due_digest_users():
-                digest_posts = await pop_subscription_digest(digest_user_id, 10)
-                if not await send_digest_to_chat(app.bot, digest_user_id, digest_posts):
-                    for post in digest_posts:
-                        await enqueue_subscription_digest(
-                            digest_user_id, post.get("subscription_query", "digest"), post
+                claim_token, digest_posts = await claim_subscription_digest(
+                    digest_user_id, 10
+                )
+                if not claim_token:
+                    continue
+                claim_open = True
+                locks: list[DigestSubscriptionLockHandle] = []
+                lease: DigestClaimLease | None = None
+                try:
+                    locks = await acquire_digest_subscription_locks(
+                        digest_user_id, digest_posts
+                    )
+                    active_keys = await get_subscription_digest_claim_keys(
+                        digest_user_id, claim_token
+                    )
+                    digest_posts = [
+                        post for post in digest_posts
+                        if digest_item_key(post) in active_keys
+                    ]
+                    lease = DigestClaimLease(digest_user_id, claim_token)
+                    if not digest_posts or not await lease.start():
+                        await cancellation_safe_digest_finish(
+                            digest_user_id, claim_token, []
                         )
+                        claim_open = False
+                        continue
+                    delivery = await send_digest_to_chat(
+                        app.bot, digest_user_id, digest_posts, lease=lease
+                    )
+                    await cancellation_safe_digest_finish(
+                        digest_user_id, claim_token, delivery.delivered_ids
+                    )
+                    claim_open = False
+                    logger.info(
+                        "Scheduled digest result user=%s delivered=%s failed=%s ambiguous=%s",
+                        digest_user_id,
+                        len(delivery.delivered_ids),
+                        len(delivery.failed_ids),
+                        len(delivery.ambiguous_ids),
+                    )
+                except DigestDeliveryCancelled as exc:
+                    await cancellation_safe_digest_finish(
+                        digest_user_id, claim_token, exc.result.delivered_ids
+                    )
+                    claim_open = False
+                    raise
+                finally:
+                    if lease is not None:
+                        await lease.stop()
+                    if claim_open:
+                        await cancellation_safe_digest_release(
+                            digest_user_id, claim_token
+                        )
+                    release_digest_subscription_locks(locks)
             logger.info(
                 "Subscription pass complete users=%s due=%s",
                 len(subscriptions_by_user),
