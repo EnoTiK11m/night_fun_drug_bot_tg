@@ -119,6 +119,15 @@ from bot_media import (
     send_text_to_chat,
 )
 from bot_delivery import telegram_rate_limiter
+from project_update import (
+    UpdateCommandError,
+    check_for_updates,
+    get_version_info,
+    notify_update_marker,
+    perform_update,
+    update_operation_lock,
+    write_update_marker,
+)
 from bot_state import (
     get_callback_payload,
     get_callback_payload_by_token,
@@ -4541,7 +4550,11 @@ async def retry_failed_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-async def request_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def request_restart(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    response_text: str | None = "♻️ Перезапускаюсь...",
+):
     global restart_requested
 
     user_id = update.effective_user.id
@@ -4551,7 +4564,8 @@ async def request_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     restart_requested = True
-    await update.message.reply_text("♻️ Перезапускаюсь...")
+    if response_text:
+        await update.message.reply_text(response_text)
     logger.warning("Restart requested by admin user=%s", user_id)
     context.application.stop_running()
 
@@ -4559,6 +4573,167 @@ async def request_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only command to restart the bot via the launcher."""
     await request_restart(update, context)
+
+
+def is_private_admin_command(update: Update) -> bool:
+    return bool(
+        update.effective_user
+        and update.effective_user.id in ADMIN_USER_IDS
+        and update.effective_chat
+        and update.effective_chat.type == "private"
+    )
+
+
+async def _reject_non_private_admin(update: Update) -> bool:
+    if is_private_admin_command(update):
+        return False
+    await update.message.reply_text("❌ Команда доступна только администратору в личном чате.")
+    return True
+
+
+async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _reject_non_private_admin(update):
+        return
+    try:
+        info = await get_version_info()
+    except UpdateCommandError as exc:
+        logger.warning(
+            "Version command failed admin=%s stage=%s rc=%s timeout=%s",
+            update.effective_user.id,
+            exc.stage,
+            exc.returncode,
+            exc.timed_out,
+        )
+        await update.message.reply_text("❌ Не удалось определить версию проекта.")
+        return
+    await update.message.reply_text(
+        "🔎 Версия проекта\n"
+        f"Commit: {info.commit[:12]}\n"
+        f"Branch: {info.branch[:128]}\n"
+        f"Дата: {info.commit_date[:64]}\n"
+        f"Локальные изменения: {'есть' if info.dirty else 'нет'}"
+    )
+
+
+async def update_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _reject_non_private_admin(update):
+        return
+    admin_id = update.effective_user.id
+    logger.info("Update check started admin=%s", admin_id)
+    try:
+        result = await check_for_updates()
+    except (UpdateCommandError, ValueError) as exc:
+        stage = exc.stage if isinstance(exc, UpdateCommandError) else "configuration"
+        returncode = exc.returncode if isinstance(exc, UpdateCommandError) else None
+        logger.warning(
+            "Update check failed admin=%s stage=%s rc=%s",
+            admin_id,
+            stage,
+            returncode,
+        )
+        await update.message.reply_text("❌ Не удалось проверить обновления.")
+        return
+    if result.current_commit == result.remote_commit:
+        text = "✅ Уже установлена последняя версия."
+    else:
+        text = (
+            f"⬆️ Доступно коммитов: {result.commits_behind}\n"
+            f"Текущий: {result.current_commit[:12]}\n"
+            f"Удалённый: {result.remote_commit[:12]}"
+        )
+    await update.message.reply_text(text)
+    logger.info("Update check completed admin=%s behind=%s", admin_id, result.commits_behind)
+
+
+def _update_error_text(result) -> str:
+    if result.timed_out:
+        text = f"❌ Обновление остановлено: превышен timeout на этапе {result.stage}."
+    else:
+        labels = {
+            "work_tree": "проверки репозитория",
+            "status": "проверки рабочей копии",
+            "fetch": "получения данных из GitHub",
+            "local_commit": "определения текущей версии",
+            "remote_commit": "определения удалённой версии",
+            "backup": "резервного копирования базы данных",
+            "pull": "fast-forward обновления",
+            "new_commit": "проверки новой версии",
+            "dependency_diff": "проверки зависимостей",
+            "dependencies": "установки зависимостей",
+            "compile": "компиляции новой версии",
+            "imports": "проверки импортов новой версии",
+        }
+        text = f"❌ Обновление остановлено на этапе {labels.get(result.stage, 'проверки')}."
+    if result.old_commit and result.new_commit:
+        text += (
+            f"\nБыло: {result.old_commit[:12]}"
+            f"\nСтало: {result.new_commit[:12]}"
+        )
+    return text
+
+
+async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _reject_non_private_admin(update):
+        return
+    if update_operation_lock.locked():
+        await update.message.reply_text("⏳ Обновление уже выполняется.")
+        return
+
+    admin_id = update.effective_user.id
+    await update_operation_lock.acquire()
+    started = time.monotonic()
+    logger.warning("Project update started admin=%s", admin_id)
+    try:
+        result = await perform_update()
+        if result.status == "dirty":
+            logger.warning(
+                "Project update blocked by dirty tree admin=%s files=%s",
+                admin_id,
+                len(result.changed_files),
+            )
+            paths = "\n".join(f"• {path[:200]}" for path in result.changed_files[:20])
+            suffix = "\n…" if len(result.changed_files) > 20 else ""
+            await update.message.reply_text(
+                "❌ Обновление отменено: рабочая копия содержит изменения.\n"
+                f"{paths}{suffix}"
+            )
+            return
+        if result.status == "current":
+            logger.info("Project update already current admin=%s", admin_id)
+            await update.message.reply_text("✅ Уже установлена последняя версия.")
+            return
+        if result.status != "updated":
+            logger.warning(
+                "Project update result admin=%s stage=%s rc=%s timeout=%s",
+                admin_id,
+                result.stage,
+                result.returncode,
+                result.timed_out,
+            )
+            await update.message.reply_text(_update_error_text(result))
+            return
+
+        write_update_marker(admin_id, result.new_commit)
+        await update.message.reply_text(
+            "✅ Обновление установлено.\n"
+            f"Было: {result.old_commit[:12]}\n"
+            f"Стало: {result.new_commit[:12]}\n"
+            "Перезапускаюсь…"
+        )
+        await request_restart(update, context, response_text=None)
+    except asyncio.CancelledError:
+        logger.warning("Project update cancelled admin=%s", admin_id)
+        raise
+    except Exception:
+        logger.exception("Project update handler failed admin=%s", admin_id)
+        await update.message.reply_text("❌ Не удалось завершить обновление.")
+    finally:
+        update_operation_lock.release()
+        logger.warning(
+            "Project update finished admin=%s elapsed=%.2fs",
+            admin_id,
+            time.monotonic() - started,
+        )
 
 
 async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5009,6 +5184,7 @@ async def post_init(application):
 
     """Инициализация после запуска"""
     await init_db()
+    await notify_update_marker(bot)
 
     # Запускаем фоновую задачу для подписок
     if subscription_task is None or subscription_task.done():
@@ -5111,6 +5287,9 @@ def main():
     application.add_handler(CommandHandler("whyblocked", require_access(whyblocked_command)))
     application.add_handler(CommandHandler("settings", require_access(settings_command)))
     application.add_handler(CommandHandler("restart", require_access(restart_command)))
+    application.add_handler(CommandHandler("update", require_access(update_command)))
+    application.add_handler(CommandHandler("update_check", require_access(update_check_command)))
+    application.add_handler(CommandHandler("version", require_access(version_command)))
     application.add_handler(CommandHandler("health", require_access(health_command)))
     application.add_handler(CommandHandler("adminstats", require_access(admin_stats_command)))
     application.add_handler(CommandHandler("retry_failed", require_access(retry_failed_command)))

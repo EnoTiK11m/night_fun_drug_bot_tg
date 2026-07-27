@@ -68,6 +68,14 @@ ALLOWED_USER_IDS = _get_int_set_env("ALLOWED_USER_IDS")
 ALLOWED_CHAT_IDS = _get_int_set_env("ALLOWED_CHAT_IDS")
 ALLOW_GROUP_CHATS = _get_bool_env("ALLOW_GROUP_CHATS", False)
 TAG_TRANSLATION_ENABLED = _get_bool_env("TAG_TRANSLATION_ENABLED", True)
+GIT_UPDATE_REMOTE = os.getenv("GIT_UPDATE_REMOTE", "origin").strip() or "origin"
+GIT_UPDATE_BRANCH = os.getenv("GIT_UPDATE_BRANCH", "main").strip() or "main"
+GIT_UPDATE_COMMAND_TIMEOUT_SECONDS = max(
+    5, _get_int_env("GIT_UPDATE_COMMAND_TIMEOUT_SECONDS", 60)
+)
+GIT_UPDATE_PIP_TIMEOUT_SECONDS = max(
+    30, _get_int_env("GIT_UPDATE_PIP_TIMEOUT_SECONDS", 300)
+)
 
 # Temporarily simplified blacklist for testing
 DEFAULT_BLACKLIST = {
