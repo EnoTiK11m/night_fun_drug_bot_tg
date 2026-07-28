@@ -18,6 +18,17 @@ def _get_int_env(name: str, default: int) -> int:
         return default
 
 
+def _get_float_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError:
+        _CONFIG_ERRORS.append(f"{name} must be a number")
+        return default
+
+
 def _get_int_set_env(name: str) -> set[int]:
     raw_value = os.getenv(name, "")
     values: set[int] = set()
@@ -111,6 +122,21 @@ USER_STATE_TTL_MINUTES = max(
 )
 USER_STATE_CLEANUP_INTERVAL_SECONDS = max(
     30, min(86_400, _get_int_env("USER_STATE_CLEANUP_INTERVAL_SECONDS", 300))
+)
+TELEGRAM_GLOBAL_REQUESTS_PER_SECOND = max(
+    1.0, min(30.0, _get_float_env("TELEGRAM_GLOBAL_REQUESTS_PER_SECOND", 20.0))
+)
+TELEGRAM_PER_CHAT_REQUESTS_PER_SECOND = max(
+    0.1, min(10.0, _get_float_env("TELEGRAM_PER_CHAT_REQUESTS_PER_SECOND", 0.75))
+)
+TELEGRAM_RATE_LIMIT_BURST = max(
+    1, min(20, _get_int_env("TELEGRAM_RATE_LIMIT_BURST", 3))
+)
+TELEGRAM_RATE_LIMIT_STATE_TTL_SECONDS = max(
+    30, min(86_400, _get_int_env("TELEGRAM_RATE_LIMIT_STATE_TTL_SECONDS", 900))
+)
+TELEGRAM_MAX_RETRY_AFTER_ATTEMPTS = max(
+    0, min(10, _get_int_env("TELEGRAM_MAX_RETRY_AFTER_ATTEMPTS", 2))
 )
 GLOBAL_DOWNLOAD_CONCURRENCY = max(
     1, min(32, _get_int_env("GLOBAL_DOWNLOAD_CONCURRENCY", 4))

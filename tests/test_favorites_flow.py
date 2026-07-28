@@ -28,6 +28,7 @@ def make_callback_update(data: str, user_id: int = 1):
 
 class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        bot.telegram_rate_limiter.reset()
         self.tempdir = f"test_payloads_{uuid.uuid4().hex}"
         os.makedirs(self.tempdir)
         self.old_payload_db_path = bot_state.DB_PATH
@@ -36,6 +37,7 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         bot.recent_posts.clear()
 
     def tearDown(self):
+        bot.telegram_rate_limiter.reset()
         bot_state.callback_payloads.clear()
         bot_state.DB_PATH = self.old_payload_db_path
         shutil.rmtree(self.tempdir, ignore_errors=True)

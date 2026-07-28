@@ -38,6 +38,7 @@ class FakeRateLimiter:
     def __init__(self):
         self.wait_calls = []
         self.retry_calls = []
+        self.execute_calls = []
 
     async def wait_for_slot(self, user_id):
         self.wait_calls.append(user_id)
@@ -46,6 +47,35 @@ class FakeRateLimiter:
     def apply_retry_after(self, user_id, error):
         self.retry_calls.append((user_id, error))
         return 0.0
+
+    async def execute(
+        self,
+        operation,
+        *,
+        operation_name,
+        chat_id,
+        safe_to_retry_timeout=False,
+        ambiguous_bad_request_policy=None,
+        max_retry_after_attempts=None,
+    ):
+        self.execute_calls.append(
+            (operation_name, chat_id, safe_to_retry_timeout, ambiguous_bad_request_policy)
+        )
+        retry_limit = 2 if max_retry_after_attempts is None else max_retry_after_attempts
+        timeout_attempts = 0
+        for attempt in range(retry_limit + 1):
+            await self.wait_for_slot(chat_id)
+            try:
+                return await operation()
+            except RetryAfter as exc:
+                self.apply_retry_after(chat_id, exc)
+                if attempt >= retry_limit:
+                    raise
+            except TimedOut:
+                if safe_to_retry_timeout and timeout_attempts < 1:
+                    timeout_attempts += 1
+                    continue
+                raise
 
 
 def message(chat_id):
@@ -89,6 +119,17 @@ class ZipExportManagerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         # Every test owns and stops its manager explicitly; this also exposes leaks.
         await asyncio.sleep(0)
+
+    async def test_group_status_uses_actual_chat_for_rate_limit(self):
+        limiter = FakeRateLimiter()
+        manager = self.make_manager(rate_limiter=limiter)
+        job = ZipExportJob("group-job", 42, -100123, "favorites", None, "title", 0)
+        reporter = JobStatusReporter(manager, job, progress_interval_seconds=100)
+
+        await reporter.queued(1)
+
+        self.assertEqual(limiter.wait_calls, [job.chat_id])
+        self.assertNotEqual(job.user_id, job.chat_id)
 
     async def test_fifo_worker_limit_and_different_users(self):
         manager = self.make_manager(worker_count=2)
@@ -605,7 +646,14 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_telegram_retry_after_retries_document_and_terminal_status(self):
         manager, job, reporter = self.make_manager([{"id": 1, "file_url": "a"}])
-        manager._bot.send_document.side_effect = [RetryAfter(0), None]
+        uploaded_payloads = []
+
+        async def send_document(**kwargs):
+            uploaded_payloads.append(kwargs["document"].read())
+            if len(uploaded_payloads) == 1:
+                raise RetryAfter(0)
+
+        manager._bot.send_document.side_effect = send_document
 
         async def download(_url, path, **_kwargs):
             Path(path).write_bytes(PNG)
@@ -616,6 +664,9 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, "success")
         self.assertEqual(manager._bot.send_document.await_count, 2)
+        self.assertEqual(len(uploaded_payloads), 2)
+        self.assertTrue(uploaded_payloads[0])
+        self.assertEqual(uploaded_payloads[0], uploaded_payloads[1])
         self.assertEqual(len(manager._rate_limiter.retry_calls), 1)
 
         job.status_message_id = 55
@@ -623,6 +674,17 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
         await reporter.finished(result)
         self.assertEqual(manager._bot.edit_message_text.await_count, 2)
         self.assertEqual(len(manager._rate_limiter.retry_calls), 2)
+
+    async def test_safe_status_edit_retries_timeout_once(self):
+        manager, job, reporter = self.make_manager([])
+        job.status_message_id = 55
+        manager._bot.edit_message_text.side_effect = [TimedOut(), None]
+        await reporter.finished(success_result())
+        self.assertEqual(manager._bot.edit_message_text.await_count, 2)
+        self.assertIn(
+            ("zip_status_edit", job.chat_id, True, "edit_message_text"),
+            manager._rate_limiter.execute_calls,
+        )
 
 
 class FakeContent:

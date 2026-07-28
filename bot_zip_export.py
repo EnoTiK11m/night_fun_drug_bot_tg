@@ -32,7 +32,7 @@ from bot_media import (
     TotalDownloadLimitExceeded,
     download_photo_to_path,
 )
-from bot_delivery import telegram_rate_limiter
+from bot_delivery import execute_telegram_request, telegram_rate_limiter
 
 logger = logging.getLogger(__name__)
 ZIP_ENTRY_OVERHEAD_BYTES = 512
@@ -195,25 +195,27 @@ class JobStatusReporter:
         try:
             if self._job.status_message_id is None:
                 sent = await self._manager._telegram_request(
-                    self._job.user_id,
+                    self._job.chat_id,
                     lambda: self._manager._bot.send_message(
                         chat_id=self._job.chat_id,
                         text=text,
                         reply_markup=markup,
                     ),
-                    pace=False,
+                    operation_name="zip_status_send",
                 )
                 self._job.status_message_id = getattr(sent, "message_id", None)
             else:
                 await self._manager._telegram_request(
-                    self._job.user_id,
+                    self._job.chat_id,
                     lambda: self._manager._bot.edit_message_text(
                         chat_id=self._job.chat_id,
                         message_id=self._job.status_message_id,
                         text=text,
                         reply_markup=markup,
                     ),
-                    pace=False,
+                    operation_name="zip_status_edit",
+                    safe_to_retry_timeout=True,
+                    ambiguous_bad_request_policy="edit_message_text",
                 )
         except Exception:
             logger.warning("ZIP export status update failed user=%s job=%s", self._job.user_id, self._job.job_id)
@@ -288,22 +290,21 @@ class ZipExportManager:
 
     async def _telegram_request(
         self,
-        user_id: int,
+        chat_id: int,
         operation: Callable[[], Awaitable[Any]],
         *,
-        pace: bool,
-        attempts: int = 3,
+        operation_name: str,
+        safe_to_retry_timeout: bool = False,
+        ambiguous_bad_request_policy=None,
     ) -> Any:
-        if pace:
-            await self._rate_limiter.wait_for_slot(user_id)
-        for attempt in range(max(1, attempts)):
-            try:
-                return await operation()
-            except RetryAfter as exc:
-                self._rate_limiter.apply_retry_after(user_id, exc)
-                if attempt + 1 >= attempts:
-                    raise
-                await self._rate_limiter.wait_for_slot(user_id)
+        return await execute_telegram_request(
+            operation,
+            operation_name=operation_name,
+            chat_id=chat_id,
+            safe_to_retry_timeout=safe_to_retry_timeout,
+            ambiguous_bad_request_policy=ambiguous_bad_request_policy,
+            limiter=self._rate_limiter,
+        )
 
     async def start(self) -> None:
         async with self._condition:
@@ -939,9 +940,9 @@ class ZipExportManager:
                 )
 
             await self._telegram_request(
-                job.user_id,
+                job.chat_id,
                 send_part,
-                pace=True,
+                operation_name="zip_send_document",
             )
         with contextlib.suppress(OSError):
             os.remove(archive_path)

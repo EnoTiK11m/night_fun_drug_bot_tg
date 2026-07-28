@@ -5,9 +5,16 @@ from unittest.mock import AsyncMock, patch
 
 import bot
 from api_handler import APITemporaryError
+from bot_delivery import telegram_rate_limiter
 
 
 class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        telegram_rate_limiter.reset()
+
+    def tearDown(self):
+        telegram_rate_limiter.reset()
+
     async def test_digest_subscription_queues_without_immediate_send(self):
         app = SimpleNamespace(bot=object())
         result = {"id": "123", "file_url": "https://example.test/file.jpg"}

@@ -11,7 +11,7 @@ from urllib.parse import unquote, urljoin, urlparse
 import aiohttp
 from telegram.error import RetryAfter, TimedOut
 
-from bot_delivery import telegram_rate_limiter
+from bot_delivery import execute_telegram_request
 from bot_features import runtime_metrics
 from bot_formatting import md_text
 from bot_keyboards import get_subscription_image_keyboard
@@ -320,34 +320,54 @@ async def _download_photo_file(
     return photo
 
 
+def _is_seekable_upload(upload) -> bool:
+    seekable = getattr(upload, "seekable", None)
+    if not callable(seekable):
+        return False
+    try:
+        return bool(seekable())
+    except (OSError, ValueError):
+        return False
+
+
 async def reply_media_url(message, url: str, caption: str, reply_markup, has_spoiler: bool = False):
     user_id = _message_user_id(message)
-    if not await telegram_rate_limiter.wait_for_slot(user_id):
-        return False
     url_path = media_url_path_lower(url)
     if url_path.endswith((".mp4", ".webm")):
-        await message.reply_video(
-            url,
-            caption=caption if caption else None,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-            has_spoiler=has_spoiler,
+        await execute_telegram_request(
+            lambda: message.reply_video(
+                url,
+                caption=caption if caption else None,
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+                has_spoiler=has_spoiler,
+            ),
+            operation_name="reply_video",
+            chat_id=user_id,
         )
     elif url_path.endswith(".gif"):
-        await message.reply_animation(
-            url,
-            caption=caption if caption else None,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-            has_spoiler=has_spoiler,
+        await execute_telegram_request(
+            lambda: message.reply_animation(
+                url,
+                caption=caption if caption else None,
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+                has_spoiler=has_spoiler,
+            ),
+            operation_name="reply_animation",
+            chat_id=user_id,
         )
     else:
-        await message.reply_photo(
-            url,
-            caption=caption if caption else None,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-            has_spoiler=has_spoiler,
+        await execute_telegram_request(
+            lambda: message.reply_photo(
+                url,
+                caption=caption if caption else None,
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+                has_spoiler=has_spoiler,
+            ),
+            operation_name="reply_photo",
+            chat_id=user_id,
         )
     return True
 
@@ -355,15 +375,25 @@ async def reply_media_url(message, url: str, caption: str, reply_markup, has_spo
 async def reply_downloaded_photo(message, url: str, caption: str, reply_markup, has_spoiler: bool = False):
     user_id = _message_user_id(message)
     photo = await _download_photo_file(url)
-    try:
-        if not await telegram_rate_limiter.wait_for_slot(user_id):
-            return False
-        await message.reply_photo(
+    seekable = _is_seekable_upload(photo)
+
+    async def upload_photo():
+        if seekable:
+            photo.seek(0)
+        return await message.reply_photo(
             photo,
             caption=caption if caption else None,
             parse_mode="Markdown",
             reply_markup=reply_markup,
             has_spoiler=has_spoiler,
+        )
+
+    try:
+        await execute_telegram_request(
+            upload_photo,
+            operation_name="reply_photo_upload",
+            chat_id=user_id,
+            max_retry_after_attempts=None if seekable else 0,
         )
         return True
     finally:
@@ -371,51 +401,71 @@ async def reply_downloaded_photo(message, url: str, caption: str, reply_markup, 
 
 
 async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup, has_spoiler: bool = False):
-    if not await telegram_rate_limiter.wait_for_slot(chat_id):
-        return False
     url_path = media_url_path_lower(url)
     if url_path.endswith((".mp4", ".webm")):
-        await bot.send_video(
+        await execute_telegram_request(
+            lambda: bot.send_video(
+                chat_id=chat_id,
+                video=url,
+                caption=caption if caption else None,
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+                has_spoiler=has_spoiler,
+            ),
+            operation_name="send_video",
             chat_id=chat_id,
-            video=url,
-            caption=caption if caption else None,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-            has_spoiler=has_spoiler,
         )
     elif url_path.endswith(".gif"):
-        await bot.send_animation(
+        await execute_telegram_request(
+            lambda: bot.send_animation(
+                chat_id=chat_id,
+                animation=url,
+                caption=caption if caption else None,
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+                has_spoiler=has_spoiler,
+            ),
+            operation_name="send_animation",
             chat_id=chat_id,
-            animation=url,
-            caption=caption if caption else None,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-            has_spoiler=has_spoiler,
         )
     else:
-        await bot.send_photo(
+        await execute_telegram_request(
+            lambda: bot.send_photo(
+                chat_id=chat_id,
+                photo=url,
+                caption=caption if caption else None,
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+                has_spoiler=has_spoiler,
+            ),
+            operation_name="send_photo",
             chat_id=chat_id,
-            photo=url,
-            caption=caption if caption else None,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-            has_spoiler=has_spoiler,
         )
     return True
 
 
 async def send_downloaded_photo(bot, chat_id: int, url: str, caption: str, reply_markup, has_spoiler: bool = False):
     photo = await _download_photo_file(url)
-    try:
-        if not await telegram_rate_limiter.wait_for_slot(chat_id):
-            return False
-        await bot.send_photo(
+    seekable = _is_seekable_upload(photo)
+
+    async def upload_photo():
+        if seekable:
+            photo.seek(0)
+        return await bot.send_photo(
             chat_id=chat_id,
             photo=photo,
             caption=caption if caption else None,
             parse_mode="Markdown",
             reply_markup=reply_markup,
             has_spoiler=has_spoiler,
+        )
+
+    try:
+        await execute_telegram_request(
+            upload_photo,
+            operation_name="send_photo_upload",
+            chat_id=chat_id,
+            max_retry_after_attempts=None if seekable else 0,
         )
         return True
     finally:
@@ -424,24 +474,26 @@ async def send_downloaded_photo(bot, chat_id: int, url: str, caption: str, reply
 
 async def _reply_text(message, text: str, **kwargs) -> bool:
     user_id = _message_user_id(message)
-    if not await telegram_rate_limiter.wait_for_slot(user_id):
-        return False
     try:
-        await message.reply_text(text, **kwargs)
+        await execute_telegram_request(
+            lambda: message.reply_text(text, **kwargs),
+            operation_name="reply_text",
+            chat_id=user_id,
+        )
         return True
-    except RetryAfter as exc:
-        telegram_rate_limiter.apply_retry_after(user_id, exc)
+    except RetryAfter:
         return False
 
 
 async def send_text_to_chat(bot, chat_id: int, **kwargs) -> bool:
-    if not await telegram_rate_limiter.wait_for_slot(chat_id):
-        return False
     try:
-        await bot.send_message(chat_id=chat_id, **kwargs)
+        await execute_telegram_request(
+            lambda: bot.send_message(chat_id=chat_id, **kwargs),
+            operation_name="send_message",
+            chat_id=chat_id,
+        )
         return True
-    except RetryAfter as exc:
-        telegram_rate_limiter.apply_retry_after(chat_id, exc)
+    except RetryAfter:
         return False
 
 
@@ -483,13 +535,11 @@ async def send_post_media(
                 )
                 runtime_metrics.increment("media_direct_ok")
                 return True
-            except RetryAfter as exc:
-                telegram_rate_limiter.apply_retry_after(_message_user_id(message), exc)
-                if attempt == retries:
-                    return False
+            except RetryAfter:
+                return False
+            except TimedOut:
+                raise
             except Exception as exc:
-                if raise_on_timeout and isinstance(exc, TimedOut):
-                    raise
                 logger.warning(
                     "Media send failed post=%s url_kind=%s attempt=%s/%s: %s",
                     post.get("id"),
@@ -511,15 +561,11 @@ async def send_post_media(
                             )
                             runtime_metrics.increment("media_upload_fallback_ok")
                             return True
-                    except RetryAfter as retry_exc:
-                        telegram_rate_limiter.apply_retry_after(
-                            _message_user_id(message), retry_exc
-                        )
-                        if attempt == retries:
-                            return False
+                    except RetryAfter:
+                        return False
+                    except TimedOut:
+                        raise
                     except Exception as fallback_exc:
-                        if raise_on_timeout and isinstance(fallback_exc, TimedOut):
-                            raise
                         logger.warning(
                             "Media downloaded fallback failed post=%s url_kind=%s attempt=%s/%s: %s",
                             post.get("id"),
@@ -599,13 +645,11 @@ async def send_post_media_to_chat(
                 )
                 runtime_metrics.increment("media_direct_ok")
                 return True
-            except RetryAfter as exc:
-                telegram_rate_limiter.apply_retry_after(chat_id, exc)
-                if attempt == retries:
-                    return False
+            except RetryAfter:
+                return False
+            except TimedOut:
+                raise
             except Exception as exc:
-                if raise_on_timeout and isinstance(exc, TimedOut):
-                    raise
                 logger.warning(
                     "Subscription media send failed user=%s post=%s url_kind=%s attempt=%s/%s: %s",
                     chat_id,
@@ -629,13 +673,11 @@ async def send_post_media_to_chat(
                             )
                             runtime_metrics.increment("media_upload_fallback_ok")
                             return True
-                    except RetryAfter as retry_exc:
-                        telegram_rate_limiter.apply_retry_after(chat_id, retry_exc)
-                        if attempt == retries:
-                            return False
+                    except RetryAfter:
+                        return False
+                    except TimedOut:
+                        raise
                     except Exception as fallback_exc:
-                        if raise_on_timeout and isinstance(fallback_exc, TimedOut):
-                            raise
                         logger.warning(
                             "Subscription media downloaded fallback failed user=%s post=%s url_kind=%s attempt=%s/%s: %s",
                             chat_id,

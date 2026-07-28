@@ -1,3 +1,4 @@
+import asyncio
 import io
 import logging
 import unittest
@@ -10,11 +11,40 @@ from bot_delivery import (
     TelegramRateLimiter,
     telegram_rate_limiter,
 )
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, TimedOut
+
+
+class CloseCountingBytesIO(io.BytesIO):
+    def __init__(self, payload):
+        super().__init__(payload)
+        self.close_count = 0
+
+    def close(self):
+        self.close_count += 1
+        super().close()
+
+
+class NonSeekableUpload:
+    def __init__(self, payload):
+        self._buffer = io.BytesIO(payload)
+        self.closed = False
+
+    def read(self, *args):
+        return self._buffer.read(*args)
+
+    def seekable(self):
+        return False
+
+    def close(self):
+        self.closed = True
+        self._buffer.close()
 
 
 class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        telegram_rate_limiter.reset()
+
+    def tearDown(self):
         telegram_rate_limiter.reset()
 
     def test_default_rate_limit_is_45_messages_per_chat_per_minute(self):
@@ -22,6 +52,75 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(TELEGRAM_MESSAGES_PER_CHAT_MINUTE, 45)
         self.assertAlmostEqual(limiter.per_user_seconds, 60 / 45)
+
+    async def _run_explicit_limiter(self, operation, **kwargs):
+        limiter = TelegramRateLimiter(
+            global_requests_per_second=1000,
+            per_chat_requests_per_second=1000,
+            burst=10,
+            max_retry_after_attempts=1,
+        )
+        return await limiter.execute(operation, **kwargs)
+
+    async def test_downloaded_upload_rewinds_for_retry_after_and_closes_once(self):
+        upload = CloseCountingBytesIO(b"complete-image")
+        upload.name = "image.jpg"
+        received = []
+        message = AsyncMock()
+
+        async def reply_photo(photo, **_kwargs):
+            received.append(photo.read())
+            if len(received) == 1:
+                raise RetryAfter(0)
+
+        message.reply_photo.side_effect = reply_photo
+        with patch("bot_media._download_photo_file", AsyncMock(return_value=upload)), patch(
+            "bot_media.execute_telegram_request", side_effect=self._run_explicit_limiter
+        ):
+            self.assertTrue(await bot_media.reply_downloaded_photo(message, "u", "", None))
+        self.assertEqual(received, [b"complete-image", b"complete-image"])
+        self.assertEqual(upload.close_count, 1)
+
+    async def test_downloaded_upload_timeout_is_not_retried_and_closes(self):
+        upload = CloseCountingBytesIO(b"image")
+        message = AsyncMock()
+        message.reply_photo.side_effect = TimedOut()
+        with patch("bot_media._download_photo_file", AsyncMock(return_value=upload)), patch(
+            "bot_media.execute_telegram_request", side_effect=self._run_explicit_limiter
+        ):
+            with self.assertRaises(TimedOut):
+                await bot_media.reply_downloaded_photo(message, "u", "", None)
+        self.assertEqual(message.reply_photo.await_count, 1)
+        self.assertEqual(upload.close_count, 1)
+
+    async def test_downloaded_upload_cancellation_is_not_retried_and_closes(self):
+        upload = CloseCountingBytesIO(b"image")
+        telegram_bot = AsyncMock()
+        telegram_bot.send_photo.side_effect = asyncio.CancelledError()
+        with patch("bot_media._download_photo_file", AsyncMock(return_value=upload)), patch(
+            "bot_media.execute_telegram_request", side_effect=self._run_explicit_limiter
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await bot_media.send_downloaded_photo(telegram_bot, 1, "u", "", None)
+        self.assertEqual(telegram_bot.send_photo.await_count, 1)
+        self.assertEqual(upload.close_count, 1)
+
+    async def test_non_seekable_upload_is_not_retried_after_retry_after(self):
+        upload = NonSeekableUpload(b"image")
+        message = AsyncMock()
+
+        async def reply_photo(photo, **_kwargs):
+            photo.read()
+            raise RetryAfter(0)
+
+        message.reply_photo.side_effect = reply_photo
+        with patch("bot_media._download_photo_file", AsyncMock(return_value=upload)), patch(
+            "bot_media.execute_telegram_request", side_effect=self._run_explicit_limiter
+        ):
+            with self.assertRaises(RetryAfter):
+                await bot_media.reply_downloaded_photo(message, "u", "", None)
+        self.assertEqual(message.reply_photo.await_count, 1)
+        self.assertTrue(upload.closed)
 
     def test_downloaded_photo_magic_validation(self):
         self.assertTrue(bot_media._looks_like_supported_photo(b"\xff\xd8\xffrest"))
@@ -231,68 +330,6 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "https://example.test/original.jpg",
         )
         telegram_bot.send_message.assert_not_awaited()
-
-    async def test_rate_limiter_waits_for_retry_after_cooldown(self):
-        limiter = TelegramRateLimiter(per_user_seconds=0, global_per_second=25)
-
-        with (
-            patch(
-                "bot_delivery.time.monotonic",
-                side_effect=[100.0, 100.0, 107.0, 107.0, 107.0],
-            ),
-            patch("bot_delivery.asyncio.sleep", new=AsyncMock()) as sleep,
-        ):
-            limiter.apply_retry_after(123, RetryAfter(2))
-            allowed = await limiter.wait_for_slot(123)
-
-        self.assertTrue(allowed)
-        sleep.assert_awaited_once_with(7.0)
-
-    async def test_user_cooldown_does_not_delay_other_users(self):
-        limiter = TelegramRateLimiter(per_user_seconds=0, global_per_second=25)
-
-        with (
-            patch(
-                "bot_delivery.time.monotonic",
-                side_effect=[100.0, 100.0, 100.0, 100.0],
-            ),
-            patch("bot_delivery.asyncio.sleep", new=AsyncMock()) as sleep,
-        ):
-            limiter.apply_retry_after(123, RetryAfter(2))
-            allowed = await limiter.wait_for_slot(456)
-
-        self.assertTrue(allowed)
-        sleep.assert_not_awaited()
-
-    async def test_new_cooldown_during_pacing_wait_is_honored(self):
-        limiter = TelegramRateLimiter(per_user_seconds=0, global_per_second=25)
-        limiter._next_global_send = 101.0
-
-        async def apply_cooldown_during_first_sleep(_delay):
-            if sleep.await_count == 1:
-                limiter.apply_retry_after(123, RetryAfter(2))
-
-        sleep = AsyncMock(side_effect=apply_cooldown_during_first_sleep)
-        with (
-            patch(
-                "bot_delivery.time.monotonic",
-                side_effect=[
-                    100.0,
-                    100.0,
-                    100.0,
-                    100.0,
-                    100.0,
-                    107.0,
-                    107.0,
-                    107.0,
-                ],
-            ),
-            patch("bot_delivery.asyncio.sleep", new=sleep),
-        ):
-            allowed = await limiter.wait_for_slot(123)
-
-        self.assertTrue(allowed)
-        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1.0, 7.0])
 
     def test_redacting_formatter_masks_known_secrets(self):
         formatter = bot.RedactingFormatter("%(message)s")

@@ -244,6 +244,11 @@ All settings are read from environment variables or `.env`.
 | `POST_CACHE_MAX_ROWS` | no | `100000` | Hard shared post-cache row limit |
 | `USER_STATE_TTL_MINUTES` | no | `30` | TTL for process-local per-user temporary state |
 | `USER_STATE_CLEANUP_INTERVAL_SECONDS` | no | `300` | Temporary user-state cleanup interval |
+| `TELEGRAM_GLOBAL_REQUESTS_PER_SECOND` | no | `20` | Process-wide Telegram Bot API request rate |
+| `TELEGRAM_PER_CHAT_REQUESTS_PER_SECOND` | no | `0.75` | Request rate for one user or chat |
+| `TELEGRAM_RATE_LIMIT_BURST` | no | `3` | Allowed short request burst |
+| `TELEGRAM_RATE_LIMIT_STATE_TTL_SECONDS` | no | `900` | TTL for inactive per-chat limiter buckets |
+| `TELEGRAM_MAX_RETRY_AFTER_ATTEMPTS` | no | `2` | Maximum retries after RetryAfter |
 | `GLOBAL_DOWNLOAD_CONCURRENCY` | no | `4` | Process-wide concurrent external download limit |
 | `ZIP_EXPORT_WORKERS` | no | `1` | FIFO ZIP worker count, from 1 to 2 |
 | `ZIP_EXPORT_QUEUE_SIZE` | no | `8` | Maximum waiting ZIP jobs |

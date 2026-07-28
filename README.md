@@ -226,6 +226,11 @@ SQLite-база и необходимые таблицы создаются ав
 | `POST_CACHE_MAX_ROWS` | нет | `100000` | Жёсткий лимит строк общего кэша постов |
 | `USER_STATE_TTL_MINUTES` | нет | `30` | TTL временного process-local состояния пользователя |
 | `USER_STATE_CLEANUP_INTERVAL_SECONDS` | нет | `300` | Интервал очистки временного состояния пользователей |
+| `TELEGRAM_GLOBAL_REQUESTS_PER_SECOND` | нет | `20` | Общая частота запросов к Telegram Bot API |
+| `TELEGRAM_PER_CHAT_REQUESTS_PER_SECOND` | нет | `0.75` | Частота запросов для одного пользователя или чата |
+| `TELEGRAM_RATE_LIMIT_BURST` | нет | `3` | Допустимый кратковременный burst запросов |
+| `TELEGRAM_RATE_LIMIT_STATE_TTL_SECONDS` | нет | `900` | TTL неактивных per-chat buckets limiter-а |
+| `TELEGRAM_MAX_RETRY_AFTER_ATTEMPTS` | нет | `2` | Максимальное число повторов после RetryAfter |
 | `GLOBAL_DOWNLOAD_CONCURRENCY` | нет | `4` | Общий лимит одновременных внешних загрузок процесса |
 | `ZIP_EXPORT_WORKERS` | нет | `1` | Число обработчиков FIFO-очереди ZIP-экспорта, от 1 до 2 |
 | `ZIP_EXPORT_QUEUE_SIZE` | нет | `8` | Максимум ожидающих ZIP-заданий |

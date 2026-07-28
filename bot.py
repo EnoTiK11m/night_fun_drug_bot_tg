@@ -118,7 +118,7 @@ from bot_media import (
     send_post_media_to_chat as send_post_media_to_chat_with_retries,
     send_text_to_chat,
 )
-from bot_delivery import telegram_rate_limiter
+from bot_delivery import execute_telegram_request, telegram_rate_limiter
 from project_update import (
     UpdateCommandError,
     check_for_updates,
@@ -684,8 +684,15 @@ async def send_resilient_media_group(
             for index, post in enumerate(album_posts)
         ]
         try:
-            await message.reply_media_group(media=media)
+            await execute_telegram_request(
+                lambda: message.reply_media_group(media=media),
+                operation_name="reply_media_group",
+                chat_id=int(getattr(getattr(message, "chat", None), "id", 0) or 0),
+            )
             return album_posts, rejected_posts
+        except TimedOut:
+            # The album may already have been accepted; sequential retry could duplicate it.
+            raise
         except Exception as exc:
             failed_index = gallery_failed_item_index(exc, len(album_posts))
             if failed_index is None:
@@ -863,13 +870,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def safe_query_answer(query, text: str | None = None):
-    try:
-        await query.answer(text=text)
-    except BadRequest as exc:
-        if "Query is too old" in str(exc) or "query id is invalid" in str(exc):
-            logger.warning("Ignoring expired callback query answer: %s", exc)
-            return
-        raise
+    await execute_telegram_request(
+        lambda: query.answer(text=text),
+        operation_name="answer_callback_query",
+        chat_id=int(getattr(getattr(query, "from_user", None), "id", 0) or 0),
+        safe_to_retry_timeout=True,
+        ambiguous_bad_request_policy="answer_callback_query",
+    )
 
 
 def is_access_allowed(update: Update) -> bool:
@@ -893,7 +900,14 @@ def is_access_allowed(update: Update) -> bool:
 async def send_access_denied(update: Update):
     text = "Доступ к боту ограничен."
     if update.callback_query:
-        await update.callback_query.answer(text, show_alert=True)
+        query = update.callback_query
+        await execute_telegram_request(
+            lambda: query.answer(text, show_alert=True),
+            operation_name="answer_callback_query",
+            chat_id=int(getattr(getattr(query, "from_user", None), "id", 0) or 0),
+            safe_to_retry_timeout=True,
+            ambiguous_bad_request_policy="answer_callback_query",
+        )
         return
     if update.effective_message:
         await update.effective_message.reply_text(text)
@@ -3862,20 +3876,35 @@ async def send_digest_posts(
             result.add("failed_ids", [digest_item_key(post) for post in standalone_posts])
             return result
         in_flight = album_item_keys
+        request_started = False
         try:
-            await message.reply_media_group(media=media)
+            async def send_album():
+                nonlocal request_started
+                if lease is not None and not await lease.ensure_owned():
+                    return False
+                request_started = True
+                return await message.reply_media_group(media=media)
+
+            sent = await execute_telegram_request(
+                send_album,
+                operation_name="digest_reply_media_group",
+                chat_id=user_id,
+            )
+            if sent is False:
+                result.add("failed_ids", in_flight)
+                result.add("failed_ids", [digest_item_key(post) for post in standalone_posts])
+                return result
             result.add("delivered_ids", in_flight)
             in_flight = []
         except TimedOut:
             result.add("ambiguous_ids", in_flight)
             in_flight = []
-        except RetryAfter as exc:
-            telegram_rate_limiter.apply_retry_after(user_id, exc)
+        except RetryAfter:
             result.add("failed_ids", in_flight)
             result.add("failed_ids", [digest_item_key(post) for post in standalone_posts])
             return result
         except asyncio.CancelledError as exc:
-            result.add("ambiguous_ids", in_flight)
+            result.add("ambiguous_ids" if request_started else "failed_ids", in_flight)
             raise DigestDeliveryCancelled(result) from exc
         except Exception as exc:
             logger.warning("Digest album failed, using sequential delivery: %s", exc)
@@ -3932,30 +3961,40 @@ async def send_digest_to_chat(
             for index, post in enumerate(album_posts)
         ]
         album_item_keys = [digest_item_key(post) for post in album_posts]
+        request_started = False
         try:
             if lease is not None and not await lease.ensure_owned():
                 result.add("failed_ids", album_item_keys)
                 result.add("failed_ids", [digest_item_key(post) for post in standalone_posts])
                 return result
-            await telegram_rate_limiter.wait_for_slot(user_id)
-            if lease is not None and not await lease.ensure_owned():
-                result.add("failed_ids", album_item_keys)
+            in_flight = album_item_keys
+            async def send_album():
+                nonlocal request_started
+                if lease is not None and not await lease.ensure_owned():
+                    return False
+                request_started = True
+                return await bot.send_media_group(chat_id=user_id, media=media)
+
+            sent = await execute_telegram_request(
+                send_album,
+                operation_name="digest_send_media_group",
+                chat_id=user_id,
+            )
+            if sent is False:
+                result.add("failed_ids", in_flight)
                 result.add("failed_ids", [digest_item_key(post) for post in standalone_posts])
                 return result
-            in_flight = album_item_keys
-            await bot.send_media_group(chat_id=user_id, media=media)
             result.add("delivered_ids", in_flight)
             in_flight = []
         except TimedOut:
             result.add("ambiguous_ids", in_flight)
             in_flight = []
-        except RetryAfter as exc:
-            telegram_rate_limiter.apply_retry_after(user_id, exc)
+        except RetryAfter:
             result.add("failed_ids", in_flight)
             result.add("failed_ids", [digest_item_key(post) for post in standalone_posts])
             return result
         except asyncio.CancelledError as exc:
-            if in_flight:
+            if in_flight and request_started:
                 result.add("ambiguous_ids", in_flight)
             else:
                 result.add("failed_ids", album_item_keys)
@@ -5276,8 +5315,9 @@ async def heartbeat_loop():
             export_stats = zip_export_manager.stats() if zip_export_manager else {
                 "queued": 0, "active": 0, "tracked_users": 0,
             }
+            telegram_metrics = telegram_rate_limiter.snapshot_metrics()
             logger.info(
-                "Heartbeat alive uptime=%ss user_states=%s recent_posts=%s export_queued=%s export_active=%s cache_cleanup_last_deleted=%s cache_cleanup_errors=%s",
+                "Heartbeat alive uptime=%ss user_states=%s recent_posts=%s export_queued=%s export_active=%s cache_cleanup_last_deleted=%s cache_cleanup_errors=%s telegram_requests_total=%s telegram_rate_limit_waits=%s telegram_retry_after_count=%s telegram_retry_attempts=%s telegram_ambiguous_timeouts=%s telegram_request_failures=%s telegram_limiter_registry_size=%s",
                 int(time.monotonic() - started_at),
                 len(user_states),
                 len(recent_posts),
@@ -5285,6 +5325,13 @@ async def heartbeat_loop():
                 export_stats["active"],
                 cache_cleanup_last_deleted,
                 cache_cleanup_errors,
+                telegram_metrics["telegram_requests_total"],
+                telegram_metrics["telegram_rate_limit_waits"],
+                telegram_metrics["telegram_retry_after_count"],
+                telegram_metrics["telegram_retry_attempts"],
+                telegram_metrics["telegram_ambiguous_timeouts"],
+                telegram_metrics["telegram_request_failures"],
+                telegram_metrics["telegram_limiter_registry_size"],
             )
         except asyncio.CancelledError:
             raise
@@ -5433,6 +5480,7 @@ def main():
     application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .rate_limiter(telegram_rate_limiter)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .concurrent_updates(8)
