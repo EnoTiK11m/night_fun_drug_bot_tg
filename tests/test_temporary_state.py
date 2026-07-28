@@ -26,10 +26,12 @@ class TemporaryUserStateRegistryTests(unittest.IsolatedAsyncioTestCase):
         return clock, registry, mappings
 
     async def asyncSetUp(self):
+        bot.user_operation_gate.reset_for_tests()
         bot.temporary_user_state.clear_all()
 
     async def asyncTearDown(self):
         bot.temporary_user_state.clear_all()
+        bot.user_operation_gate.reset_for_tests()
 
     async def test_expired_user_state_is_removed(self):
         clock, registry, mappings = self.make_registry()
@@ -82,9 +84,9 @@ class TemporaryUserStateRegistryTests(unittest.IsolatedAsyncioTestCase):
             bot.pending_preset_queries,
             bot.pending_bulk_posts,
             bot.pending_subscription_options,
-            bot.user_last_search_at,
         ):
             self.assertNotIn(7, mapping)
+        self.assertEqual(bot.user_last_search_at[7], "value")
 
     async def test_snapshot_cleanup_tolerates_concurrent_mutation(self):
         clock, registry, mappings = self.make_registry()
@@ -116,6 +118,9 @@ class TemporaryUserStateRegistryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MaintenanceLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        bot.user_operation_gate.reset_for_tests()
+
     async def asyncTearDown(self):
         task = bot.maintenance_task
         if task is not None and not task.done():
@@ -124,6 +129,7 @@ class MaintenanceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await task
         bot.maintenance_task = None
         bot.temporary_user_state.clear_all()
+        bot.user_operation_gate.reset_for_tests()
 
     async def test_shutdown_finishes_maintenance_task_and_clears_state(self):
         bot.temporary_user_state.clear_all()

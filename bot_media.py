@@ -14,7 +14,6 @@ from telegram.error import RetryAfter, TimedOut
 from bot_delivery import execute_telegram_request
 from bot_features import runtime_metrics
 from bot_formatting import md_text
-from bot_keyboards import get_subscription_image_keyboard
 from config import GLOBAL_DOWNLOAD_CONCURRENCY
 
 logger = logging.getLogger(__name__)
@@ -506,7 +505,7 @@ async def send_post_media(
     has_spoiler: bool = False,
     raise_on_timeout: bool = False,
 ):
-    reply_markup = keyboard or get_subscription_image_keyboard(post.get("id", 0))
+    reply_markup = keyboard
     candidates = get_media_url_candidates(post)
     fallback_url = candidates[0][1] if candidates else ""
     if not fallback_url:
@@ -608,7 +607,7 @@ async def send_post_media_to_chat(
     has_spoiler: bool = False,
     raise_on_timeout: bool = False,
 ):
-    reply_markup = keyboard or get_subscription_image_keyboard(post.get("id", 0))
+    reply_markup = keyboard
     candidates = get_media_url_candidates(post)
     fallback_url = candidates[0][1] if candidates else ""
     if not fallback_url:

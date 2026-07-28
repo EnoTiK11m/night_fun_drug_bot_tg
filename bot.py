@@ -8,6 +8,10 @@ import json
 import shutil
 import io
 import re
+import secrets
+import hashlib
+from collections import OrderedDict
+from functools import wraps
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager, contextmanager
 from logging.handlers import RotatingFileHandler
@@ -119,6 +123,7 @@ from bot_media import (
     send_text_to_chat,
 )
 from bot_delivery import execute_telegram_request, telegram_rate_limiter
+from bot_user_gate import user_operation_gate
 from project_update import (
     UpdateCommandError,
     check_for_updates,
@@ -372,11 +377,16 @@ class TemporaryUserStateRegistry:
         self._clock = clock
         self._last_used: dict[int, float] = {}
         self._active: dict[int, int] = {}
+        self._generations: dict[int, int] = {}
+        self._generation_counter = 0
         self._mappings: list[TrackedUserStateDict] = []
+        self._flow_mappings: list[TrackedUserStateDict] = []
 
-    def create_mapping(self) -> TrackedUserStateDict:
+    def create_mapping(self, *, flow_state: bool = True) -> TrackedUserStateDict:
         mapping = TrackedUserStateDict(self)
         self._mappings.append(mapping)
+        if flow_state:
+            self._flow_mappings.append(mapping)
         return mapping
 
     def touch(self, user_id: int, *, now: float | None = None) -> None:
@@ -387,7 +397,25 @@ class TemporaryUserStateRegistry:
             return
         if any(dict.__contains__(mapping, user_id) for mapping in self._mappings):
             return
-        self._last_used.pop(user_id, None)
+        if user_id not in self._generations:
+            self._last_used.pop(user_id, None)
+
+    def generation(self, user_id: int) -> int:
+        return self._generations.get(user_id, 0)
+
+    def begin_flow(self, user_id: int) -> int:
+        self._generation_counter += 1
+        generation = self._generation_counter
+        self._generations[user_id] = generation
+        self.touch(user_id)
+        return generation
+
+    def invalidate_user(self, user_id: int) -> int:
+        generation = self.begin_flow(user_id)
+        for mapping in self._flow_mappings:
+            mapping.discard_without_touch(user_id)
+        self.touch(user_id)
+        return generation
 
     @contextmanager
     def activity(self, user_id: int):
@@ -401,15 +429,20 @@ class TemporaryUserStateRegistry:
                 self._active[user_id] = remaining
             else:
                 self._active.pop(user_id, None)
-            if any(dict.__contains__(mapping, user_id) for mapping in self._mappings):
+            if (
+                user_id in self._generations
+                or any(dict.__contains__(mapping, user_id) for mapping in self._mappings)
+            ):
                 self.touch(user_id)
             else:
                 self._last_used.pop(user_id, None)
 
-    def clear_user(self, user_id: int) -> None:
+    def clear_user(self, user_id: int, *, clear_generation: bool = True) -> None:
         for mapping in self._mappings:
             mapping.discard_without_touch(user_id)
         self._last_used.pop(user_id, None)
+        if clear_generation:
+            self._generations.pop(user_id, None)
 
     def cleanup_expired(self, ttl_seconds: float, *, now: float | None = None) -> int:
         current = self._clock() if now is None else now
@@ -419,7 +452,7 @@ class TemporaryUserStateRegistry:
             if current - last_used >= ttl_seconds and not self._active.get(user_id, 0)
         ]
         for user_id in expired:
-            self.clear_user(user_id)
+            self.clear_user(user_id, clear_generation=True)
         return len(expired)
 
     def clear_all(self) -> None:
@@ -427,6 +460,7 @@ class TemporaryUserStateRegistry:
             dict.clear(mapping)
         self._last_used.clear()
         self._active.clear()
+        self._generations.clear()
 
 
 temporary_user_state = TemporaryUserStateRegistry()
@@ -452,10 +486,45 @@ subscription_task = None
 heartbeat_task = None
 tag_translation_task = None
 zip_export_manager: ZipExportManager | None = None
-user_last_search_at = temporary_user_state.create_mapping()
+user_last_search_at = temporary_user_state.create_mapping(flow_state=False)
 maintenance_task = None
 cache_cleanup_last_deleted = 0
 cache_cleanup_errors = 0
+stale_flow_results_discarded = 0
+duplicate_callbacks_rejected = 0
+
+@dataclass
+class OneShotCallbackEntry:
+    owner_id: int
+    generation: int
+    created_at: float
+    logical_action: str
+    canonical_payload: str
+    status: str = "issued"
+
+
+class StaleCallbackIssuer(RuntimeError):
+    pass
+
+
+class OneShotRegistryFull(RuntimeError):
+    pass
+
+
+ONE_SHOT_CALLBACK_MAX_PER_USER = 512
+ONE_SHOT_CALLBACK_MAX_GLOBAL = 8192
+ONE_SHOT_CALLBACK_TTL_SECONDS = 24 * 60 * 60
+ONE_SHOT_CLEANUP_BATCH = 128
+ONE_SHOT_PROCESS_EPOCH = secrets.token_hex(3)
+issued_one_shot_callbacks: OrderedDict[str, OneShotCallbackEntry] = OrderedDict()
+
+
+@asynccontextmanager
+async def guarded_user_state(user_id: int):
+    """Gate order is always temporary-state activity, then the user gate."""
+    with temporary_user_state.activity(user_id):
+        async with user_operation_gate.hold(user_id):
+            yield
 MEDIA_SEND_RETRIES = 2
 SUBSCRIPTION_CONCURRENCY = 5
 HEARTBEAT_INTERVAL_SECONDS = 5 * 60
@@ -519,6 +588,363 @@ def is_rate_limited(user_id: int) -> bool:
     return False
 
 
+async def reserve_search_cooldown(user_id: int) -> bool:
+    """Atomically reserve the cooldown immediately before an external search."""
+    async with guarded_user_state(user_id):
+        return is_rate_limited(user_id)
+
+
+async def begin_user_flow(
+    user_id: int,
+    state: str,
+    *,
+    expected_generation: int | None = None,
+    **related_state,
+) -> int | None:
+    global stale_flow_results_discarded
+    async with guarded_user_state(user_id):
+        if (
+            expected_generation is not None
+            and temporary_user_state.generation(user_id) != expected_generation
+        ):
+            stale_flow_results_discarded += 1
+            return None
+        generation = temporary_user_state.begin_flow(user_id)
+        user_states[user_id] = state
+        for mapping, value in related_state.values():
+            mapping[user_id] = value
+        return generation
+
+
+async def invalidate_user_flow(user_id: int) -> int:
+    async with guarded_user_state(user_id):
+        generation = temporary_user_state.invalidate_user(user_id)
+        stale_user_one_shot_callbacks(user_id, generation)
+        return generation
+
+
+async def claim_user_message_state(user_id: int):
+    """Consume one pending input state and snapshot its related mutable values."""
+    async with guarded_user_state(user_id):
+        state = user_states.pop(user_id, None)
+        generation = temporary_user_state.generation(user_id)
+        snapshot = {}
+        if state == "waiting_builder_exclude":
+            snapshot["builder"] = dict(search_builders.pop(user_id, {}))
+        elif state == "waiting_preset_name":
+            snapshot["preset_query"] = str(
+                pending_preset_queries.pop(user_id, "")
+            )
+        elif state == "waiting_bulk_collection_name":
+            snapshot["bulk_posts"] = tuple(pending_bulk_posts.pop(user_id, ()))
+        elif state == "waiting_subscription_blacklist":
+            snapshot["subscription_query"] = str(
+                pending_subscription_options.pop(user_id, "")
+            )
+        return state, generation, snapshot
+
+
+async def commit_flow_if_current(user_id: int, generation: int, commit) -> bool:
+    global stale_flow_results_discarded
+    async with guarded_user_state(user_id):
+        if temporary_user_state.generation(user_id) != generation:
+            stale_flow_results_discarded += 1
+            return False
+        commit()
+        return True
+
+
+ONE_SHOT_CALLBACK_PREFIXES = (
+    "act_",
+    "sub_create_",
+    "sub_toggle_",
+    "sub_remove_do_",
+    "sub_post_del_",
+    "fav_del_",
+    "fav_remove_do_",
+    "fav_col_pick_",
+    "fav_note_",
+    "later_del_",
+    "gallery_bulk_fav_",
+    "gallery_collection_",
+    "gallery_col_add_",
+    "gallery_col_add:",
+    "gallery_col_new:",
+    "storage_cleanup_90_do",
+    "storage_empty_collections_do",
+    "bl_preset_add_",
+    "bl_preset_del_",
+    "rec_hide_",
+    "tag_block_",
+    "later_add_",
+    "sub_fav_",
+)
+ONE_SHOT_CALLBACK_EXACT: set[str] = set()
+
+
+def is_one_shot_callback(data: str) -> bool:
+    if data in ONE_SHOT_CALLBACK_EXACT or data.startswith(ONE_SHOT_CALLBACK_PREFIXES):
+        return True
+    return bool(re.fullmatch(r"fav_\d+", data))
+
+
+def register_one_shot_callback(
+    user_id: int,
+    data: str,
+    *,
+    logical_action: str,
+    canonical_payload: str,
+    expected_generation: int | None = None,
+) -> str:
+    generation = temporary_user_state.generation(user_id)
+    if expected_generation is not None and generation != expected_generation:
+        raise StaleCallbackIssuer("Callback flow generation is no longer current")
+    cleanup_one_shot_callbacks(max_removals=ONE_SHOT_CLEANUP_BATCH)
+    _make_one_shot_capacity(int(user_id))
+    issued_one_shot_callbacks[data] = OneShotCallbackEntry(
+        owner_id=int(user_id),
+        generation=generation,
+        created_at=time.monotonic(),
+        logical_action=logical_action,
+        canonical_payload=canonical_payload,
+    )
+    issued_one_shot_callbacks.move_to_end(data)
+    return data
+
+
+def _one_shot_user_count(user_id: int) -> int:
+    return sum(
+        entry.owner_id == user_id for entry in issued_one_shot_callbacks.values()
+    )
+
+
+def _evict_one_shot_candidate(*, user_id: int | None = None) -> bool:
+    entries = tuple(issued_one_shot_callbacks.items())
+    for terminal_only in (True, False):
+        for data, entry in entries:
+            if user_id is not None and entry.owner_id != user_id:
+                continue
+            if entry.status == "processing":
+                continue
+            if terminal_only and entry.status not in {"consumed", "stale"}:
+                continue
+            issued_one_shot_callbacks.pop(data, None)
+            return True
+    return False
+
+
+def _make_one_shot_capacity(user_id: int) -> None:
+    while _one_shot_user_count(user_id) >= ONE_SHOT_CALLBACK_MAX_PER_USER:
+        if not _evict_one_shot_candidate(user_id=user_id):
+            raise OneShotRegistryFull("User callback registry is full of processing entries")
+    while len(issued_one_shot_callbacks) >= ONE_SHOT_CALLBACK_MAX_GLOBAL:
+        if not _evict_one_shot_candidate():
+            raise OneShotRegistryFull("Global callback registry is full of processing entries")
+
+
+def cleanup_one_shot_callbacks(
+    *, now: float | None = None, max_removals: int = ONE_SHOT_CLEANUP_BATCH
+) -> int:
+    current = time.monotonic() if now is None else now
+    removed = 0
+    for data, entry in tuple(issued_one_shot_callbacks.items()):
+        if removed >= max_removals:
+            break
+        if (
+            entry.status != "processing"
+            and current - entry.created_at >= ONE_SHOT_CALLBACK_TTL_SECONDS
+        ):
+            issued_one_shot_callbacks.pop(data, None)
+            removed += 1
+    return removed
+
+
+def ensure_user_generation(user_id: int) -> int:
+    generation = temporary_user_state.generation(user_id)
+    if generation == 0:
+        generation = temporary_user_state.begin_flow(user_id)
+    return generation
+
+
+@dataclass(frozen=True)
+class OneShotCallbackIssuer:
+    user_id: int
+    expected_generation: int
+
+    def _check_current(self) -> None:
+        if temporary_user_state.generation(self.user_id) != self.expected_generation:
+            raise StaleCallbackIssuer("Callback issuer belongs to a stale flow")
+
+    def _token_prefix(self) -> str:
+        material = (
+            f"{ONE_SHOT_PROCESS_EPOCH}:{self.user_id}:{self.expected_generation}"
+        )
+        digest = hashlib.blake2s(
+            material.encode("ascii"), digest_size=5
+        ).hexdigest()
+        return f"p{digest}"
+
+    def payload(self, action: str, payload: str) -> str:
+        self._check_current()
+        data = store_callback_payload(
+            action,
+            payload,
+            one_shot=True,
+            token_prefix=self._token_prefix(),
+        )
+        return register_one_shot_callback(
+            self.user_id,
+            data,
+            logical_action=action,
+            canonical_payload=payload,
+            expected_generation=self.expected_generation,
+        )
+
+    def side_effect(self, data: str) -> str:
+        self._check_current()
+        token = store_callback_payload(
+            "act",
+            data,
+            one_shot=True,
+            token_prefix=self._token_prefix(),
+        )
+        return register_one_shot_callback(
+            self.user_id,
+            token,
+            logical_action="side_effect",
+            canonical_payload=data,
+            expected_generation=self.expected_generation,
+        )
+
+    def __call__(self, data: str) -> str:
+        return self.side_effect(data)
+
+
+def callback_issuer_for(
+    user_id: int, expected_generation: int | None = None
+) -> OneShotCallbackIssuer:
+    generation = (
+        ensure_user_generation(user_id)
+        if expected_generation is None
+        else expected_generation
+    )
+    if temporary_user_state.generation(user_id) != generation:
+        raise StaleCallbackIssuer("Cannot create issuer for a stale generation")
+    return OneShotCallbackIssuer(int(user_id), generation)
+
+
+def store_user_one_shot_payload(action: str, payload: str, user_id: int) -> str:
+    return callback_issuer_for(user_id).payload(action, payload)
+
+
+def store_side_effect_callback(data: str, user_id: int) -> str:
+    return callback_issuer_for(user_id).side_effect(data)
+
+
+def side_effect_callback_for(
+    user_id: int, expected_generation: int | None = None
+) -> OneShotCallbackIssuer:
+    return callback_issuer_for(user_id, expected_generation)
+
+
+def resolved_callback_data(data: str) -> str:
+    entry = issued_one_shot_callbacks.get(data)
+    if entry and entry.logical_action == "side_effect":
+        return entry.canonical_payload
+    return data
+
+
+def stale_user_one_shot_callbacks(user_id: int, current_generation: int) -> None:
+    for entry in issued_one_shot_callbacks.values():
+        if (
+            entry.owner_id == user_id
+            and entry.generation != current_generation
+            and entry.status in {"issued", "reserved"}
+        ):
+            entry.status = "stale"
+
+
+async def reserve_one_shot_callback(user_id: int, data: str) -> bool:
+    global duplicate_callbacks_rejected
+    if not is_one_shot_callback(data):
+        return True
+    async with guarded_user_state(user_id):
+        cleanup_one_shot_callbacks(max_removals=ONE_SHOT_CLEANUP_BATCH)
+        generation = temporary_user_state.generation(user_id)
+        issued = issued_one_shot_callbacks.get(data)
+        if (
+            issued is None
+            or issued.owner_id != user_id
+            or issued.generation != generation
+            or issued.status != "issued"
+        ):
+            duplicate_callbacks_rejected += 1
+            return False
+
+        logical_key = (
+            issued.owner_id,
+            issued.generation,
+            issued.logical_action,
+            issued.canonical_payload,
+        )
+        for candidate in issued_one_shot_callbacks.values():
+            candidate_key = (
+                candidate.owner_id,
+                candidate.generation,
+                candidate.logical_action,
+                candidate.canonical_payload,
+            )
+            if candidate_key != logical_key or candidate is issued:
+                continue
+            if candidate.status in {"reserved", "processing", "consumed"}:
+                issued.status = "stale"
+                duplicate_callbacks_rejected += 1
+                return False
+        issued.status = "reserved"
+        for candidate in issued_one_shot_callbacks.values():
+            candidate_key = (
+                candidate.owner_id,
+                candidate.generation,
+                candidate.logical_action,
+                candidate.canonical_payload,
+            )
+            if candidate is not issued and candidate_key == logical_key:
+                candidate.status = "stale"
+        return True
+
+
+async def begin_one_shot_processing(user_id: int, data: str) -> bool:
+    if not is_one_shot_callback(data):
+        return True
+    async with guarded_user_state(user_id):
+        entry = issued_one_shot_callbacks.get(data)
+        if (
+            entry is None
+            or entry.owner_id != user_id
+            or entry.generation != temporary_user_state.generation(user_id)
+            or entry.status != "reserved"
+        ):
+            return False
+        entry.status = "processing"
+        return True
+
+
+async def finish_one_shot_processing(user_id: int, data: str) -> None:
+    if not is_one_shot_callback(data):
+        return
+    async with guarded_user_state(user_id):
+        entry = issued_one_shot_callbacks.get(data)
+        if entry is not None and entry.owner_id == user_id and entry.status == "processing":
+            entry.status = "consumed"
+
+
+async def consume_one_shot_callback(user_id: int, data: str) -> bool:
+    """Compatibility helper used by focused tests: reserve and start processing."""
+    if not await reserve_one_shot_callback(user_id, data):
+        return False
+    return await begin_one_shot_processing(user_id, data)
+
+
 async def build_main_menu_text(user_id: int) -> str:
     pause_until = await get_subscription_pause_until(user_id)
     remaining = format_remaining_pause(pause_until)
@@ -544,9 +970,15 @@ async def build_subscription_added_text(query: str, interval: int, user_id: int)
     return text
 
 
-def get_subscription_preview(query: str, interval: int) -> tuple[str, InlineKeyboardMarkup]:
+def get_subscription_preview(
+    query: str,
+    interval: int,
+    user_id: int,
+    *,
+    issuer: OneShotCallbackIssuer,
+) -> tuple[str, InlineKeyboardMarkup]:
     payload = json.dumps({"query": query, "interval": interval}, ensure_ascii=False)
-    confirm_callback = store_callback_payload("sub_create", payload)
+    confirm_callback = issuer.payload("sub_create", payload)
     text = (
         "Главная → Подписки → Новая подписка\n\n"
         f"Запрос: `{md_code(query)}`\n"
@@ -798,7 +1230,12 @@ def build_caption_settings_text(settings: dict) -> str:
 
 
 async def send_full_post_tags(
-    message, post_id: int, page: int = 0, edit: bool = False
+    message,
+    post_id: int,
+    user_id: int,
+    issuer: OneShotCallbackIssuer,
+    page: int = 0,
+    edit: bool = False,
 ):
     post = await get_known_post(post_id) or minimal_post(post_id)
     all_tags = [tag for tag in str(post.get("tags") or "").split() if tag]
@@ -821,7 +1258,7 @@ async def send_full_post_tags(
             ),
             InlineKeyboardButton(
                 "🚫 В чёрный список",
-                callback_data=store_callback_payload("tag_block", tag),
+                callback_data=issuer.payload("tag_block", tag),
             ),
         ])
     if total_pages > 1:
@@ -847,7 +1284,7 @@ async def send_full_post_tags(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
     user_id = update.effective_user.id
-    user_states.pop(user_id, None)
+    await invalidate_user_flow(user_id)
     pause_until = await get_subscription_pause_until(user_id)
     remaining = format_remaining_pause(pause_until)
     pause_text = (
@@ -931,10 +1368,6 @@ def require_access(handler):
     return wrapped
 
 
-def clear_user_temporary_state(user_id: int) -> None:
-    temporary_user_state.clear_user(user_id)
-
-
 def schedule_background_task(context: ContextTypes.DEFAULT_TYPE, coroutine):
     application = getattr(context, "application", None)
     if application and hasattr(application, "create_task"):
@@ -943,11 +1376,46 @@ def schedule_background_task(context: ContextTypes.DEFAULT_TYPE, coroutine):
         asyncio.create_task(coroutine)
 
 
+def finalize_one_shot_handler(handler):
+    @wraps(handler)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        global stale_flow_results_discarded
+        query = getattr(update, "callback_query", None)
+        raw_data = getattr(query, "data", "")
+        user_id = int(getattr(getattr(query, "from_user", None), "id", 0) or 0)
+        try:
+            return await handler(update, context)
+        except StaleCallbackIssuer:
+            stale_flow_results_discarded += 1
+            return None
+        finally:
+            if user_id and raw_data:
+                await finish_one_shot_processing(user_id, raw_data)
+
+    return wrapped
+
+
+@finalize_one_shot_handler
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик нажатий кнопок"""
+    global stale_flow_results_discarded
     query = update.callback_query
     user_id = query.from_user.id
-    data = query.data
+    raw_data = query.data
+    data = resolved_callback_data(raw_data)
+    async with guarded_user_state(user_id):
+        callback_generation = temporary_user_state.generation(user_id)
+        if callback_generation == 0:
+            callback_generation = temporary_user_state.begin_flow(user_id)
+    callback_issuer = side_effect_callback_for(user_id, callback_generation)
+
+    async def begin_callback_flow(state: str, **related_state):
+        return await begin_user_flow(
+            user_id,
+            state,
+            expected_generation=callback_generation,
+            **related_state,
+        )
     deferred_answer = data.startswith((
         "later_add_",
         "tag_block_",
@@ -957,8 +1425,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not deferred_answer:
         await safe_query_answer(query)
 
+    async with guarded_user_state(user_id):
+        callback_is_current = (
+            temporary_user_state.generation(user_id) == callback_generation
+        )
+    if not callback_is_current:
+        stale_flow_results_discarded += 1
+        if deferred_answer:
+            await safe_query_answer(query, "Кнопка устарела")
+        else:
+            await query.message.reply_text("Эта кнопка устарела.")
+        return
+
+    if not await reserve_one_shot_callback(user_id, raw_data):
+        if deferred_answer:
+            await safe_query_answer(query, "Кнопка уже обработана")
+        else:
+            await query.message.reply_text("Эта кнопка уже была обработана.")
+        return
+    if not await begin_one_shot_processing(user_id, raw_data):
+        if deferred_answer:
+            await safe_query_answer(query, "Кнопка устарела")
+        else:
+            await query.message.reply_text("Эта кнопка устарела.")
+        return
+    data = resolved_callback_data(raw_data)
+
     if data == "cancel_input":
-        clear_user_temporary_state(user_id)
+        await invalidate_user_flow(user_id)
         await query.edit_message_text(
             "Действие отменено.\n\n" + await build_main_menu_text(user_id),
             reply_markup=await get_user_main_keyboard(user_id),
@@ -1025,7 +1519,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "search":
-        user_states[user_id] = "waiting_search"
+        if await begin_callback_flow("waiting_search") is None:
+            return
         await query.edit_message_text(
             "🔍 Введите теги для поиска (через пробел):\n\n"
             "Примеры:\n"
@@ -1054,14 +1549,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "random":
-        schedule_background_task(context, send_random_image(query.message, user_id))
+        schedule_background_task(
+            context,
+            send_random_image(
+                query.message,
+                user_id,
+                expected_generation=callback_generation,
+            ),
+        )
 
     elif data == "more":
         saved = await get_user_query(user_id)
         if saved and saved[0]:
             schedule_background_task(
                 context,
-                send_image(query.message, user_id, saved[0], edit=False, is_more=True),
+                send_image(
+                    query.message,
+                    user_id,
+                    saved[0],
+                    edit=False,
+                    is_more=True,
+                    expected_generation=callback_generation,
+                ),
             )
         else:
             await query.message.reply_text(
@@ -1086,6 +1595,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=get_image_keyboard(
                     int(post_id_text),
                     show_tags_button=should_show_tags_button(settings),
+                    side_effect_callback=callback_issuer,
                 )
             )
     elif data == "blacklist":
@@ -1110,7 +1620,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_favorites(query.message, user_id, edit=True)
 
     elif data == "gallery":
-        user_states[user_id] = "waiting_gallery"
+        if await begin_callback_flow("waiting_gallery") is None:
+            return
         await query.edit_message_text(
             "🖼 Введите теги для галереи. Для случайной подборки отправьте `random`.",
             parse_mode="Markdown",
@@ -1127,12 +1638,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("❌ Подборка устарела. Запустите галерею заново.")
             return
         schedule_background_task(
-            context, send_search_gallery(query.message, user_id, tags, page)
+            context,
+            send_search_gallery(
+                query.message,
+                user_id,
+                tags,
+                page,
+                expected_generation=callback_generation,
+            ),
         )
 
     elif data == "search_builder":
-        search_builders[user_id] = {}
-        user_states[user_id] = "waiting_builder_include"
+        if await begin_callback_flow(
+            "waiting_builder_include",
+            builder=(search_builders, {}),
+        ) is None:
+            return
         await query.message.reply_text(
             "🧩 *Конструктор поиска*\n\nВведите обязательные теги через пробел.",
             parse_mode="Markdown",
@@ -1147,8 +1668,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not saved or not saved[0]:
             await query.message.reply_text("Сначала выполните поиск.")
         else:
-            pending_preset_queries[user_id] = saved[0]
-            user_states[user_id] = "waiting_preset_name"
+            if await begin_callback_flow(
+                "waiting_preset_name",
+                preset=(pending_preset_queries, saved[0]),
+            ) is None:
+                return
             await query.message.reply_text(
                 "Введите название сохранённого запроса (до 40 символов):",
                 reply_markup=get_cancel_keyboard("search_hub"),
@@ -1163,7 +1687,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             settings = await get_user_settings(user_id)
             settings.update(preset["settings"])
             await save_user_settings(user_id, settings)
-            schedule_background_task(context, send_search_gallery(query.message, user_id, preset["query"]))
+            schedule_background_task(
+                context,
+                send_search_gallery(
+                    query.message,
+                    user_id,
+                    preset["query"],
+                    expected_generation=callback_generation,
+                ),
+            )
 
     elif data.startswith("preset_del_"):
         value = data.replace("preset_del_", "", 1)
@@ -1174,8 +1706,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("preset_from_"):
         preset_query = get_callback_payload("preset_from", data)
         if preset_query:
-            pending_preset_queries[user_id] = preset_query
-            user_states[user_id] = "waiting_preset_name"
+            if await begin_callback_flow(
+                "waiting_preset_name",
+                preset=(pending_preset_queries, preset_query),
+            ) is None:
+                return
             await query.message.reply_text(
                 "Введите название сохранённого запроса:",
                 reply_markup=get_cancel_keyboard("search_hub"),
@@ -1184,10 +1719,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("builder_run_"):
         built_query = get_callback_payload("builder_run", data)
         if built_query:
-            schedule_background_task(context, send_search_gallery(query.message, user_id, built_query))
+            schedule_background_task(
+                context,
+                send_search_gallery(
+                    query.message,
+                    user_id,
+                    built_query,
+                    expected_generation=callback_generation,
+                ),
+            )
 
     elif data == "recommendations":
-        schedule_background_task(context, send_recommendations(query.message, user_id))
+        schedule_background_task(
+            context,
+            send_recommendations(
+                query.message,
+                user_id,
+                expected_generation=callback_generation,
+            ),
+        )
 
     elif data.startswith("rec_hide_"):
         tag = get_callback_payload("rec_hide", data)
@@ -1208,7 +1758,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             similar_tags = similar_query_from_post(post)
             if similar_tags:
                 schedule_background_task(
-                    context, send_search_gallery(query.message, user_id, similar_tags)
+                    context,
+                    send_search_gallery(
+                        query.message,
+                        user_id,
+                        similar_tags,
+                        expected_generation=callback_generation,
+                    ),
                 )
             else:
                 await query.message.reply_text("Недостаточно характерных тегов для похожей подборки.")
@@ -1216,7 +1772,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("tag_search_"):
         tag = get_callback_payload("tag_search", data)
         if tag:
-            schedule_background_task(context, send_search_gallery(query.message, user_id, tag))
+            schedule_background_task(
+                context,
+                send_search_gallery(
+                    query.message,
+                    user_id,
+                    tag,
+                    expected_generation=callback_generation,
+                ),
+            )
 
     elif data.startswith("tag_block_"):
         tag = get_callback_payload("tag_block", data)
@@ -1242,7 +1806,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "later_list":
-        await show_read_later(query.message, user_id)
+        await show_read_later(query.message, user_id, issuer=callback_issuer)
 
     elif data.startswith("later_open_"):
         value = data.replace("later_open_", "", 1)
@@ -1250,7 +1814,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post = next((item for item in posts if str(item.get("id")) == value), None)
         if post:
             settings = await get_user_settings(user_id)
-            await send_post_media(query.message, post, settings=settings)
+            await send_post_media(
+                query.message,
+                post,
+                keyboard=get_subscription_image_keyboard(
+                    post.get("id", 0),
+                    side_effect_callback=callback_issuer,
+                ),
+                settings=settings,
+            )
         else:
             await query.message.reply_text("Пост больше не находится в списке.")
 
@@ -1258,7 +1830,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         value = data.replace("later_del_", "", 1)
         if value.isdigit():
             await remove_read_later(user_id, int(value))
-        await show_read_later(query.message, user_id)
+        await show_read_later(query.message, user_id, issuer=callback_issuer)
 
     elif data == "storage":
         await show_storage(query.message, user_id)
@@ -1267,7 +1839,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             "Удалить историю и служебные записи старше 90 дней?",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🧹 Удалить", callback_data="storage_cleanup_90_do"),
+                InlineKeyboardButton(
+                    "🧹 Удалить",
+                    callback_data=callback_issuer.side_effect(
+                        "storage_cleanup_90_do"
+                    ),
+                ),
                 InlineKeyboardButton("❌ Отмена", callback_data="storage"),
             ]]),
         )
@@ -1283,7 +1860,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             "Удалить все пустые коллекции?",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🗑 Удалить", callback_data="storage_empty_collections_do"),
+                InlineKeyboardButton(
+                    "🗑 Удалить",
+                    callback_data=callback_issuer.side_effect(
+                        "storage_empty_collections_do"
+                    ),
+                ),
                 InlineKeyboardButton("❌ Отмена", callback_data="storage"),
             ]]),
         )
@@ -1304,22 +1886,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("gallery_collection_"):
         raw_ids = get_callback_payload("gallery_collection", data) or ""
-        pending_bulk_posts[user_id] = [int(value) for value in raw_ids.split(",") if value.isdigit()][:10]
+        bulk_post_ids = tuple(
+            int(value) for value in raw_ids.split(",") if value.isdigit()
+        )[:10]
+        canonical_ids = ",".join(str(post_id) for post_id in bulk_post_ids)
         collections = await get_favorite_collections(user_id)
+        if not await commit_flow_if_current(
+            user_id, callback_generation, lambda: None
+        ):
+            return
         rows = [[InlineKeyboardButton(
-            f"🗂 {item['name'][:28]}", callback_data=f"gallery_col_add_{item['id']}"
+            f"🗂 {item['name'][:28]}",
+            callback_data=callback_issuer.side_effect(
+                f"gallery_col_add:{item['id']}:{canonical_ids}"
+            ),
         )] for item in collections]
-        rows.append([InlineKeyboardButton("➕ Новая коллекция", callback_data="gallery_col_new")])
+        rows.append([InlineKeyboardButton(
+            "➕ Новая коллекция",
+            callback_data=callback_issuer.side_effect(
+                f"gallery_col_new:{canonical_ids}"
+            ),
+        )])
         await query.message.reply_text(
             "Выберите коллекцию для всей подборки:",
             reply_markup=InlineKeyboardMarkup(rows),
         )
 
-    elif data.startswith("gallery_col_add_"):
-        value = data.replace("gallery_col_add_", "", 1)
+    elif data.startswith("gallery_col_add:"):
+        _action, value, raw_ids = data.split(":", 2)
         collection_id = int(value) if value.isdigit() else 0
         added = 0
-        for post_id in pending_bulk_posts.pop(user_id, []):
+        bulk_post_ids = tuple(
+            int(post_id) for post_id in raw_ids.split(",") if post_id.isdigit()
+        )[:10]
+        for post_id in bulk_post_ids:
             post = await get_known_post(post_id)
             if post:
                 await add_favorite(user_id, post)
@@ -1327,8 +1927,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     added += 1
         await query.message.reply_text(f"🗂 Добавлено в коллекцию: {added}.")
 
-    elif data == "gallery_col_new":
-        user_states[user_id] = "waiting_bulk_collection_name"
+    elif data.startswith("gallery_col_new:"):
+        raw_ids = data.split(":", 1)[1]
+        bulk_post_ids = tuple(
+            int(post_id) for post_id in raw_ids.split(",") if post_id.isdigit()
+        )[:10]
+        if await begin_callback_flow(
+            "waiting_bulk_collection_name",
+            bulk=(pending_bulk_posts, bulk_post_ids),
+        ) is None:
+            return
         await query.message.reply_text(
             "Введите название новой коллекции для этой подборки:",
             reply_markup=get_cancel_keyboard("library"),
@@ -1436,8 +2044,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current = options.get("quality_mode", "auto")
             options["quality_mode"] = values[(values.index(current) + 1) % len(values)]
         elif action == "blacklist":
-            pending_subscription_options[user_id] = sub_query
-            user_states[user_id] = "waiting_subscription_blacklist"
+            if await begin_callback_flow(
+                "waiting_subscription_blacklist",
+                subscription=(pending_subscription_options, sub_query),
+            ) is None:
+                return
             await query.message.reply_text(
                 "Введите дополнительные теги чёрного списка через пробел или `-` для сброса.",
                 reply_markup=get_cancel_keyboard("subscriptions"),
@@ -1468,7 +2079,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_collections(query.message, user_id)
 
     elif data == "col_create":
-        user_states[user_id] = "waiting_collection_create"
+        if await begin_callback_flow("waiting_collection_create") is None:
+            return
         await query.message.reply_text(
             "Введите название коллекции (до 40 символов):",
             reply_markup=get_cancel_keyboard("fav_collections"),
@@ -1504,7 +2116,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("col_rename_"):
         value = data.replace("col_rename_", "", 1)
         if value.isdigit():
-            user_states[user_id] = f"waiting_collection_rename_{value}"
+            if await begin_callback_flow(
+                f"waiting_collection_rename_{value}"
+            ) is None:
+                return
             await query.message.reply_text(
                 "Введите новое название коллекции:",
                 reply_markup=get_cancel_keyboard("fav_collections"),
@@ -1546,8 +2161,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("fav_note_"):
         value = data.replace("fav_note_", "", 1)
         if value.isdigit():
-            user_states[user_id] = f"waiting_favorite_note_{value}"
+            note_generation = await begin_callback_flow(
+                f"waiting_favorite_note_{value}"
+            )
+            if note_generation is None:
+                return
             current = await get_favorite_note(user_id, int(value))
+            if not await commit_flow_if_current(
+                user_id, note_generation, lambda: None
+            ):
+                return
             await query.message.reply_text(
                 "Введите заметку до 1000 символов. Отправьте `-`, чтобы удалить."
                 + (f"\n\nСейчас: {current}" if current else ""),
@@ -1555,13 +2178,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     elif data == "fav_gallery":
-        await send_favorites_gallery(query.message, user_id)
+        await send_favorites_gallery(query.message, user_id, issuer=callback_issuer)
 
     elif data == "fav_list":
         await show_favorites_list(query.message, user_id, edit=False, page=0)
 
     elif data == "fav_find":
-        user_states[user_id] = "waiting_fav_tag"
+        if await begin_callback_flow("waiting_fav_tag") is None:
+            return
         await query.edit_message_text(
             "🔎 Введите теги или слова из заметки для поиска в избранном:\n\n"
             "Пример: `blonde_hair wallpaper`",
@@ -1618,7 +2242,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query.message,
             post,
             keyboard=get_image_keyboard(
-                int(post_id_text), show_tags_button=should_show_tags_button(settings)
+                int(post_id_text),
+                show_tags_button=should_show_tags_button(settings),
+                side_effect_callback=callback_issuer,
             ),
             settings=settings,
         )
@@ -1634,14 +2260,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (TypeError, ValueError):
             await query.message.reply_text("❌ Не удалось открыть страницу тегов.")
             return
-        await send_full_post_tags(query.message, post_id, page=page, edit=True)
+        await send_full_post_tags(
+            query.message,
+            post_id,
+            user_id,
+            callback_issuer,
+            page=page,
+            edit=True,
+        )
 
     elif data.startswith("post_tags_"):
         post_id_text = data.replace("post_tags_", "", 1)
         if not post_id_text.isdigit():
             await query.message.reply_text("❌ Не удалось определить пост.")
             return
-        await send_full_post_tags(query.message, int(post_id_text))
+        await send_full_post_tags(
+            query.message, int(post_id_text), user_id, callback_issuer
+        )
 
     elif data == "settings":
         settings = await get_user_settings(user_id)
@@ -1715,7 +2350,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "gallery_resolution":
-        user_states[user_id] = "waiting_gallery_resolution"
+        if await begin_callback_flow("waiting_gallery_resolution") is None:
+            return
         await query.edit_message_text(
             "Введите минимальное разрешение как `ширинаxвысота`, например `1920x1080`. Для сброса: `0x0`.",
             parse_mode="Markdown",
@@ -1775,7 +2411,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "settings_pause_subscriptions":
-        user_states[user_id] = "waiting_pause_subscriptions"
+        if await begin_callback_flow("waiting_pause_subscriptions") is None:
+            return
         await query.edit_message_text(
             "⏸ На сколько остановить все активные подписки?\n\n"
             "Можно написать в минутах или коротко: `30`, `2ч`, `1д`.\n"
@@ -1837,7 +2474,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "sub_add_current":
         saved = await get_user_query(user_id)
         if saved and saved[0]:
-            user_states[user_id] = f"waiting_sub_interval_{saved[0]}"
+            if await begin_callback_flow(
+                f"waiting_sub_interval_{saved[0]}"
+            ) is None:
+                return
             await query.edit_message_text(
                 f"🔔 Подписка на: `{md_code(saved[0])}`\n\n"
                 "Введите интервал в минутах от 1 до 120 (по умолчанию 10):",
@@ -1851,7 +2491,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     elif data == "sub_add_new":
-        user_states[user_id] = "waiting_sub_new"
+        if await begin_callback_flow("waiting_sub_new") is None:
+            return
         await query.edit_message_text(
             "🔔 Введите теги для подписки (через пробел):\n\n" "Пример: `anime girl`",
             parse_mode="Markdown",
@@ -1908,7 +2549,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [
                         InlineKeyboardButton(
                             f"{toggle_action}",
-                            callback_data=store_callback_payload("sub_toggle", sub_query),
+                            callback_data=callback_issuer.payload(
+                                "sub_toggle", sub_query
+                            ),
                         ),
                         InlineKeyboardButton(
                             f"⏱ {interval} мин.",
@@ -1951,7 +2594,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        user_states[user_id] = f"waiting_sub_interval_update_{sub_query}"
+        if await begin_callback_flow(
+            f"waiting_sub_interval_update_{sub_query}"
+        ) is None:
+            return
         await query.edit_message_text(
             f"⏱ Новый интервал для `{md_code(sub_query)}`\n\n"
             "Введите число минут от 1 до 120:",
@@ -1999,7 +2645,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        await send_subscription_post_by_index(query.message, user_id, sub_query, index)
+        await send_subscription_post_by_index(
+            query.message, user_id, sub_query, index, issuer=callback_issuer
+        )
 
     elif data.startswith("sub_all_"):
         token = data.replace("sub_all_", "", 1)
@@ -2010,7 +2658,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        await send_subscription_gallery(query.message, user_id, sub_query, token)
+        await send_subscription_gallery(
+            query.message, user_id, sub_query, token, issuer=callback_issuer
+        )
 
     elif data.startswith("sub_page_"):
         parts = data.split("_")
@@ -2027,7 +2677,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        await edit_subscription_gallery(query, user_id, sub_query, token, index)
+        await edit_subscription_gallery(
+            query, user_id, sub_query, token, index, issuer=callback_issuer
+        )
 
     elif data.startswith("sub_post_del_"):
         parts = data.split("_")
@@ -2047,7 +2699,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await remove_subscription_post(user_id, sub_query, post_id)
         await remove_favorite(user_id, post_id)
-        await edit_subscription_gallery(query, user_id, sub_query, token, index)
+        await edit_subscription_gallery(
+            query, user_id, sub_query, token, index, issuer=callback_issuer
+        )
 
     elif data.startswith("sub_toggle_"):
         sub_query = get_callback_payload("sub_toggle", data)
@@ -2109,7 +2763,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        preview_text, preview_keyboard = get_subscription_preview(sub_query, 10)
+        preview_text, preview_keyboard = get_subscription_preview(
+            sub_query, 10, user_id, issuer=callback_issuer
+        )
         await query.message.reply_text(
             preview_text,
             reply_markup=preview_keyboard,
@@ -2126,7 +2782,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        confirm_callback = store_callback_payload("sub_remove_do", sub_query)
+        confirm_callback = callback_issuer.payload("sub_remove_do", sub_query)
         await query.edit_message_text(
             f"Удалить подписку `{md_code(sub_query)}`?\n\n"
             "Сохранённые посты этой подписки также будут удалены.",
@@ -2168,7 +2824,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "🗑 Удалить",
-                    callback_data=f"fav_remove_do_{post_id_text}_{page}",
+                    callback_data=callback_issuer.side_effect(
+                        f"fav_remove_do_{post_id_text}_{page}"
+                    ),
                 ),
                 InlineKeyboardButton("❌ Отмена", callback_data="fav_list"),
             ]]),
@@ -2209,12 +2867,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             get_image_keyboard(
                 post["id"],
                 show_tags_button=should_show_tags_button(settings),
+                side_effect_callback=callback_issuer,
             ),
             settings=settings,
         )
 
     elif data == "fav_all":
-        await send_favorites_gallery(query.message, user_id)
+        await send_favorites_gallery(query.message, user_id, issuer=callback_issuer)
 
     elif data.startswith("fav_page_"):
         page_text = data.replace("fav_page_", "", 1)
@@ -2222,7 +2881,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("❌ Не удалось открыть страницу.")
             return
 
-        await send_favorites_gallery(query.message, user_id, int(page_text))
+        await send_favorites_gallery(
+            query.message, user_id, int(page_text), issuer=callback_issuer
+        )
 
     elif data.startswith("fav_del_") and not data.startswith("fav_del_do_"):
         parts = data.split("_")
@@ -2236,7 +2897,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Удалить пост `{post_id}` из избранного?",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
-                    "🗑 Удалить", callback_data=f"fav_del_do_{post_id}_{index}"
+                    "🗑 Удалить",
+                    callback_data=callback_issuer.side_effect(
+                        f"fav_del_do_{post_id}_{index}"
+                    ),
                 ),
                 InlineKeyboardButton("❌ Отмена", callback_data="fav_gallery"),
             ]]),
@@ -2251,7 +2915,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_id = int(parts[3])
         index = int(parts[4])
         await remove_favorite(user_id, post_id)
-        await edit_favorites_gallery(query, user_id, index)
+        await edit_favorites_gallery(query, user_id, index, issuer=callback_issuer)
 
     elif data.startswith("sub_fav_"):
         payload = data.replace("sub_fav_", "", 1)
@@ -2344,11 +3008,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         schedule_background_task(
             context,
-            send_image(query.message, user_id, history_query),
+            send_image(
+                query.message,
+                user_id,
+                history_query,
+                expected_generation=callback_generation,
+            ),
         )
 
     elif data == "bl_add":
-        user_states[user_id] = "waiting_bl_add"
+        if await begin_callback_flow("waiting_bl_add") is None:
+            return
         await query.edit_message_text(
             "➕ Введите тег для добавления в чёрный список:\n\n"
             "💡 Можно ввести несколько тегов через пробел",
@@ -2356,8 +3026,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "bl_remove":
-        user_states[user_id] = "waiting_bl_remove"
+        remove_generation = await begin_callback_flow("waiting_bl_remove")
+        if remove_generation is None:
+            return
         blacklist = await get_user_blacklist(user_id)
+        if not await commit_flow_if_current(
+            user_id, remove_generation, lambda: None
+        ):
+            return
         if blacklist:
             ordered_tags = sorted(blacklist)
             visible_tags = ordered_tags[:60]
@@ -2417,7 +3093,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     elif data == "bl_temp":
-        user_states[user_id] = "waiting_bl_temp"
+        if await begin_callback_flow("waiting_bl_temp") is None:
+            return
         await query.edit_message_text(
             "Введите тег и срок: `tag 2ч`, `tag 1д` или `tag 30` (минуты).",
             parse_mode="Markdown",
@@ -2425,7 +3102,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "bl_import":
-        user_states[user_id] = "waiting_bl_import"
+        if await begin_callback_flow("waiting_bl_import") is None:
+            return
         await query.edit_message_text(
             "Отправьте список тегов через пробел, запятую или с новой строки. "
             "Импорт заменит текущий чёрный список.",
@@ -2444,7 +3122,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "bl_suggest":
-        user_states[user_id] = "waiting_bl_suggest"
+        if await begin_callback_flow("waiting_bl_suggest") is None:
+            return
         await query.edit_message_text(
             "Введите тег, для которого найти похожие варианты:",
             reply_markup=get_cancel_keyboard("blacklist"),
@@ -2455,9 +3134,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for preset, tags in BLACKLIST_PRESETS.items():
             rows.append([
                 InlineKeyboardButton(
-                    f"➕ {preset} ({len(tags)})", callback_data=f"bl_preset_add_{preset}"
+                    f"➕ {preset} ({len(tags)})",
+                    callback_data=callback_issuer.side_effect(
+                        f"bl_preset_add_{preset}"
+                    ),
                 ),
-                InlineKeyboardButton("➖", callback_data=f"bl_preset_del_{preset}"),
+                InlineKeyboardButton(
+                    "➖",
+                    callback_data=callback_issuer.side_effect(
+                        f"bl_preset_del_{preset}"
+                    ),
+                ),
             ])
         rows.append([InlineKeyboardButton("◀️ Назад", callback_data="blacklist")])
         await query.edit_message_text(
@@ -2489,7 +3176,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_query_answer(query, "Кнопка устарела")
 
     elif data == "back":
-        user_states.pop(user_id, None)
+        await invalidate_user_flow(user_id)
         await query.edit_message_text(
             await build_main_menu_text(user_id),
             reply_markup=await get_user_main_keyboard(user_id),
@@ -2540,12 +3227,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def send_random_image(message, user_id: int):
+async def send_random_image(
+    message, user_id: int, *, expected_generation: int | None = None
+):
     """Отправка случайного изображения без поисковых тегов."""
+    try:
+        callback_issuer = callback_issuer_for(user_id, expected_generation)
+    except StaleCallbackIssuer:
+        return False
     blacklist = await get_user_blacklist(user_id)
     settings = await get_user_settings(user_id)
 
-    if is_rate_limited(user_id):
+    if await reserve_search_cooldown(user_id):
         await message.reply_text(
             f"⏳ Подождите {SEARCH_COOLDOWN_SECONDS} сек. перед следующим поиском.",
             reply_markup=get_main_keyboard(),
@@ -2607,14 +3300,19 @@ async def send_random_image(message, user_id: int):
     if settings.get("show_caption", True):
         caption = await build_caption(settings, result)
 
+    try:
+        keyboard = get_random_image_keyboard(
+            post_id,
+            should_show_tags_button(settings),
+            side_effect_callback=callback_issuer,
+        )
+    except StaleCallbackIssuer:
+        keyboard = None
     delivered = await send_post_media(
         message,
         result,
         caption,
-        get_random_image_keyboard(
-            post_id,
-            should_show_tags_button(settings),
-        ),
+        keyboard,
         settings=settings,
     )
     if delivered and post_id:
@@ -2630,12 +3328,24 @@ async def send_image(
     edit: bool = False,
     is_more: bool = False,
     is_subscription: bool = False,
+    expected_generation: int | None = None,
 ):
     """Отправка изображения"""
+    try:
+        callback_issuer = callback_issuer_for(user_id, expected_generation)
+    except StaleCallbackIssuer:
+        return False
+    if not is_subscription and not str(tags).strip():
+        await message.reply_text(
+            "❌ Укажите хотя бы один тег для поиска.",
+            reply_markup=get_main_keyboard(),
+        )
+        return False
+
     blacklist = await get_user_blacklist(user_id)
     settings = await get_user_settings(user_id)
 
-    if not is_subscription and is_rate_limited(user_id):
+    if not is_subscription and await reserve_search_cooldown(user_id):
         await message.reply_text(
             f"⏳ Подождите {SEARCH_COOLDOWN_SECONDS} сек. перед следующим поиском.",
             reply_markup=get_main_keyboard(),
@@ -2715,14 +3425,23 @@ async def send_image(
 
         # Для подписок не добавляем кнопку подписки (чтобы избежать рекурсии)
         show_tags_button = should_show_tags_button(settings)
-        if is_subscription:
-            keyboard = get_subscription_image_keyboard(
-                post_id,
-                tags,
-                show_tags_button,
-            )
-        else:
-            keyboard = get_image_keyboard(post_id, tags, show_tags_button)
+        try:
+            if is_subscription:
+                keyboard = get_subscription_image_keyboard(
+                    post_id,
+                    tags,
+                    show_tags_button,
+                    side_effect_callback=callback_issuer,
+                )
+            else:
+                keyboard = get_image_keyboard(
+                    post_id,
+                    tags,
+                    show_tags_button,
+                    side_effect_callback=callback_issuer,
+                )
+        except StaleCallbackIssuer:
+            keyboard = None
 
         delivered = await send_post_media(
             message, result, caption, keyboard, settings=settings
@@ -2924,7 +3643,12 @@ async def show_subscription_posts_menu(
 
 
 async def send_subscription_post_by_index(
-    message, user_id: int, sub_query: str, index: int
+    message,
+    user_id: int,
+    sub_query: str,
+    index: int,
+    *,
+    issuer: OneShotCallbackIssuer,
 ):
     total = await count_subscription_posts(user_id, sub_query)
     if index < 0 or index >= total:
@@ -2943,12 +3667,19 @@ async def send_subscription_post_by_index(
         message, post, caption, get_subscription_image_keyboard(
             post.get("id", 0),
             show_tags_button=should_show_tags_button(settings),
+            side_effect_callback=issuer,
         ), settings=settings
     )
 
 
 async def send_subscription_gallery(
-    message, user_id: int, sub_query: str, token: str, index: int = 0
+    message,
+    user_id: int,
+    sub_query: str,
+    token: str,
+    index: int = 0,
+    *,
+    issuer: OneShotCallbackIssuer,
 ):
     total = await count_subscription_posts(user_id, sub_query)
     if total <= 0:
@@ -2974,13 +3705,20 @@ async def send_subscription_gallery(
             total,
             post.get("id", 0),
             should_show_tags_button(settings),
+            side_effect_callback=issuer,
         ),
         settings=settings,
     )
 
 
 async def edit_subscription_gallery(
-    query, user_id: int, sub_query: str, token: str, index: int
+    query,
+    user_id: int,
+    sub_query: str,
+    token: str,
+    index: int,
+    *,
+    issuer: OneShotCallbackIssuer,
 ):
     total = await count_subscription_posts(user_id, sub_query)
     if total <= 0:
@@ -3006,6 +3744,7 @@ async def edit_subscription_gallery(
         total,
         post.get("id", 0),
         should_show_tags_button(settings),
+        side_effect_callback=issuer,
     )
     try:
         await query.edit_message_media(
@@ -3017,7 +3756,13 @@ async def edit_subscription_gallery(
         await send_post_media(query.message, post, caption, keyboard, settings=settings)
 
 
-async def send_favorites_gallery(message, user_id: int, page: int = 0):
+async def send_favorites_gallery(
+    message,
+    user_id: int,
+    page: int = 0,
+    *,
+    issuer: OneShotCallbackIssuer,
+):
     total = await count_favorites(user_id)
     if total <= 0:
         await message.reply_text("❌ Избранное пока пустое.")
@@ -3078,6 +3823,7 @@ async def send_favorites_gallery(message, user_id: int, page: int = 0):
             get_image_keyboard(
                 int(post.get("id") or 0),
                 show_tags_button=should_show_tags_button(settings),
+                side_effect_callback=issuer,
             ),
             settings=settings,
         )
@@ -3092,7 +3838,13 @@ async def send_favorites_gallery(message, user_id: int, page: int = 0):
     return bool(delivered_posts)
 
 
-async def edit_favorites_gallery(query, user_id: int, index: int):
+async def edit_favorites_gallery(
+    query,
+    user_id: int,
+    index: int,
+    *,
+    issuer: OneShotCallbackIssuer,
+):
     total = await count_favorites(user_id)
     if total <= 0:
         await query.message.reply_text("❌ В избранном больше нет постов.")
@@ -3111,6 +3863,7 @@ async def edit_favorites_gallery(query, user_id: int, index: int):
         total,
         post.get("id", 0),
         should_show_tags_button(settings),
+        side_effect_callback=issuer,
     )
     try:
         await query.edit_message_media(
@@ -3277,7 +4030,18 @@ async def show_favorites_list(
         await message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
 
-async def send_search_gallery(message, user_id: int, tags: str, page: int = 0):
+async def send_search_gallery(
+    message,
+    user_id: int,
+    tags: str,
+    page: int = 0,
+    *,
+    expected_generation: int | None = None,
+):
+    try:
+        callback_issuer = callback_issuer_for(user_id, expected_generation)
+    except StaleCallbackIssuer:
+        return False
     settings = normalize_feature_settings(await get_user_settings(user_id))
     blacklist = await get_user_blacklist(user_id)
     excluded = await get_sent_post_ids(user_id)
@@ -3344,14 +4108,19 @@ async def send_search_gallery(message, user_id: int, tags: str, page: int = 0):
 
     if not delivered_ids:
         for post in prepared:
-            delivered = await send_post_media(
-                message,
-                post,
-                keyboard=get_image_keyboard(
+            try:
+                keyboard = get_image_keyboard(
                     int(post.get("id") or 0),
                     query=tags,
                     show_tags_button=should_show_tags_button(settings),
-                ),
+                    side_effect_callback=callback_issuer,
+                )
+            except StaleCallbackIssuer:
+                keyboard = None
+            delivered = await send_post_media(
+                message,
+                post,
+                keyboard=keyboard,
                 settings=settings,
             )
             if delivered:
@@ -3369,19 +4138,35 @@ async def send_search_gallery(message, user_id: int, tags: str, page: int = 0):
         previous_callback = store_callback_payload(
             "gallery_next", json.dumps({"tags": tags, "page": page - 1})
         )
+    try:
+        bulk_callback = (
+            callback_issuer.payload(
+                "gallery_bulk_fav",
+                ",".join(str(post_id) for post_id in delivered_ids),
+            )
+            if delivered_ids
+            else None
+        )
+        collection_callback = (
+            callback_issuer.payload(
+                "gallery_collection",
+                ",".join(str(post_id) for post_id in delivered_ids),
+            )
+            if delivered_ids
+            else None
+        )
+    except StaleCallbackIssuer:
+        bulk_callback = None
+        collection_callback = None
     await message.reply_text(
         f"Показано: {len(delivered_ids)}. Страница источника: {page + 1}.",
         reply_markup=get_gallery_result_keyboard(
             next_callback,
             previous_callback,
-            store_callback_payload(
-                "gallery_bulk_fav", ",".join(str(post_id) for post_id in delivered_ids)
-            ) if delivered_ids else None,
+            bulk_callback,
             store_callback_payload("preset_from", tags) if tags else None,
             store_callback_payload("subscribe", tags) if tags else None,
-            store_callback_payload(
-                "gallery_collection", ",".join(str(post_id) for post_id in delivered_ids)
-            ) if delivered_ids else None,
+            collection_callback,
         ),
     )
     return bool(delivered_ids)
@@ -3550,7 +4335,13 @@ async def show_search_presets(message, user_id: int):
     await message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown")
 
 
-async def show_read_later(message, user_id: int):
+async def show_read_later(
+    message,
+    user_id: int,
+    *,
+    issuer: OneShotCallbackIssuer | None = None,
+):
+    callback_issuer = issuer or callback_issuer_for(user_id)
     posts = await get_read_later(user_id, limit=20)
     if not posts:
         await message.reply_text(
@@ -3562,6 +4353,8 @@ async def show_read_later(message, user_id: int):
             ]),
         )
         return
+    if temporary_user_state.generation(user_id) != callback_issuer.expected_generation:
+        return
     rows = []
     lines = []
     for post in posts[:10]:
@@ -3570,7 +4363,12 @@ async def show_read_later(message, user_id: int):
         lines.append(f"• `{post_id}` {md_text(tags)}")
         rows.append([
             InlineKeyboardButton(f"📤 {post_id}", callback_data=f"later_open_{post_id}"),
-            InlineKeyboardButton("✅ Убрать", callback_data=f"later_del_{post_id}"),
+            InlineKeyboardButton(
+                "✅ Убрать",
+                callback_data=callback_issuer.side_effect(
+                    f"later_del_{post_id}"
+                ),
+            ),
         ])
     rows.append([InlineKeyboardButton("◀️ Меню", callback_data="back")])
     await message.reply_text(
@@ -3605,7 +4403,13 @@ async def show_storage(message, user_id: int):
     )
 
 
-async def send_recommendations(message, user_id: int):
+async def send_recommendations(
+    message, user_id: int, *, expected_generation: int | None = None
+):
+    try:
+        callback_issuer = callback_issuer_for(user_id, expected_generation)
+    except StaleCallbackIssuer:
+        return False
     profile = await get_favorite_tag_profile(user_id, limit=5)
     settings = await get_user_settings(user_id)
     excluded = set(str(settings.get("recommendation_excluded_tags", "")).split())
@@ -3621,19 +4425,28 @@ async def send_recommendations(message, user_id: int):
         )
         return False
     tags = " ".join(tag for tag, _count in profile[:3])
+    try:
+        recommendation_rows = [
+            [InlineKeyboardButton(
+                f"🚫 Не рекомендовать {tag[:24]}",
+                callback_data=callback_issuer.payload("rec_hide", tag),
+            )]
+            for tag, _count in profile[:3]
+        ]
+    except StaleCallbackIssuer:
+        return False
     await message.reply_text(
         "✨ Подборка по частым тегам избранного: "
         + ", ".join(f"`{md_code(tag)}`" for tag, _count in profile[:3]),
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                f"🚫 Не рекомендовать {tag[:24]}",
-                callback_data=store_callback_payload("rec_hide", tag),
-            )]
-            for tag, _count in profile[:3]
-        ]),
+        reply_markup=InlineKeyboardMarkup(recommendation_rows),
         parse_mode="Markdown",
     )
-    return await send_search_gallery(message, user_id, tags)
+    return await send_search_gallery(
+        message,
+        user_id,
+        tags,
+        expected_generation=callback_issuer.expected_generation,
+    )
 
 
 async def show_favorite_search_results(message, user_id: int, text: str):
@@ -3927,6 +4740,10 @@ async def send_digest_posts(
                     message,
                     post,
                     caption="📨 Дайджест подписок" if index == 0 else "",
+                    keyboard=get_subscription_image_keyboard(
+                        post.get("id", 0),
+                        side_effect_callback=side_effect_callback_for(user_id),
+                    ),
                     settings=settings,
                     raise_on_timeout=True,
                 )
@@ -4021,6 +4838,10 @@ async def send_digest_to_chat(
                     user_id,
                     post,
                     caption="📨 Дайджест подписок" if index == 0 else "",
+                    keyboard=get_subscription_image_keyboard(
+                        post.get("id", 0),
+                        side_effect_callback=side_effect_callback_for(user_id),
+                    ),
                     settings=settings,
                     raise_on_timeout=True,
                 )
@@ -4062,7 +4883,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
-    state = user_states.get(user_id)
+    state = None
+    flow_generation = temporary_user_state.generation(user_id)
+    flow_snapshot = {}
     persistent_actions = {
         PERSISTENT_SEARCH,
         LEGACY_PERSISTENT_SEARCH,
@@ -4075,26 +4898,20 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PERSISTENT_MENU,
         LEGACY_PERSISTENT_MENU,
     }
-    if text in persistent_actions:
-        user_states.pop(user_id, None)
-        search_builders.pop(user_id, None)
-        pending_preset_queries.pop(user_id, None)
-        pending_bulk_posts.pop(user_id, None)
-        pending_subscription_options.pop(user_id, None)
-        state = None
-
     if text.lower() in {"отмена", "❌ отмена", "cancel", "/cancel"}:
-        user_states.pop(user_id, None)
-        search_builders.pop(user_id, None)
-        pending_preset_queries.pop(user_id, None)
-        pending_bulk_posts.pop(user_id, None)
-        pending_subscription_options.pop(user_id, None)
+        await invalidate_user_flow(user_id)
         await update.message.reply_text(
             "Действие отменено.\n\n" + await build_main_menu_text(user_id),
             reply_markup=await get_user_main_keyboard(user_id),
         )
+        return
 
-    elif text in {PERSISTENT_SEARCH, LEGACY_PERSISTENT_SEARCH}:
+    if text in persistent_actions:
+        flow_generation = await invalidate_user_flow(user_id)
+    else:
+        state, flow_generation, flow_snapshot = await claim_user_message_state(user_id)
+
+    if text in {PERSISTENT_SEARCH, LEGACY_PERSISTENT_SEARCH}:
         await update.message.reply_text(
             "Главная → Поиск\n\nВыберите способ поиска.",
             reply_markup=get_search_hub_keyboard(),
@@ -4102,7 +4919,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif text == PERSISTENT_GALLERY:
-        user_states[user_id] = "waiting_gallery"
+        await begin_user_flow(user_id, "waiting_gallery")
         await update.message.reply_text(
             "🖼 Введите теги для подборки или `random` для случайных изображений.",
             parse_mode="Markdown",
@@ -4110,11 +4927,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif text in {PERSISTENT_RANDOM, LEGACY_PERSISTENT_RANDOM}:
-        user_states.pop(user_id, None)
-        schedule_background_task(context, send_random_image(update.message, user_id))
+        schedule_background_task(
+            context,
+            send_random_image(
+                update.message,
+                user_id,
+                expected_generation=flow_generation,
+            ),
+        )
 
     elif text in {PERSISTENT_FAVORITES, LEGACY_PERSISTENT_FAVORITES}:
-        user_states.pop(user_id, None)
         total = await count_favorites(user_id)
         later_count = (await get_user_storage_stats(user_id)).get("read_later", 0)
         await update.message.reply_text(
@@ -4124,7 +4946,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif text == PERSISTENT_SUBSCRIPTIONS:
-        user_states.pop(user_id, None)
         await update.message.reply_text(
             await build_subscriptions_menu_text(user_id),
             reply_markup=await get_user_subscriptions_keyboard(user_id),
@@ -4132,7 +4953,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif text in {PERSISTENT_MENU, LEGACY_PERSISTENT_MENU}:
-        user_states.pop(user_id, None)
         await update.message.reply_text(
             await build_main_menu_text(user_id),
             reply_markup=await get_user_main_keyboard(user_id),
@@ -4143,29 +4963,55 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await request_restart(update, context)
 
     elif state == "waiting_search":
-        user_states.pop(user_id, None)
-        schedule_background_task(context, send_image(update.message, user_id, text))
+        schedule_background_task(
+            context,
+            send_image(
+                update.message,
+                user_id,
+                text,
+                expected_generation=flow_generation,
+            ),
+        )
 
     elif state == "waiting_gallery":
-        user_states.pop(user_id, None)
         tags = "" if text.lower() in {"random", "рандом", "случайно"} else text
-        schedule_background_task(context, send_search_gallery(update.message, user_id, tags))
+        schedule_background_task(
+            context,
+            send_search_gallery(
+                update.message,
+                user_id,
+                tags,
+                expected_generation=flow_generation,
+            ),
+        )
 
     elif state == "waiting_builder_include":
-        search_builders[user_id] = {"include": " ".join(text.split()[:12])}
-        user_states[user_id] = "waiting_builder_exclude"
+        include_builder = {"include": " ".join(text.split()[:12])}
+
+        def commit_builder_include():
+            search_builders[user_id] = include_builder
+            user_states[user_id] = "waiting_builder_exclude"
+
+        if not await commit_flow_if_current(
+            user_id, flow_generation, commit_builder_include
+        ):
+            return
         await update.message.reply_text(
             "Введите исключаемые теги без минуса или отправьте `-`, если исключений нет.",
             reply_markup=get_cancel_keyboard("search_hub"),
         )
 
     elif state == "waiting_builder_exclude":
-        user_states.pop(user_id, None)
-        builder = search_builders.pop(user_id, {})
+        builder = flow_snapshot.get("builder", {})
         include = builder.get("include", "")
         excluded = [] if text == "-" else text.split()[:12]
         built_query = " ".join([include] + [f"-{tag.lstrip('-')}" for tag in excluded]).strip()
-        pending_preset_queries[user_id] = built_query
+        if not await commit_flow_if_current(
+            user_id,
+            flow_generation,
+            lambda: pending_preset_queries.__setitem__(user_id, built_query),
+        ):
+            return
         await update.message.reply_text(
             f"🧩 Готовый запрос: `{md_code(built_query)}`",
             reply_markup=InlineKeyboardMarkup([[
@@ -4182,8 +5028,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif state == "waiting_preset_name":
-        user_states.pop(user_id, None)
-        preset_query = pending_preset_queries.pop(user_id, "")
+        preset_query = flow_snapshot.get("preset_query", "")
         settings = normalize_feature_settings(await get_user_settings(user_id))
         preset_id = await create_search_preset(user_id, text, preset_query, settings)
         await update.message.reply_text(
@@ -4192,8 +5037,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_search_presets(update.message, user_id)
 
     elif state == "waiting_bulk_collection_name":
-        user_states.pop(user_id, None)
-        post_ids = pending_bulk_posts.pop(user_id, [])
+        post_ids = flow_snapshot.get("bulk_posts", ())
         collection_id = await create_favorite_collection(user_id, text)
         added = 0
         if collection_id:
@@ -4209,8 +5053,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif state == "waiting_subscription_blacklist":
-        user_states.pop(user_id, None)
-        sub_query = pending_subscription_options.pop(user_id, "")
+        sub_query = flow_snapshot.get("subscription_query", "")
         options = await get_subscription_options(user_id, sub_query)
         options["extra_blacklist"] = "" if text == "-" else " ".join(text.lower().split()[:30])
         saved = await update_subscription_options(user_id, sub_query, options)
@@ -4219,7 +5062,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif state == "waiting_collection_create":
-        user_states.pop(user_id, None)
         collection_id = await create_favorite_collection(user_id, text)
         if collection_id:
             await update.message.reply_text(f"✅ Коллекция «{text[:40]}» создана.")
@@ -4228,7 +5070,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_collections(update.message, user_id)
 
     elif state and state.startswith("waiting_collection_rename_"):
-        user_states.pop(user_id, None)
         collection_id = state.replace("waiting_collection_rename_", "", 1)
         renamed = collection_id.isdigit() and await rename_favorite_collection(
             user_id, int(collection_id), text
@@ -4239,7 +5080,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_collections(update.message, user_id)
 
     elif state and state.startswith("waiting_favorite_note_"):
-        user_states.pop(user_id, None)
         post_id_text = state.replace("waiting_favorite_note_", "", 1)
         note = "" if text == "-" else text
         saved = post_id_text.isdigit() and await set_favorite_note(
@@ -4251,7 +5091,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif state == "waiting_gallery_resolution":
-        user_states.pop(user_id, None)
         normalized = text.lower().replace("×", "x").replace(" ", "")
         parts = normalized.split("x", 1)
         if len(parts) != 2 or not all(part.isdigit() for part in parts):
@@ -4268,7 +5107,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     elif state == "waiting_bl_temp":
-        user_states.pop(user_id, None)
         parts = text.split()
         if len(parts) < 2:
             await update.message.reply_text("❌ Укажите тег и срок, например `animated 2ч`.", parse_mode="Markdown")
@@ -4287,7 +5125,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     elif state == "waiting_bl_import":
-        user_states.pop(user_id, None)
         tags = {
             tag.strip().lower()
             for tag in text.replace(",", " ").replace(";", " ").split()
@@ -4299,7 +5136,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif state == "waiting_bl_suggest":
-        user_states.pop(user_id, None)
         suggestions = await api.autocomplete(text)
         if suggestions:
             rows = [[InlineKeyboardButton(
@@ -4312,7 +5148,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Похожие теги не найдены.")
 
     elif state == "waiting_pause_subscriptions":
-        user_states.pop(user_id, None)
         pause_minutes = parse_pause_minutes(text)
         paused_count = await pause_all_active_subscriptions(user_id, pause_minutes)
         await update.message.reply_text(
@@ -4324,12 +5159,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif state == "waiting_fav_tag":
-        user_states.pop(user_id, None)
         await show_favorite_search_results(update.message, user_id, text)
 
     elif state == "waiting_sub_new":
-        user_states.pop(user_id, None)
-        user_states[user_id] = f"waiting_sub_interval_{text}"
+        if not await commit_flow_if_current(
+            user_id,
+            flow_generation,
+            lambda: user_states.__setitem__(user_id, f"waiting_sub_interval_{text}"),
+        ):
+            return
         await update.message.reply_text(
             f"🔔 Подписка на: `{md_code(text)}`\n\n"
             "Введите интервал в минутах от 1 до 120 (по умолчанию 10):",
@@ -4339,7 +5177,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif state and state.startswith("waiting_sub_interval_update_"):
         sub_query = state.replace("waiting_sub_interval_update_", "", 1)
-        user_states.pop(user_id, None)
         interval = parse_subscription_interval(text)
 
         success = await update_subscription_interval(user_id, sub_query, interval)
@@ -4357,10 +5194,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif state and state.startswith("waiting_sub_interval_"):
         query = state.replace("waiting_sub_interval_", "", 1)
-        user_states.pop(user_id, None)
 
         interval = parse_subscription_interval(text)
-        preview_text, preview_keyboard = get_subscription_preview(query, interval)
+        preview_text, preview_keyboard = get_subscription_preview(
+            query,
+            interval,
+            user_id,
+            issuer=callback_issuer_for(user_id, flow_generation),
+        )
         await update.message.reply_text(
             preview_text,
             reply_markup=preview_keyboard,
@@ -4368,7 +5209,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif state == "waiting_bl_add":
-        user_states.pop(user_id, None)
         tags = text.lower().split()
         added = []
         already = []
@@ -4395,7 +5235,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif state == "waiting_bl_remove":
-        user_states.pop(user_id, None)
         tags = text.lower().split()
         removed = []
         not_found = []
@@ -4423,7 +5262,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     else:
         # По умолчанию - поиск
-        schedule_background_task(context, send_image(update.message, user_id, text))
+        schedule_background_task(
+            context,
+            send_image(
+                update.message,
+                user_id,
+                text,
+                expected_generation=flow_generation,
+            ),
+        )
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4462,7 +5309,7 @@ async def subscriptions_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the current multi-step input flow."""
     user_id = update.effective_user.id
-    clear_user_temporary_state(user_id)
+    await invalidate_user_flow(user_id)
     export_cancelled = bool(zip_export_manager) and await zip_export_manager.cancel_for_user(user_id)
     await update.message.reply_text(
         ("Действие и ZIP-экспорт отменены.\n\n" if export_cancelled else "Действие отменено.\n\n")
@@ -4631,6 +5478,10 @@ async def retry_failed_command(update: Update, context: ContextTypes.DEFAULT_TYP
             failure["user_id"],
             failure["post"],
             failure["caption"],
+            keyboard=get_subscription_image_keyboard(
+                failure["post"].get("id", 0),
+                side_effect_callback=side_effect_callback_for(failure["user_id"]),
+            ),
         )
         if ok:
             delivered += 1
@@ -4899,6 +5750,7 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = get_image_keyboard(
                 post_id,
                 show_tags_button=should_show_tags_button(settings),
+                side_effect_callback=side_effect_callback_for(user_id),
             )
 
             await send_post_media(
@@ -5009,6 +5861,7 @@ async def process_one_subscription(app, subscription):
                 post_id,
                 query,
                 should_show_tags_button(settings),
+                side_effect_callback=side_effect_callback_for(user_id),
             )
 
             caption = ""
@@ -5317,7 +6170,7 @@ async def heartbeat_loop():
             }
             telegram_metrics = telegram_rate_limiter.snapshot_metrics()
             logger.info(
-                "Heartbeat alive uptime=%ss user_states=%s recent_posts=%s export_queued=%s export_active=%s cache_cleanup_last_deleted=%s cache_cleanup_errors=%s telegram_requests_total=%s telegram_rate_limit_waits=%s telegram_retry_after_count=%s telegram_retry_attempts=%s telegram_ambiguous_timeouts=%s telegram_request_failures=%s telegram_limiter_registry_size=%s",
+                "Heartbeat alive uptime=%ss user_states=%s recent_posts=%s export_queued=%s export_active=%s cache_cleanup_last_deleted=%s cache_cleanup_errors=%s telegram_requests_total=%s telegram_rate_limit_waits=%s telegram_retry_after_count=%s telegram_retry_attempts=%s telegram_ambiguous_timeouts=%s telegram_request_failures=%s telegram_limiter_registry_size=%s user_gate_registry_size=%s user_gate_waiters=%s user_gate_contention_total=%s stale_flow_results_discarded=%s duplicate_callbacks_rejected=%s",
                 int(time.monotonic() - started_at),
                 len(user_states),
                 len(recent_posts),
@@ -5332,6 +6185,11 @@ async def heartbeat_loop():
                 telegram_metrics["telegram_ambiguous_timeouts"],
                 telegram_metrics["telegram_request_failures"],
                 telegram_metrics["telegram_limiter_registry_size"],
+                user_operation_gate.registry_size,
+                user_operation_gate.waiter_count,
+                user_operation_gate.metrics.contention_total,
+                stale_flow_results_discarded,
+                duplicate_callbacks_rejected,
             )
         except asyncio.CancelledError:
             raise
@@ -5342,6 +6200,7 @@ async def heartbeat_loop():
 async def post_init(application):
     global subscription_task, heartbeat_task, tag_translation_task, zip_export_manager, maintenance_task
 
+    await user_operation_gate.start()
     bot = application.bot
 
     # 💣 СНАЧАЛА ЧИСТИМ ВСЁ
@@ -5416,6 +6275,7 @@ async def post_shutdown(application):
     """Очистка при завершении"""
     # Останавливаем фоновую задачу
     global subscription_task, heartbeat_task, tag_translation_task, zip_export_manager, maintenance_task
+    await user_operation_gate.shutdown()
     if zip_export_manager is not None:
         await zip_export_manager.stop()
         zip_export_manager = None
@@ -5441,6 +6301,7 @@ async def post_shutdown(application):
             pass
     maintenance_task = None
     temporary_user_state.clear_all()
+    issued_one_shot_callbacks.clear()
 
     if tag_translation_task and not tag_translation_task.done():
         tag_translation_task.cancel()

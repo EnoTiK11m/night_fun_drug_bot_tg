@@ -7,6 +7,12 @@ import bot
 
 
 class SearchFlowTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        bot.user_operation_gate.reset_for_tests()
+
+    def tearDown(self):
+        bot.user_operation_gate.reset_for_tests()
+
     async def test_schedule_background_task_uses_application_create_task(self):
         async def noop():
             return None

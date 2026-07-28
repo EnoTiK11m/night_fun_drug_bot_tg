@@ -11,9 +11,11 @@ from bot_delivery import telegram_rate_limiter
 class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         telegram_rate_limiter.reset()
+        bot.user_operation_gate.reset_for_tests()
 
     def tearDown(self):
         telegram_rate_limiter.reset()
+        bot.user_operation_gate.reset_for_tests()
 
     async def test_digest_subscription_queues_without_immediate_send(self):
         app = SimpleNamespace(bot=object())

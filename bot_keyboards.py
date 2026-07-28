@@ -4,6 +4,7 @@ from telegram import (
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
+from collections.abc import Callable
 
 from bot_state import store_callback_payload
 from database import get_user_settings
@@ -66,9 +67,25 @@ def get_site_button(post_id: int) -> InlineKeyboardButton:
     )
 
 
-def get_favorite_button(post_id: int, sub_query: str = "") -> InlineKeyboardButton:
+def _side_effect_data(
+    data: str, callback_factory: Callable[[str], str] | None
+) -> str:
+    if callback_factory is None:
+        raise ValueError("side_effect_callback is required for side-effect keyboards")
+    return callback_factory(data)
+
+
+def get_favorite_button(
+    post_id: int,
+    sub_query: str = "",
+    *,
+    side_effect_callback: Callable[[str], str],
+) -> InlineKeyboardButton:
     favorite_callback = f"sub_fav_{post_id}" if sub_query else f"fav_{post_id}"
-    return InlineKeyboardButton("⭐ В избранное", callback_data=favorite_callback)
+    return InlineKeyboardButton(
+        "⭐ В избранное",
+        callback_data=_side_effect_data(favorite_callback, side_effect_callback),
+    )
 
 
 def build_post_keyboard(
@@ -77,14 +94,25 @@ def build_post_keyboard(
     query: str = "",
     sub_query: str = "",
     show_tags_button: bool = True,
+    *,
+    side_effect_callback: Callable[[str], str],
 ) -> InlineKeyboardMarkup:
     keyboard = []
     if action_rows:
         keyboard.extend(action_rows)
 
     keyboard.append([
-        get_favorite_button(post_id, sub_query),
-        InlineKeyboardButton("⏳ На потом", callback_data=f"later_add_{post_id}"),
+        get_favorite_button(
+            post_id,
+            sub_query,
+            side_effect_callback=side_effect_callback,
+        ),
+        InlineKeyboardButton(
+            "⏳ На потом",
+            callback_data=_side_effect_data(
+                f"later_add_{post_id}", side_effect_callback
+            ),
+        ),
     ])
     keyboard.append([
         InlineKeyboardButton("🧠 Похожее", callback_data=f"similar_{post_id}"),
@@ -118,6 +146,8 @@ def get_subscription_gallery_keyboard(
     total: int,
     post_id: int,
     show_tags_button: bool = True,
+    *,
+    side_effect_callback: Callable[[str], str],
 ) -> InlineKeyboardMarkup:
     prev_index = (index - 1) % total
     next_index = (index + 1) % total
@@ -130,7 +160,10 @@ def get_subscription_gallery_keyboard(
         [
             InlineKeyboardButton(
                 "❌ Удалить",
-                callback_data=f"sub_post_del_{token}_{post_id}_{index}",
+                callback_data=_side_effect_data(
+                    f"sub_post_del_{token}_{post_id}_{index}",
+                    side_effect_callback,
+                ),
             )
         ],
     ]
@@ -147,6 +180,8 @@ def get_favorites_gallery_keyboard(
     total: int,
     post_id: int,
     show_tags_button: bool = True,
+    *,
+    side_effect_callback: Callable[[str], str],
 ) -> InlineKeyboardMarkup:
     prev_index = (index - 1) % total
     next_index = (index + 1) % total
@@ -158,11 +193,24 @@ def get_favorites_gallery_keyboard(
         ],
         [
             InlineKeyboardButton(
-                "❌ Удалить", callback_data=f"fav_del_{post_id}_{index}"
+                "❌ Удалить",
+                callback_data=_side_effect_data(
+                    f"fav_del_{post_id}_{index}", side_effect_callback
+                ),
             ),
-            InlineKeyboardButton("🗂 В коллекцию", callback_data=f"fav_col_pick_{post_id}"),
+            InlineKeyboardButton(
+                "🗂 В коллекцию",
+                callback_data=_side_effect_data(
+                    f"fav_col_pick_{post_id}", side_effect_callback
+                ),
+            ),
         ],
-        [InlineKeyboardButton("📝 Заметка", callback_data=f"fav_note_{post_id}")],
+        [InlineKeyboardButton(
+            "📝 Заметка",
+            callback_data=_side_effect_data(
+                f"fav_note_{post_id}", side_effect_callback
+            ),
+        )],
     ]
     if show_tags_button:
         keyboard.append([get_tags_button(post_id)])
@@ -552,6 +600,8 @@ def get_image_keyboard(
     post_id: int,
     query: str = "",
     show_tags_button: bool = True,
+    *,
+    side_effect_callback: Callable[[str], str],
 ) -> InlineKeyboardMarkup:
     return build_post_keyboard(
         post_id,
@@ -563,12 +613,15 @@ def get_image_keyboard(
         ],
         query=query,
         show_tags_button=show_tags_button,
+        side_effect_callback=side_effect_callback,
     )
 
 
 def get_random_image_keyboard(
     post_id: int,
     show_tags_button: bool = True,
+    *,
+    side_effect_callback: Callable[[str], str],
 ) -> InlineKeyboardMarkup:
     return build_post_keyboard(
         post_id,
@@ -579,6 +632,7 @@ def get_random_image_keyboard(
             ]
         ],
         show_tags_button=show_tags_button,
+        side_effect_callback=side_effect_callback,
     )
 
 
@@ -586,9 +640,12 @@ def get_subscription_image_keyboard(
     post_id: int,
     sub_query: str = "",
     show_tags_button: bool = True,
+    *,
+    side_effect_callback: Callable[[str], str],
 ) -> InlineKeyboardMarkup:
     return build_post_keyboard(
         post_id,
         sub_query=sub_query,
         show_tags_button=show_tags_button,
+        side_effect_callback=side_effect_callback,
     )

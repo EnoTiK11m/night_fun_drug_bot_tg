@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import secrets
 import sqlite3
 import time
 
@@ -116,12 +117,23 @@ def _cleanup_callback_payloads_db(now: float):
             conn.close()
 
 
-def store_callback_payload(action: str, payload: str) -> str:
+def store_callback_payload(
+    action: str,
+    payload: str,
+    *,
+    one_shot: bool = False,
+    token_prefix: str = "",
+) -> str:
     """Store large callback payloads behind compact Telegram callback_data."""
     cleanup_callback_payloads()
-    token = hashlib.blake2s(
-        f"{action}:{payload}".encode("utf-8"), digest_size=8
+    nonce = secrets.token_hex(8) if one_shot else ""
+    token_material = (
+        f"{action}:{payload}:{nonce}" if one_shot else f"{action}:{payload}"
+    )
+    token_hash = hashlib.blake2s(
+        token_material.encode("utf-8"), digest_size=8
     ).hexdigest()
+    token = f"{token_prefix}-{token_hash}" if token_prefix else token_hash
     callback_payloads[(action, token)] = (payload, time.monotonic())
     _store_callback_payload_db(action, token, payload, time.time())
     return f"{action}_{token}"

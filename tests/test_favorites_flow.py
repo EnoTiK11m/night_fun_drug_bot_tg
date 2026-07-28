@@ -29,16 +29,20 @@ def make_callback_update(data: str, user_id: int = 1):
 class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         bot.telegram_rate_limiter.reset()
+        bot.user_operation_gate.reset_for_tests()
         self.tempdir = f"test_payloads_{uuid.uuid4().hex}"
         os.makedirs(self.tempdir)
         self.old_payload_db_path = bot_state.DB_PATH
         bot_state.DB_PATH = os.path.join(self.tempdir, "callbacks.db")
         bot_state.callback_payloads.clear()
         bot.recent_posts.clear()
+        bot.issued_one_shot_callbacks.clear()
 
     def tearDown(self):
         bot.telegram_rate_limiter.reset()
+        bot.user_operation_gate.reset_for_tests()
         bot_state.callback_payloads.clear()
+        bot.issued_one_shot_callbacks.clear()
         bot_state.DB_PATH = self.old_payload_db_path
         shutil.rmtree(self.tempdir, ignore_errors=True)
         bot.user_states.pop(1, None)
@@ -56,7 +60,9 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
             "score": 10,
         }
         bot.remember_post(post)
-        update, query = make_callback_update("fav_123")
+        update, query = make_callback_update(
+            bot.store_side_effect_callback("fav_123", 1)
+        )
 
         with (
             patch.object(bot.api, "get_post_by_id", AsyncMock()) as get_post_by_id,
@@ -99,7 +105,9 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(update.message.reply_text.await_args_list), 2)
 
     async def test_favorite_button_without_cache_saves_id_without_blocking_api(self):
-        update, query = make_callback_update("fav_456")
+        update, query = make_callback_update(
+            bot.store_side_effect_callback("fav_456", 1)
+        )
 
         with (
             patch.object(bot.api, "get_post_by_id", AsyncMock()) as get_post_by_id,
@@ -121,7 +129,9 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
             "file_url": "https://example.test/cached.jpg",
             "sample_url": "https://example.test/cached-sample.jpg",
         }
-        update, _query = make_callback_update("fav_789")
+        update, _query = make_callback_update(
+            bot.store_side_effect_callback("fav_789", 1)
+        )
 
         with (
             patch.object(bot.api, "get_post_by_id", AsyncMock()) as get_post_by_id,
@@ -305,7 +315,12 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("post_tags_123", hidden_callbacks)
 
     def test_image_keyboard_keeps_subscribe_and_post_actions(self):
-        keyboard = bot.get_image_keyboard(123, query="tag", show_tags_button=True)
+        keyboard = bot.get_image_keyboard(
+            123,
+            query="tag",
+            show_tags_button=True,
+            side_effect_callback=bot.side_effect_callback_for(1),
+        )
         rows = keyboard.inline_keyboard
 
         callbacks = [
@@ -313,7 +328,10 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
             for row in rows for button in row if button.callback_data
         ]
         self.assertIn("similar_123", callbacks)
-        self.assertIn("later_add_123", callbacks)
+        self.assertTrue(any(
+            bot.resolved_callback_data(data) == "later_add_123"
+            for data in callbacks
+        ))
         self.assertIn("post_more_123", callbacks)
         self.assertTrue(any(data.startswith("subscribe_") for data in callbacks))
         self.assertNotIn("post_tags_123", callbacks)
@@ -473,14 +491,21 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(markup, bot.InlineKeyboardMarkup)
 
     def test_subscription_keyboard_uses_post_id_callback(self):
-        keyboard = bot.get_subscription_image_keyboard(123, "tag")
+        keyboard = bot.get_subscription_image_keyboard(
+            123,
+            "tag",
+            side_effect_callback=bot.side_effect_callback_for(1),
+        )
         callback_data = keyboard.inline_keyboard[0][0].callback_data
 
-        self.assertEqual(callback_data, "sub_fav_123")
+        self.assertEqual(bot.resolved_callback_data(callback_data), "sub_fav_123")
+        self.assertIn(callback_data, bot.issued_one_shot_callbacks)
 
     async def test_subscription_favorite_uses_cache_queries_from_database(self):
         post = {"id": 123, "file_url": "https://example.test/123.jpg"}
-        update, query = make_callback_update("sub_fav_123")
+        update, query = make_callback_update(
+            bot.store_side_effect_callback("sub_fav_123", 1)
+        )
 
         with (
             patch.object(bot, "get_known_post", AsyncMock(return_value=post)),
@@ -563,7 +588,9 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_collection_picker_callback_is_not_consumed_by_generic_favorite(self):
-        update, _query = make_callback_update("fav_col_pick_123")
+        update, _query = make_callback_update(
+            bot.store_side_effect_callback("fav_col_pick_123", 1)
+        )
 
         with (
             patch.object(bot, "show_collection_picker", AsyncMock()) as picker,
@@ -793,7 +820,9 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "get_user_settings", AsyncMock(return_value={"show_tags_button": True})),
             patch.object(bot, "send_post_media", AsyncMock()) as send_post_media,
         ):
-            delivered = await bot.send_favorites_gallery(message, 1, page=0)
+            delivered = await bot.send_favorites_gallery(
+                message, 1, page=0, issuer=bot.callback_issuer_for(1)
+            )
 
         self.assertTrue(delivered)
         get_favorites.assert_awaited_once_with(1, limit=10, offset=0)
@@ -819,7 +848,11 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         ) as send_gallery:
             await bot.button_handler(update, SimpleNamespace())
 
-        send_gallery.assert_awaited_once_with(query.message, 1, 2)
+        send_gallery.assert_awaited_once()
+        self.assertEqual(send_gallery.await_args.args, (query.message, 1, 2))
+        self.assertIsInstance(
+            send_gallery.await_args.kwargs["issuer"], bot.OneShotCallbackIssuer
+        )
         query.edit_message_text.assert_not_awaited()
 
     async def test_favorites_gallery_keeps_gif_without_preview_as_single_item(self):
@@ -841,7 +874,9 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "get_user_settings", AsyncMock(return_value={})),
             patch.object(bot, "send_post_media", AsyncMock(return_value=True)) as send_single,
         ):
-            delivered = await bot.send_favorites_gallery(message, 1)
+            delivered = await bot.send_favorites_gallery(
+                message, 1, issuer=bot.callback_issuer_for(1)
+            )
 
         self.assertTrue(delivered)
         album = message.reply_media_group.await_args.kwargs["media"]
