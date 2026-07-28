@@ -243,6 +243,8 @@ SQLite-база и необходимые таблицы создаются ав
 | `ZIP_EXPORT_MAX_TEMP_BYTES` | нет | `100663296` | Максимум временного дискового пространства задания |
 | `ZIP_EXPORT_PROGRESS_INTERVAL_SECONDS` | нет | `3` | Минимальный интервал обновления прогресса в Telegram |
 | `DB_PATH` | нет | `bot_data.db` | Путь к SQLite-базе |
+| `INSTANCE_LOCK_WAIT_SECONDS` | нет | `20` | Максимальное ожидание освобождения межпроцессного lock, от 0 до 120 секунд |
+| `INSTANCE_LOCK_RETRY_INTERVAL_SECONDS` | нет | `0.25` | Интервал проверки межпроцессного lock, от 0.05 до 5 секунд |
 | `ADMIN_USER_IDS` | нет | пусто | Telegram user ID администраторов через запятую |
 | `ALLOWED_USER_IDS` | нет | пусто | Разрешённые пользователи личных чатов через запятую |
 | `ALLOWED_CHAT_IDS` | нет | пусто | Разрешённые Telegram chat ID через запятую |

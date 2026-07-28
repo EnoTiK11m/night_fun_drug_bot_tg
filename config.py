@@ -1,4 +1,5 @@
 import os
+import math
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -27,6 +28,16 @@ def _get_float_env(name: str, default: float) -> float:
     except ValueError:
         _CONFIG_ERRORS.append(f"{name} must be a number")
         return default
+
+
+def _get_bounded_float_env(
+    name: str, default: float, minimum: float, maximum: float
+) -> float:
+    value = _get_float_env(name, default)
+    if not math.isfinite(value):
+        _CONFIG_ERRORS.append(f"{name} must be a finite number")
+        return default
+    return max(minimum, min(maximum, value))
 
 
 def _get_int_set_env(name: str) -> set[int]:
@@ -74,6 +85,12 @@ SUBSCRIPTION_MAX_POSTS_PER_USER_PASS = max(
     1, min(45, _get_int_env("SUBSCRIPTION_MAX_POSTS_PER_USER_PASS", 45))
 )
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+INSTANCE_LOCK_WAIT_SECONDS = _get_bounded_float_env(
+    "INSTANCE_LOCK_WAIT_SECONDS", 20.0, 0.0, 120.0
+)
+INSTANCE_LOCK_RETRY_INTERVAL_SECONDS = _get_bounded_float_env(
+    "INSTANCE_LOCK_RETRY_INTERVAL_SECONDS", 0.25, 0.05, 5.0
+)
 ADMIN_USER_IDS = _get_int_set_env("ADMIN_USER_IDS")
 ALLOWED_USER_IDS = _get_int_set_env("ALLOWED_USER_IDS")
 ALLOWED_CHAT_IDS = _get_int_set_env("ALLOWED_CHAT_IDS")

@@ -261,6 +261,8 @@ All settings are read from environment variables or `.env`.
 | `ZIP_EXPORT_MAX_TEMP_BYTES` | no | `100663296` | Maximum temporary disk footprint per job |
 | `ZIP_EXPORT_PROGRESS_INTERVAL_SECONDS` | no | `3` | Minimum Telegram progress update interval |
 | `DB_PATH` | no | `bot_data.db` | SQLite database path |
+| `INSTANCE_LOCK_WAIT_SECONDS` | no | `20` | Maximum process-lock wait, from 0 to 120 seconds |
+| `INSTANCE_LOCK_RETRY_INTERVAL_SECONDS` | no | `0.25` | Process-lock retry interval, from 0.05 to 5 seconds |
 | `ADMIN_USER_IDS` | no | empty | Comma-separated administrator Telegram user IDs |
 | `ALLOWED_USER_IDS` | no | empty | Comma-separated users allowed in private chats |
 | `ALLOWED_CHAT_IDS` | no | empty | Comma-separated allowed Telegram chat IDs |

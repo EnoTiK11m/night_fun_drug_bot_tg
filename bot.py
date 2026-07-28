@@ -45,6 +45,8 @@ from config import (
     API_USER_ID,
     BOT_TOKEN,
     DB_PATH,
+    INSTANCE_LOCK_RETRY_INTERVAL_SECONDS,
+    INSTANCE_LOCK_WAIT_SECONDS,
     SEARCH_COOLDOWN_SECONDS,
     SUBSCRIPTION_CHECK_INTERVAL_SECONDS,
     SUBSCRIPTION_MAX_ACTIVE,
@@ -124,6 +126,12 @@ from bot_media import (
 )
 from bot_delivery import execute_telegram_request, telegram_rate_limiter
 from bot_user_gate import user_operation_gate
+from bot_instance_lock import (
+    BotInstanceLifecycle,
+    InstanceLockBusy,
+    InstanceLockLifecycleError,
+    create_instance_lifecycle,
+)
 from project_update import (
     UpdateCommandError,
     check_for_updates,
@@ -492,6 +500,9 @@ cache_cleanup_last_deleted = 0
 cache_cleanup_errors = 0
 stale_flow_results_discarded = 0
 duplicate_callbacks_rejected = 0
+instance_lifecycle: BotInstanceLifecycle | None = None
+instance_lock_wait_ms = 0
+startup_orphans_deleted = 0
 
 @dataclass
 class OneShotCallbackEntry:
@@ -6170,7 +6181,7 @@ async def heartbeat_loop():
             }
             telegram_metrics = telegram_rate_limiter.snapshot_metrics()
             logger.info(
-                "Heartbeat alive uptime=%ss user_states=%s recent_posts=%s export_queued=%s export_active=%s cache_cleanup_last_deleted=%s cache_cleanup_errors=%s telegram_requests_total=%s telegram_rate_limit_waits=%s telegram_retry_after_count=%s telegram_retry_attempts=%s telegram_ambiguous_timeouts=%s telegram_request_failures=%s telegram_limiter_registry_size=%s user_gate_registry_size=%s user_gate_waiters=%s user_gate_contention_total=%s stale_flow_results_discarded=%s duplicate_callbacks_rejected=%s",
+                "Heartbeat alive uptime=%ss user_states=%s recent_posts=%s export_queued=%s export_active=%s cache_cleanup_last_deleted=%s cache_cleanup_errors=%s telegram_requests_total=%s telegram_rate_limit_waits=%s telegram_retry_after_count=%s telegram_retry_attempts=%s telegram_ambiguous_timeouts=%s telegram_request_failures=%s telegram_limiter_registry_size=%s user_gate_registry_size=%s user_gate_waiters=%s user_gate_contention_total=%s stale_flow_results_discarded=%s duplicate_callbacks_rejected=%s instance_lock_held=%s instance_lock_wait_ms=%s startup_orphans_deleted=%s",
                 int(time.monotonic() - started_at),
                 len(user_states),
                 len(recent_posts),
@@ -6190,6 +6201,9 @@ async def heartbeat_loop():
                 user_operation_gate.metrics.contention_total,
                 stale_flow_results_discarded,
                 duplicate_callbacks_rejected,
+                int(instance_lifecycle is not None and instance_lifecycle.lock.held),
+                instance_lock_wait_ms,
+                startup_orphans_deleted,
             )
         except asyncio.CancelledError:
             raise
@@ -6327,17 +6341,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def main():
-    """Запуск бота"""
-    configure_logging()
-    missing_config = validate_config()
-    if missing_config:
-        logger.error(
-            "Не установлены обязательные переменные окружения: %s",
-            ", ".join(missing_config),
-        )
-        return
-
+def build_and_run_application() -> None:
+    """Build the Telegram application and run it until shutdown."""
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -6386,6 +6391,48 @@ def main():
     application.run_polling(allowed_updates=Update.ALL_TYPES)
     if restart_requested:
         sys.exit(RESTART_EXIT_CODE)
+
+
+def run_with_instance_lifecycle(
+    lifecycle: BotInstanceLifecycle,
+    runner=build_and_run_application,
+) -> None:
+    """Run the whole application lifecycle while exclusively owning the OS lock."""
+    global instance_lifecycle, instance_lock_wait_ms, startup_orphans_deleted
+    instance_lifecycle = lifecycle
+    try:
+        result = asyncio.run(lifecycle.start())
+        instance_lock_wait_ms = result.wait_ms
+        startup_orphans_deleted = result.cleanup.deleted
+        runner()
+    finally:
+        lifecycle.close()
+        if instance_lifecycle is lifecycle:
+            instance_lifecycle = None
+
+
+def main():
+    """Запуск бота"""
+    configure_logging()
+    missing_config = validate_config()
+    if missing_config:
+        logger.error(
+            "Не установлены обязательные переменные окружения: %s",
+            ", ".join(missing_config),
+        )
+        return
+
+    lifecycle = create_instance_lifecycle(
+        database_path=DB_PATH,
+        wait_seconds=INSTANCE_LOCK_WAIT_SECONDS,
+        retry_interval_seconds=INSTANCE_LOCK_RETRY_INTERVAL_SECONDS,
+    )
+    try:
+        run_with_instance_lifecycle(lifecycle)
+    except InstanceLockBusy as exc:
+        logger.error("Запуск отменён: %s", exc)
+    except InstanceLockLifecycleError as exc:
+        logger.error("Запуск отменён: %s", exc)
 
 
 if __name__ == "__main__":
