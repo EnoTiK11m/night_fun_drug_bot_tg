@@ -236,6 +236,14 @@ All settings are read from environment variables or `.env`.
 | `SUBSCRIPTION_QUERY_MAX_LENGTH` | no | `256` | Maximum normalized subscription query length |
 | `SUBSCRIPTION_QUERY_MAX_TAGS` | no | `20` | Maximum tags in a subscription query |
 | `SUBSCRIPTION_CREATE_COOLDOWN_SECONDS` | no | `30` | Delay between new subscriptions; updating an existing one is exempt |
+| `SUBSCRIPTION_CACHE_MAX_PER_QUERY` | no | `250` | Maximum cache rows per user/query pair |
+| `SUBSCRIPTION_CACHE_MAX_ROWS` | no | `100000` | Hard global subscription-cache row limit |
+| `SUBSCRIPTION_CACHE_CLEANUP_BATCH_SIZE` | no | `500` | Maximum deletions from each SQLite cache per pass |
+| `SUBSCRIPTION_CACHE_CLEANUP_INTERVAL_SECONDS` | no | `900` | Background SQLite cache-cleanup interval |
+| `POST_CACHE_TTL_HOURS` | no | `168` | Shared post-cache retention time in hours |
+| `POST_CACHE_MAX_ROWS` | no | `100000` | Hard shared post-cache row limit |
+| `USER_STATE_TTL_MINUTES` | no | `30` | TTL for process-local per-user temporary state |
+| `USER_STATE_CLEANUP_INTERVAL_SECONDS` | no | `300` | Temporary user-state cleanup interval |
 | `GLOBAL_DOWNLOAD_CONCURRENCY` | no | `4` | Process-wide concurrent external download limit |
 | `ZIP_EXPORT_WORKERS` | no | `1` | FIFO ZIP worker count, from 1 to 2 |
 | `ZIP_EXPORT_QUEUE_SIZE` | no | `8` | Maximum waiting ZIP jobs |

@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -10,6 +11,11 @@ import aiosqlite
 
 from config import (
     DB_PATH,
+    POST_CACHE_MAX_ROWS,
+    POST_CACHE_TTL_HOURS,
+    SUBSCRIPTION_CACHE_CLEANUP_BATCH_SIZE,
+    SUBSCRIPTION_CACHE_MAX_PER_QUERY,
+    SUBSCRIPTION_CACHE_MAX_ROWS,
     SUBSCRIPTION_CREATE_COOLDOWN_SECONDS,
     SUBSCRIPTION_MAX_ACTIVE,
     SUBSCRIPTION_MAX_TOTAL,
@@ -26,6 +32,7 @@ SUBSCRIPTION_CLAIM_MINUTES = 5
 DIGEST_CLAIM_MINUTES = 10
 DIGEST_CLAIM_MIGRATION_VERSION = 1
 SUBSCRIPTION_QUOTA_MIGRATION_VERSION = 2
+CACHE_RETENTION_MIGRATION_VERSION = 3
 SUBSCRIPTION_CACHE_TTL_MINUTES = 60
 SUBSCRIPTION_CACHE_MIN_AVAILABLE = 20
 SUBSCRIPTION_PAUSE_SETTING = "subscription_pause_until"
@@ -90,6 +97,15 @@ class SubscriptionToggleResult:
     active_limit: int = SUBSCRIPTION_MAX_ACTIVE
     total_count: int = 0
     total_limit: int = SUBSCRIPTION_MAX_TOTAL
+
+
+@dataclass(frozen=True)
+class CacheCleanupResult:
+    subscription_cache_deleted: int
+    post_cache_deleted: int
+    subscription_cache_remaining: int
+    post_cache_remaining: int
+    elapsed_ms: float
 
 
 def normalize_subscription_query(query: Any) -> str:
@@ -249,6 +265,54 @@ async def apply_versioned_migrations(db):
             raise RuntimeError(
                 "Subscription quota migration is recorded but state table is missing"
             )
+
+        cache_indexes = {
+            "idx_subscription_cache_lookup": (
+                """
+                    CREATE INDEX IF NOT EXISTS idx_subscription_cache_lookup
+                    ON subscription_cache (user_id, query, cached_at)
+                """,
+                ("user_id", "query", "cached_at"),
+            ),
+            "idx_subscription_cache_cached": (
+                """
+                    CREATE INDEX IF NOT EXISTS idx_subscription_cache_cached
+                    ON subscription_cache (cached_at)
+                """,
+                ("cached_at",),
+            ),
+            "idx_post_cache_cached": (
+                """
+                    CREATE INDEX IF NOT EXISTS idx_post_cache_cached
+                    ON post_cache (cached_at)
+                """,
+                ("cached_at",),
+            ),
+        }
+        cursor = await db.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            (CACHE_RETENTION_MIGRATION_VERSION,),
+        )
+        cache_migration_applied = await cursor.fetchone() is not None
+        if not cache_migration_applied:
+            for statement, _expected_columns in cache_indexes.values():
+                await db.execute(statement)
+            await db.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?)",
+                (CACHE_RETENTION_MIGRATION_VERSION,),
+            )
+        else:
+            invalid_indexes = []
+            for index_name, (_statement, expected_columns) in cache_indexes.items():
+                cursor = await db.execute(f"PRAGMA index_info({index_name})")
+                actual_columns = tuple(row[2] for row in await cursor.fetchall())
+                if actual_columns != expected_columns:
+                    invalid_indexes.append(index_name)
+            if invalid_indexes:
+                raise RuntimeError(
+                    "Cache retention migration is recorded but indexes are invalid: "
+                    + ", ".join(sorted(invalid_indexes))
+                )
         await db.commit()
     except BaseException:
         await db.rollback()
@@ -532,14 +596,6 @@ async def init_db():
             ON subscription_posts (user_id, query, sent_at)
         """)
         await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_subscription_cache_lookup
-            ON subscription_cache (user_id, query, cached_at)
-        """)
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_post_cache_cached
-            ON post_cache (cached_at)
-        """)
-        await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_read_later_expiry
             ON read_later (user_id, expires_at)
         """)
@@ -575,6 +631,185 @@ async def init_db():
 
         await db.commit()
         await apply_versioned_migrations(db)
+
+
+def _deleted_row_count(cursor: aiosqlite.Cursor) -> int:
+    return max(0, int(cursor.rowcount or 0))
+
+
+async def _cleanup_expired_caches_in_connection(
+    db: aiosqlite.Connection,
+    *,
+    subscription_ttl_minutes: int,
+    subscription_max_per_query: int,
+    subscription_max_rows: int,
+    post_ttl_hours: int,
+    post_max_rows: int,
+    batch_size: int,
+) -> CacheCleanupResult:
+    started_at = time.perf_counter()
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = await db.execute("SELECT COUNT(*) FROM subscription_cache")
+        subscription_initial = int((await cursor.fetchone())[0] or 0)
+        cursor = await db.execute("SELECT COUNT(*) FROM post_cache")
+        post_initial = int((await cursor.fetchone())[0] or 0)
+
+        subscription_deleted = 0
+        cursor = await db.execute("""
+            DELETE FROM subscription_cache
+            WHERE rowid IN (
+                SELECT sc.rowid
+                FROM subscription_cache sc
+                WHERE datetime(COALESCE(sc.cached_at, '1970-01-01 00:00:00'))
+                      < datetime('now', '-' || ? || ' minutes')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM subscriptions s
+                      WHERE s.user_id = sc.user_id
+                        AND s.query = sc.query
+                        AND s.processing_token IS NOT NULL
+                        AND s.processing_until IS NOT NULL
+                        AND datetime(s.processing_until) > datetime('now')
+                  )
+                ORDER BY datetime(COALESCE(sc.cached_at, '1970-01-01 00:00:00')), sc.rowid
+                LIMIT ?
+            )
+        """, (max(1, int(subscription_ttl_minutes)), batch_size))
+        subscription_deleted += _deleted_row_count(cursor)
+
+        subscription_budget = max(0, batch_size - subscription_deleted)
+        if subscription_budget:
+            cursor = await db.execute("""
+                DELETE FROM subscription_cache
+                WHERE rowid IN (
+                    SELECT candidate_rowid
+                    FROM (
+                        SELECT
+                            sc.rowid AS candidate_rowid,
+                            sc.cached_at AS candidate_cached_at,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY sc.user_id, sc.query
+                                ORDER BY datetime(COALESCE(sc.cached_at, '1970-01-01 00:00:00')) DESC,
+                                         sc.rowid DESC
+                            ) AS position
+                        FROM subscription_cache sc
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM subscriptions s
+                            WHERE s.user_id = sc.user_id
+                              AND s.query = sc.query
+                              AND s.processing_token IS NOT NULL
+                              AND s.processing_until IS NOT NULL
+                              AND datetime(s.processing_until) > datetime('now')
+                        )
+                    ) ranked
+                    WHERE position > ?
+                    ORDER BY datetime(COALESCE(candidate_cached_at, '1970-01-01 00:00:00')),
+                             candidate_rowid
+                    LIMIT ?
+                )
+            """, (subscription_max_per_query, subscription_budget))
+            subscription_deleted += _deleted_row_count(cursor)
+
+        subscription_budget = max(0, batch_size - subscription_deleted)
+        subscription_overflow = max(
+            0, subscription_initial - subscription_deleted - subscription_max_rows
+        )
+        if subscription_budget and subscription_overflow:
+            cursor = await db.execute("""
+                DELETE FROM subscription_cache
+                WHERE rowid IN (
+                    SELECT sc.rowid
+                    FROM subscription_cache sc
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM subscriptions s
+                        WHERE s.user_id = sc.user_id
+                          AND s.query = sc.query
+                          AND s.processing_token IS NOT NULL
+                          AND s.processing_until IS NOT NULL
+                          AND datetime(s.processing_until) > datetime('now')
+                    )
+                    ORDER BY datetime(COALESCE(sc.cached_at, '1970-01-01 00:00:00')), sc.rowid
+                    LIMIT ?
+                )
+            """, (min(subscription_budget, subscription_overflow),))
+            subscription_deleted += _deleted_row_count(cursor)
+
+        post_deleted = 0
+        cursor = await db.execute("""
+            DELETE FROM post_cache
+            WHERE rowid IN (
+                SELECT rowid FROM post_cache
+                WHERE datetime(COALESCE(cached_at, '1970-01-01 00:00:00'))
+                      < datetime('now', '-' || ? || ' hours')
+                ORDER BY datetime(COALESCE(cached_at, '1970-01-01 00:00:00')), rowid
+                LIMIT ?
+            )
+        """, (max(1, int(post_ttl_hours)), batch_size))
+        post_deleted += _deleted_row_count(cursor)
+
+        post_budget = max(0, batch_size - post_deleted)
+        post_overflow = max(0, post_initial - post_deleted - post_max_rows)
+        if post_budget and post_overflow:
+            cursor = await db.execute("""
+                DELETE FROM post_cache
+                WHERE rowid IN (
+                    SELECT rowid FROM post_cache
+                    ORDER BY datetime(COALESCE(cached_at, '1970-01-01 00:00:00')), rowid
+                    LIMIT ?
+                )
+            """, (min(post_budget, post_overflow),))
+            post_deleted += _deleted_row_count(cursor)
+
+        await db.commit()
+    except BaseException:
+        await db.rollback()
+        raise
+
+    return CacheCleanupResult(
+        subscription_cache_deleted=subscription_deleted,
+        post_cache_deleted=post_deleted,
+        subscription_cache_remaining=max(0, subscription_initial - subscription_deleted),
+        post_cache_remaining=max(0, post_initial - post_deleted),
+        elapsed_ms=(time.perf_counter() - started_at) * 1000,
+    )
+
+
+async def cleanup_expired_caches(
+    *,
+    subscription_ttl_minutes: int = SUBSCRIPTION_CACHE_TTL_MINUTES,
+    subscription_max_per_query: int = SUBSCRIPTION_CACHE_MAX_PER_QUERY,
+    subscription_max_rows: int = SUBSCRIPTION_CACHE_MAX_ROWS,
+    post_ttl_hours: int = POST_CACHE_TTL_HOURS,
+    post_max_rows: int = POST_CACHE_MAX_ROWS,
+    batch_size: int = SUBSCRIPTION_CACHE_CLEANUP_BATCH_SIZE,
+    db: aiosqlite.Connection | None = None,
+) -> CacheCleanupResult:
+    """Delete a bounded cache batch in one short transaction."""
+    normalized_batch = max(1, int(batch_size))
+    options = {
+        "subscription_ttl_minutes": max(1, int(subscription_ttl_minutes)),
+        "subscription_max_per_query": max(1, int(subscription_max_per_query)),
+        "subscription_max_rows": max(1, int(subscription_max_rows)),
+        "post_ttl_hours": max(1, int(post_ttl_hours)),
+        "post_max_rows": max(1, int(post_max_rows)),
+        "batch_size": normalized_batch,
+    }
+    if db is not None:
+        return await _cleanup_expired_caches_in_connection(db, **options)
+    async with connect_db() as owned_db:
+        return await _cleanup_expired_caches_in_connection(owned_db, **options)
+
+
+async def get_cache_storage_stats() -> Dict[str, int]:
+    async with connect_db() as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM subscription_cache")
+        subscription_rows = int((await cursor.fetchone())[0] or 0)
+        cursor = await db.execute("SELECT COUNT(*) FROM post_cache")
+        post_rows = int((await cursor.fetchone())[0] or 0)
+    return {
+        "subscription_cache_rows": subscription_rows,
+        "post_cache_rows": post_rows,
+    }
 
 
 async def get_user_blacklist(user_id: int) -> Set[str]:

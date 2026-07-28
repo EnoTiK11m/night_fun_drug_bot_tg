@@ -9,7 +9,7 @@ import shutil
 import io
 import re
 from dataclasses import dataclass, field
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from logging.handlers import RotatingFileHandler
 from telegram import (
     Update,
@@ -46,6 +46,9 @@ from config import (
     SUBSCRIPTION_MAX_ACTIVE,
     SUBSCRIPTION_MAX_TOTAL,
     SUBSCRIPTION_MAX_POSTS_PER_USER_PASS,
+    SUBSCRIPTION_CACHE_CLEANUP_INTERVAL_SECONDS,
+    USER_STATE_CLEANUP_INTERVAL_SECONDS,
+    USER_STATE_TTL_MINUTES,
     ZIP_EXPORT_MAX_FILES,
     TAG_TRANSLATION_ENABLED,
     validate_config,
@@ -138,6 +141,7 @@ from bot_state import (
 from tag_translation import tag_translation_service
 from database import (
     init_db,
+    cleanup_expired_caches,
     get_user_blacklist,
     add_to_blacklist,
     remove_from_blacklist,
@@ -309,10 +313,127 @@ logger = logging.getLogger(__name__)
 
 
 # Состояния пользователей
-user_states = {}
-search_builders: dict[int, dict] = {}
-pending_preset_queries: dict[int, str] = {}
-pending_bulk_posts: dict[int, list[int]] = {}
+class TrackedUserStateDict(dict):
+    def __init__(self, registry):
+        super().__init__()
+        self._registry = registry
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        if isinstance(key, int):
+            self._registry.touch(key)
+        return value
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        if isinstance(key, int):
+            self._registry.touch(key)
+
+    def __contains__(self, key):
+        present = super().__contains__(key)
+        if present and isinstance(key, int):
+            self._registry.touch(key)
+        return present
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            value = dict.__getitem__(self, key)
+            if isinstance(key, int):
+                self._registry.touch(key)
+            return value
+        return default
+
+    def pop(self, key, *default):
+        existed = dict.__contains__(self, key)
+        value = super().pop(key, *default)
+        if existed and isinstance(key, int):
+            self._registry.forget_if_unused(key)
+        return value
+
+    def setdefault(self, key, default=None):
+        if not dict.__contains__(self, key):
+            dict.__setitem__(self, key, default)
+        if isinstance(key, int):
+            self._registry.touch(key)
+        return dict.__getitem__(self, key)
+
+    def clear(self):
+        user_ids = tuple(key for key in dict.keys(self) if isinstance(key, int))
+        super().clear()
+        for user_id in user_ids:
+            self._registry.forget_if_unused(user_id)
+
+    def discard_without_touch(self, user_id: int) -> None:
+        dict.pop(self, user_id, None)
+
+
+class TemporaryUserStateRegistry:
+    def __init__(self, *, clock=time.monotonic):
+        self._clock = clock
+        self._last_used: dict[int, float] = {}
+        self._active: dict[int, int] = {}
+        self._mappings: list[TrackedUserStateDict] = []
+
+    def create_mapping(self) -> TrackedUserStateDict:
+        mapping = TrackedUserStateDict(self)
+        self._mappings.append(mapping)
+        return mapping
+
+    def touch(self, user_id: int, *, now: float | None = None) -> None:
+        self._last_used[user_id] = self._clock() if now is None else now
+
+    def forget_if_unused(self, user_id: int) -> None:
+        if self._active.get(user_id, 0):
+            return
+        if any(dict.__contains__(mapping, user_id) for mapping in self._mappings):
+            return
+        self._last_used.pop(user_id, None)
+
+    @contextmanager
+    def activity(self, user_id: int):
+        self.touch(user_id)
+        self._active[user_id] = self._active.get(user_id, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = self._active.get(user_id, 1) - 1
+            if remaining > 0:
+                self._active[user_id] = remaining
+            else:
+                self._active.pop(user_id, None)
+            if any(dict.__contains__(mapping, user_id) for mapping in self._mappings):
+                self.touch(user_id)
+            else:
+                self._last_used.pop(user_id, None)
+
+    def clear_user(self, user_id: int) -> None:
+        for mapping in self._mappings:
+            mapping.discard_without_touch(user_id)
+        self._last_used.pop(user_id, None)
+
+    def cleanup_expired(self, ttl_seconds: float, *, now: float | None = None) -> int:
+        current = self._clock() if now is None else now
+        expired = [
+            user_id
+            for user_id, last_used in tuple(self._last_used.items())
+            if current - last_used >= ttl_seconds and not self._active.get(user_id, 0)
+        ]
+        for user_id in expired:
+            self.clear_user(user_id)
+        return len(expired)
+
+    def clear_all(self) -> None:
+        for mapping in self._mappings:
+            dict.clear(mapping)
+        self._last_used.clear()
+        self._active.clear()
+
+
+temporary_user_state = TemporaryUserStateRegistry()
+user_states = temporary_user_state.create_mapping()
+search_builders = temporary_user_state.create_mapping()
+pending_preset_queries = temporary_user_state.create_mapping()
+pending_bulk_posts = temporary_user_state.create_mapping()
 
 
 @dataclass
@@ -325,13 +446,16 @@ DigestSubscriptionLockHandle = tuple[tuple[int, str], DigestSubscriptionLockEntr
 digest_subscription_locks: dict[
     tuple[int, str], DigestSubscriptionLockEntry
 ] = {}
-pending_subscription_options: dict[int, str] = {}
+pending_subscription_options = temporary_user_state.create_mapping()
 # Глобальная задача для подписок
 subscription_task = None
 heartbeat_task = None
 tag_translation_task = None
 zip_export_manager: ZipExportManager | None = None
-user_last_search_at = {}
+user_last_search_at = temporary_user_state.create_mapping()
+maintenance_task = None
+cache_cleanup_last_deleted = 0
+cache_cleanup_errors = 0
 MEDIA_SEND_RETRIES = 2
 SUBSCRIPTION_CONCURRENCY = 5
 HEARTBEAT_INTERVAL_SECONDS = 5 * 60
@@ -783,9 +907,18 @@ def require_access(handler):
             logger.warning("Access denied user=%s chat=%s", user_id, chat_id)
             await send_access_denied(update)
             return
-        return await handler(update, context)
+        user = getattr(update, "effective_user", None)
+        user_id = getattr(user, "id", None)
+        if not isinstance(user_id, int):
+            return await handler(update, context)
+        with temporary_user_state.activity(user_id):
+            return await handler(update, context)
 
     return wrapped
+
+
+def clear_user_temporary_state(user_id: int) -> None:
+    temporary_user_state.clear_user(user_id)
 
 
 def schedule_background_task(context: ContextTypes.DEFAULT_TYPE, coroutine):
@@ -811,11 +944,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_query_answer(query)
 
     if data == "cancel_input":
-        user_states.pop(user_id, None)
-        search_builders.pop(user_id, None)
-        pending_preset_queries.pop(user_id, None)
-        pending_bulk_posts.pop(user_id, None)
-        pending_subscription_options.pop(user_id, None)
+        clear_user_temporary_state(user_id)
         await query.edit_message_text(
             "Действие отменено.\n\n" + await build_main_menu_text(user_id),
             reply_markup=await get_user_main_keyboard(user_id),
@@ -4294,11 +4423,7 @@ async def subscriptions_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the current multi-step input flow."""
     user_id = update.effective_user.id
-    user_states.pop(user_id, None)
-    search_builders.pop(user_id, None)
-    pending_preset_queries.pop(user_id, None)
-    pending_bulk_posts.pop(user_id, None)
-    pending_subscription_options.pop(user_id, None)
+    clear_user_temporary_state(user_id)
     export_cancelled = bool(zip_export_manager) and await zip_export_manager.cancel_for_user(user_id)
     await update.message.reply_text(
         ("Действие и ZIP-экспорт отменены.\n\n" if export_cancelled else "Действие отменено.\n\n")
@@ -5075,6 +5200,74 @@ async def process_subscriptions(app):
             await asyncio.sleep(SUBSCRIPTION_CHECK_INTERVAL_SECONDS)
 
 
+async def maintenance_loop(
+    *,
+    cache_cleanup=None,
+    sleep=None,
+    clock=None,
+    cache_interval_seconds: float | None = None,
+    state_interval_seconds: float | None = None,
+):
+    global cache_cleanup_last_deleted, cache_cleanup_errors
+    cleanup = cleanup_expired_caches if cache_cleanup is None else cache_cleanup
+    sleep_call = asyncio.sleep if sleep is None else sleep
+    monotonic = time.monotonic if clock is None else clock
+    cache_interval = max(
+        0.01,
+        float(
+            SUBSCRIPTION_CACHE_CLEANUP_INTERVAL_SECONDS
+            if cache_interval_seconds is None else cache_interval_seconds
+        ),
+    )
+    state_interval = max(
+        0.01,
+        float(
+            USER_STATE_CLEANUP_INTERVAL_SECONDS
+            if state_interval_seconds is None else state_interval_seconds
+        ),
+    )
+    now = monotonic()
+    next_cache_cleanup = now + cache_interval
+    next_state_cleanup = now + state_interval
+
+    while True:
+        await sleep_call(max(0.0, min(next_cache_cleanup, next_state_cleanup) - monotonic()))
+        now = monotonic()
+
+        if now >= next_state_cleanup:
+            try:
+                temporary_user_state.cleanup_expired(
+                    USER_STATE_TTL_MINUTES * 60,
+                    now=now,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                cache_cleanup_errors += 1
+                logger.exception("Process-local state cleanup failed")
+            next_state_cleanup = now + state_interval
+
+        if now >= next_cache_cleanup:
+            try:
+                result = await cleanup()
+                cache_cleanup_last_deleted = (
+                    result.subscription_cache_deleted + result.post_cache_deleted
+                )
+                logger.info(
+                    "Cache cleanup deleted=%s subscription_remaining=%s post_remaining=%s elapsed_ms=%.1f",
+                    cache_cleanup_last_deleted,
+                    result.subscription_cache_remaining,
+                    result.post_cache_remaining,
+                    result.elapsed_ms,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                cache_cleanup_errors += 1
+                logger.exception("SQLite cache cleanup failed")
+            next_cache_cleanup = now + cache_interval
+
+
 async def heartbeat_loop():
     started_at = time.monotonic()
     while True:
@@ -5084,12 +5277,14 @@ async def heartbeat_loop():
                 "queued": 0, "active": 0, "tracked_users": 0,
             }
             logger.info(
-                "Heartbeat alive uptime=%ss user_states=%s recent_posts=%s export_queued=%s export_active=%s",
+                "Heartbeat alive uptime=%ss user_states=%s recent_posts=%s export_queued=%s export_active=%s cache_cleanup_last_deleted=%s cache_cleanup_errors=%s",
                 int(time.monotonic() - started_at),
                 len(user_states),
                 len(recent_posts),
                 export_stats["queued"],
                 export_stats["active"],
+                cache_cleanup_last_deleted,
+                cache_cleanup_errors,
             )
         except asyncio.CancelledError:
             raise
@@ -5098,7 +5293,7 @@ async def heartbeat_loop():
 
 
 async def post_init(application):
-    global subscription_task, heartbeat_task, tag_translation_task, zip_export_manager
+    global subscription_task, heartbeat_task, tag_translation_task, zip_export_manager, maintenance_task
 
     bot = application.bot
 
@@ -5157,6 +5352,10 @@ async def post_init(application):
         heartbeat_task = asyncio.create_task(heartbeat_loop())
         logger.info("Heartbeat task started")
 
+    if maintenance_task is None or maintenance_task.done():
+        maintenance_task = asyncio.create_task(maintenance_loop())
+        logger.info("Cache and process-local state maintenance task started")
+
     if TAG_TRANSLATION_ENABLED and (
         tag_translation_task is None or tag_translation_task.done()
     ):
@@ -5169,7 +5368,7 @@ async def post_init(application):
 async def post_shutdown(application):
     """Очистка при завершении"""
     # Останавливаем фоновую задачу
-    global subscription_task, heartbeat_task, tag_translation_task, zip_export_manager
+    global subscription_task, heartbeat_task, tag_translation_task, zip_export_manager, maintenance_task
     if zip_export_manager is not None:
         await zip_export_manager.stop()
         zip_export_manager = None
@@ -5186,6 +5385,15 @@ async def post_shutdown(application):
             await heartbeat_task
         except asyncio.CancelledError:
             pass
+
+    if maintenance_task and not maintenance_task.done():
+        maintenance_task.cancel()
+        try:
+            await maintenance_task
+        except asyncio.CancelledError:
+            pass
+    maintenance_task = None
+    temporary_user_state.clear_all()
 
     if tag_translation_task and not tag_translation_task.done():
         tag_translation_task.cancel()

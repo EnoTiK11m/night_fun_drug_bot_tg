@@ -218,6 +218,14 @@ SQLite-база и необходимые таблицы создаются ав
 | `SUBSCRIPTION_QUERY_MAX_LENGTH` | нет | `256` | Максимальная длина нормализованного запроса подписки |
 | `SUBSCRIPTION_QUERY_MAX_TAGS` | нет | `20` | Максимальное число тегов в запросе подписки |
 | `SUBSCRIPTION_CREATE_COOLDOWN_SECONDS` | нет | `30` | Пауза между созданием новых подписок; обновление существующей не ограничивается |
+| `SUBSCRIPTION_CACHE_MAX_PER_QUERY` | нет | `250` | Максимум строк кэша на пару пользователь/запрос |
+| `SUBSCRIPTION_CACHE_MAX_ROWS` | нет | `100000` | Жёсткий глобальный лимит строк кэша подписок |
+| `SUBSCRIPTION_CACHE_CLEANUP_BATCH_SIZE` | нет | `500` | Максимум удалений из каждого SQLite-кэша за проход |
+| `SUBSCRIPTION_CACHE_CLEANUP_INTERVAL_SECONDS` | нет | `900` | Интервал фоновой очистки SQLite-кэшей |
+| `POST_CACHE_TTL_HOURS` | нет | `168` | Срок хранения записей общего кэша постов в часах |
+| `POST_CACHE_MAX_ROWS` | нет | `100000` | Жёсткий лимит строк общего кэша постов |
+| `USER_STATE_TTL_MINUTES` | нет | `30` | TTL временного process-local состояния пользователя |
+| `USER_STATE_CLEANUP_INTERVAL_SECONDS` | нет | `300` | Интервал очистки временного состояния пользователей |
 | `GLOBAL_DOWNLOAD_CONCURRENCY` | нет | `4` | Общий лимит одновременных внешних загрузок процесса |
 | `ZIP_EXPORT_WORKERS` | нет | `1` | Число обработчиков FIFO-очереди ZIP-экспорта, от 1 до 2 |
 | `ZIP_EXPORT_QUEUE_SIZE` | нет | `8` | Максимум ожидающих ZIP-заданий |
