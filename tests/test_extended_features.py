@@ -20,11 +20,14 @@ class FeatureDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.tempdir = f"test_features_{uuid.uuid4().hex}"
         os.makedirs(self.tempdir)
         self.old_db_path = database.DB_PATH
+        self.old_subscription_cooldown = database.SUBSCRIPTION_CREATE_COOLDOWN_SECONDS
         database.DB_PATH = os.path.join(self.tempdir, "test.db")
+        database.SUBSCRIPTION_CREATE_COOLDOWN_SECONDS = 0
         await database.init_db()
 
     async def asyncTearDown(self):
         database.DB_PATH = self.old_db_path
+        database.SUBSCRIPTION_CREATE_COOLDOWN_SECONDS = self.old_subscription_cooldown
         shutil.rmtree(self.tempdir, ignore_errors=True)
 
     async def test_temporary_blacklist_expires(self):
@@ -341,10 +344,18 @@ class LegacyMigrationTests(unittest.IsolatedAsyncioTestCase):
                         await db.execute("SELECT version FROM schema_migrations")
                     ).fetchall()
                 }
+                quota_state_table = await (
+                    await db.execute("""
+                        SELECT 1 FROM sqlite_master
+                        WHERE type = 'table' AND name = 'subscription_creation_state'
+                    """)
+                ).fetchone()
             self.assertTrue({
                 "claim_token", "claimed_at", "claim_until"
             }.issubset(digest_columns))
             self.assertIn(1, migration_versions)
+            self.assertIn(2, migration_versions)
+            self.assertIsNotNone(quota_state_table)
             self.assertEqual((await database.get_all_user_subscriptions(1))[0][0], "keep")
         finally:
             database.DB_PATH = old_path

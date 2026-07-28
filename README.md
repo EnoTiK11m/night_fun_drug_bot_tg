@@ -213,6 +213,22 @@ SQLite-база и необходимые таблицы создаются ав
 | `SEARCH_COOLDOWN_SECONDS` | нет | `3` | Пауза между пользовательскими поисками |
 | `SUBSCRIPTION_CHECK_INTERVAL_SECONDS` | нет | `120` | Частота проверки подписок; минимум 30 секунд |
 | `SUBSCRIPTION_MAX_POSTS_PER_USER_PASS` | нет | `45` | Максимум обрабатываемых подписок пользователя за проход, от 1 до 45 |
+| `SUBSCRIPTION_MAX_TOTAL` | нет | `20` | Максимум подписок пользователя, включая приостановленные |
+| `SUBSCRIPTION_MAX_ACTIVE` | нет | `10` | Максимум одновременно активных подписок пользователя |
+| `SUBSCRIPTION_QUERY_MAX_LENGTH` | нет | `256` | Максимальная длина нормализованного запроса подписки |
+| `SUBSCRIPTION_QUERY_MAX_TAGS` | нет | `20` | Максимальное число тегов в запросе подписки |
+| `SUBSCRIPTION_CREATE_COOLDOWN_SECONDS` | нет | `30` | Пауза между созданием новых подписок; обновление существующей не ограничивается |
+| `GLOBAL_DOWNLOAD_CONCURRENCY` | нет | `4` | Общий лимит одновременных внешних загрузок процесса |
+| `ZIP_EXPORT_WORKERS` | нет | `1` | Число обработчиков FIFO-очереди ZIP-экспорта, от 1 до 2 |
+| `ZIP_EXPORT_QUEUE_SIZE` | нет | `8` | Максимум ожидающих ZIP-заданий |
+| `ZIP_EXPORT_TIMEOUT_SECONDS` | нет | `600` | Общий timeout одного ZIP-задания |
+| `ZIP_EXPORT_MAX_FILES` | нет | `120` | Максимум файлов в одном экспорте |
+| `ZIP_EXPORT_MAX_FILE_BYTES` | нет | `20971520` | Максимальный фактический размер одного скачанного файла |
+| `ZIP_EXPORT_MAX_TOTAL_BYTES` | нет | `209715200` | Максимум фактически скачанных байт на экспорт |
+| `ZIP_EXPORT_PART_BYTES` | нет | `47185920` | Целевой предел одной ZIP-части |
+| `ZIP_EXPORT_MAX_PARTS` | нет | `5` | Максимальное число ZIP-частей |
+| `ZIP_EXPORT_MAX_TEMP_BYTES` | нет | `100663296` | Максимум временного дискового пространства задания |
+| `ZIP_EXPORT_PROGRESS_INTERVAL_SECONDS` | нет | `3` | Минимальный интервал обновления прогресса в Telegram |
 | `DB_PATH` | нет | `bot_data.db` | Путь к SQLite-базе |
 | `ADMIN_USER_IDS` | нет | пусто | Telegram user ID администраторов через запятую |
 | `ALLOWED_USER_IDS` | нет | пусто | Разрешённые пользователи личных чатов через запятую |
@@ -367,7 +383,7 @@ python -m pip check
 Проверка синтаксиса и запуск тестов:
 
 ```bash
-python -m compileall -q bot.py api_handler.py database.py config.py bot_delivery.py bot_features.py bot_formatting.py bot_keyboards.py bot_media.py bot_state.py tag_translation.py
+python -m compileall -q bot.py api_handler.py database.py config.py bot_delivery.py bot_features.py bot_formatting.py bot_keyboards.py bot_media.py bot_zip_export.py bot_state.py tag_translation.py
 python -m unittest discover -s tests -v
 ```
 

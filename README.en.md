@@ -231,6 +231,22 @@ All settings are read from environment variables or `.env`.
 | `SEARCH_COOLDOWN_SECONDS` | no | `3` | Delay between user searches |
 | `SUBSCRIPTION_CHECK_INTERVAL_SECONDS` | no | `120` | Subscription scan interval; minimum 30 seconds |
 | `SUBSCRIPTION_MAX_POSTS_PER_USER_PASS` | no | `45` | Maximum subscriptions processed per user pass, from 1 to 45 |
+| `SUBSCRIPTION_MAX_TOTAL` | no | `20` | Maximum subscriptions per user, including paused ones |
+| `SUBSCRIPTION_MAX_ACTIVE` | no | `10` | Maximum simultaneously active subscriptions per user |
+| `SUBSCRIPTION_QUERY_MAX_LENGTH` | no | `256` | Maximum normalized subscription query length |
+| `SUBSCRIPTION_QUERY_MAX_TAGS` | no | `20` | Maximum tags in a subscription query |
+| `SUBSCRIPTION_CREATE_COOLDOWN_SECONDS` | no | `30` | Delay between new subscriptions; updating an existing one is exempt |
+| `GLOBAL_DOWNLOAD_CONCURRENCY` | no | `4` | Process-wide concurrent external download limit |
+| `ZIP_EXPORT_WORKERS` | no | `1` | FIFO ZIP worker count, from 1 to 2 |
+| `ZIP_EXPORT_QUEUE_SIZE` | no | `8` | Maximum waiting ZIP jobs |
+| `ZIP_EXPORT_TIMEOUT_SECONDS` | no | `600` | Whole-job ZIP export timeout |
+| `ZIP_EXPORT_MAX_FILES` | no | `120` | Maximum files per export |
+| `ZIP_EXPORT_MAX_FILE_BYTES` | no | `20971520` | Maximum actual downloaded bytes per file |
+| `ZIP_EXPORT_MAX_TOTAL_BYTES` | no | `209715200` | Maximum actual downloaded bytes per export |
+| `ZIP_EXPORT_PART_BYTES` | no | `47185920` | Maximum ZIP part size target |
+| `ZIP_EXPORT_MAX_PARTS` | no | `5` | Maximum ZIP parts per export |
+| `ZIP_EXPORT_MAX_TEMP_BYTES` | no | `100663296` | Maximum temporary disk footprint per job |
+| `ZIP_EXPORT_PROGRESS_INTERVAL_SECONDS` | no | `3` | Minimum Telegram progress update interval |
 | `DB_PATH` | no | `bot_data.db` | SQLite database path |
 | `ADMIN_USER_IDS` | no | empty | Comma-separated administrator Telegram user IDs |
 | `ALLOWED_USER_IDS` | no | empty | Comma-separated users allowed in private chats |
@@ -388,7 +404,7 @@ python -m pip check
 Check syntax and run tests:
 
 ```bash
-python -m compileall -q bot.py api_handler.py database.py config.py bot_delivery.py bot_features.py bot_formatting.py bot_keyboards.py bot_media.py bot_state.py tag_translation.py
+python -m compileall -q bot.py api_handler.py database.py config.py bot_delivery.py bot_features.py bot_formatting.py bot_keyboards.py bot_media.py bot_zip_export.py bot_state.py tag_translation.py
 python -m unittest discover -s tests -v
 ```
 

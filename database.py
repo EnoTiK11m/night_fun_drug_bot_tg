@@ -2,12 +2,20 @@ import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiosqlite
 
-from config import DB_PATH
+from config import (
+    DB_PATH,
+    SUBSCRIPTION_CREATE_COOLDOWN_SECONDS,
+    SUBSCRIPTION_MAX_ACTIVE,
+    SUBSCRIPTION_MAX_TOTAL,
+    SUBSCRIPTION_QUERY_MAX_LENGTH,
+    SUBSCRIPTION_QUERY_MAX_TAGS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +25,7 @@ SEARCH_HISTORY_RETENTION_PER_USER = 200
 SUBSCRIPTION_CLAIM_MINUTES = 5
 DIGEST_CLAIM_MINUTES = 10
 DIGEST_CLAIM_MIGRATION_VERSION = 1
+SUBSCRIPTION_QUOTA_MIGRATION_VERSION = 2
 SUBSCRIPTION_CACHE_TTL_MINUTES = 60
 SUBSCRIPTION_CACHE_MIN_AVAILABLE = 20
 SUBSCRIPTION_PAUSE_SETTING = "subscription_pause_until"
@@ -58,6 +67,51 @@ BLACKLIST_PRESETS = {
     "male": {"male", "1boy", "multiple_boys"},
     "extreme": {"gore", "scat", "guro"},
 }
+
+
+@dataclass(frozen=True)
+class SubscriptionAddResult:
+    status: str
+    total_count: int = 0
+    active_count: int = 0
+    total_limit: int = SUBSCRIPTION_MAX_TOTAL
+    active_limit: int = SUBSCRIPTION_MAX_ACTIVE
+    retry_after_seconds: int = 0
+
+    def __bool__(self) -> bool:
+        return self.status in {"created", "reactivated", "updated"}
+
+
+@dataclass(frozen=True)
+class SubscriptionToggleResult:
+    status: str
+    is_active: Optional[bool] = None
+    active_count: int = 0
+    active_limit: int = SUBSCRIPTION_MAX_ACTIVE
+    total_count: int = 0
+    total_limit: int = SUBSCRIPTION_MAX_TOTAL
+
+
+def normalize_subscription_query(query: Any) -> str:
+    if not isinstance(query, str):
+        return ""
+    return " ".join(query.strip().split())
+
+
+def validate_subscription_query(query: Any) -> tuple[str, str]:
+    if not isinstance(query, str) or any(ord(character) < 32 for character in query):
+        return normalize_subscription_query(query), "invalid_query"
+    normalized = normalize_subscription_query(query)
+    if not normalized:
+        return normalized, "invalid_query"
+    if len(normalized) > SUBSCRIPTION_QUERY_MAX_LENGTH:
+        return normalized, "query_too_long"
+    tokens = normalized.split()
+    if len(tokens) > SUBSCRIPTION_QUERY_MAX_TAGS:
+        return normalized, "too_many_tags"
+    if any(token in {"-", "+"} for token in tokens):
+        return normalized, "invalid_query"
+    return normalized, ""
 
 
 @asynccontextmanager
@@ -168,6 +222,32 @@ async def apply_versioned_migrations(db):
             raise RuntimeError(
                 "Digest claim migration is recorded but columns are missing: "
                 + ", ".join(missing)
+            )
+
+        cursor = await db.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            (SUBSCRIPTION_QUOTA_MIGRATION_VERSION,),
+        )
+        quota_migration_applied = await cursor.fetchone() is not None
+        cursor = await db.execute("""
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'subscription_creation_state'
+        """)
+        quota_table_exists = await cursor.fetchone() is not None
+        if not quota_migration_applied:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS subscription_creation_state (
+                    user_id INTEGER PRIMARY KEY,
+                    last_created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?)",
+                (SUBSCRIPTION_QUOTA_MIGRATION_VERSION,),
+            )
+        elif not quota_table_exists:
+            raise RuntimeError(
+                "Subscription quota migration is recorded but state table is missing"
             )
         await db.commit()
     except BaseException:
@@ -1201,30 +1281,179 @@ async def get_subscription_pause_until(user_id: int) -> Optional[str]:
         return pause_until
 
 
-async def add_subscription(user_id: int, query: str, interval_minutes: int = 10) -> bool:
+async def _subscription_counts(db, user_id: int) -> tuple[int, int]:
+    cursor = await db.execute("""
+        SELECT COUNT(*),
+               COALESCE(SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END), 0)
+        FROM subscriptions WHERE user_id = ?
+    """, (user_id,))
+    row = await cursor.fetchone()
+    return int(row[0] or 0), int(row[1] or 0)
+
+
+async def get_subscription_usage(user_id: int) -> tuple[int, int]:
     async with connect_db() as db:
-        try:
-            pause_until = await _get_active_subscription_pause_until(db, user_id)
-            await db.execute("""
-                INSERT INTO subscriptions
-                (
-                    user_id, query, interval_minutes, is_active, last_sent,
-                    no_new_posts_count, last_empty_at, next_check_at, exhausted_notified,
-                    processing_until, processing_token
+        return await _subscription_counts(db, user_id)
+
+
+async def add_subscription(
+    user_id: int,
+    query: str,
+    interval_minutes: int = 10,
+    *,
+    total_limit: int | None = None,
+    active_limit: int | None = None,
+    cooldown_seconds: int | None = None,
+) -> SubscriptionAddResult:
+    stripped_query = query.strip() if isinstance(query, str) else ""
+    normalized_query, validation_error = validate_subscription_query(query)
+    configured_total = max(1, int(
+        SUBSCRIPTION_MAX_TOTAL if total_limit is None else total_limit
+    ))
+    configured_active = max(1, min(configured_total, int(
+        SUBSCRIPTION_MAX_ACTIVE if active_limit is None else active_limit
+    )))
+    configured_cooldown = max(0, int(
+        SUBSCRIPTION_CREATE_COOLDOWN_SECONDS
+        if cooldown_seconds is None else cooldown_seconds
+    ))
+    if validation_error:
+        return SubscriptionAddResult(
+            validation_error,
+            total_limit=configured_total,
+            active_limit=configured_active,
+        )
+
+    try:
+        async with connect_db() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute("""
+                    SELECT query, is_active FROM subscriptions
+                    WHERE user_id = ? AND query = ?
+                """, (user_id, stripped_query))
+                existing = await cursor.fetchone()
+                if existing is None:
+                    cursor = await db.execute("""
+                        SELECT query, is_active FROM subscriptions
+                        WHERE user_id = ? ORDER BY query COLLATE BINARY
+                    """, (user_id,))
+                    canonical_matches = [
+                        row for row in await cursor.fetchall()
+                        if normalize_subscription_query(row[0]) == normalized_query
+                    ]
+                    if len(canonical_matches) > 1:
+                        await db.rollback()
+                        return SubscriptionAddResult(
+                            "ambiguous_query",
+                            total_limit=configured_total,
+                            active_limit=configured_active,
+                        )
+                    existing = canonical_matches[0] if canonical_matches else None
+                total_count, active_count = await _subscription_counts(db, user_id)
+                stored_query = existing[0] if existing is not None else normalized_query
+
+                if existing is not None and bool(existing[1]):
+                    await db.execute("""
+                        UPDATE subscriptions SET interval_minutes = ?
+                        WHERE user_id = ? AND query = ?
+                    """, (interval_minutes, user_id, stored_query))
+                    await db.commit()
+                    return SubscriptionAddResult(
+                        "updated", total_count, active_count,
+                        configured_total, configured_active,
+                    )
+
+                if existing is not None:
+                    if total_count > configured_total:
+                        await db.rollback()
+                        return SubscriptionAddResult(
+                            "total_limit_reached", total_count, active_count,
+                            configured_total, configured_active,
+                        )
+                    if active_count >= configured_active:
+                        await db.rollback()
+                        return SubscriptionAddResult(
+                            "active_limit_reached", total_count, active_count,
+                            configured_total, configured_active,
+                        )
+                    await db.execute("""
+                        UPDATE subscriptions
+                        SET interval_minutes = ?, is_active = 1
+                        WHERE user_id = ? AND query = ? AND is_active = 0
+                    """, (interval_minutes, user_id, stored_query))
+                    await db.commit()
+                    return SubscriptionAddResult(
+                        "reactivated", total_count, active_count + 1,
+                        configured_total, configured_active,
+                    )
+
+                if total_count >= configured_total:
+                    await db.rollback()
+                    return SubscriptionAddResult(
+                        "total_limit_reached", total_count, active_count,
+                        configured_total, configured_active,
+                    )
+                if active_count >= configured_active:
+                    await db.rollback()
+                    return SubscriptionAddResult(
+                        "active_limit_reached", total_count, active_count,
+                        configured_total, configured_active,
+                    )
+
+                cursor = await db.execute("""
+                    SELECT MAX(
+                        0,
+                        ? - (
+                            CAST(strftime('%s', 'now') AS INTEGER)
+                            - CAST(strftime('%s', last_created_at) AS INTEGER)
+                        )
+                    )
+                    FROM subscription_creation_state WHERE user_id = ?
+                """, (configured_cooldown, user_id))
+                row = await cursor.fetchone()
+                retry_after = int((row[0] if row else 0) or 0)
+                if retry_after > 0:
+                    await db.rollback()
+                    return SubscriptionAddResult(
+                        "cooldown", total_count, active_count,
+                        configured_total, configured_active, retry_after,
+                    )
+
+                pause_until = await _get_active_subscription_pause_until(db, user_id)
+                await db.execute("""
+                    INSERT INTO subscriptions
+                    (
+                        user_id, query, interval_minutes, is_active, last_sent,
+                        no_new_posts_count, last_empty_at, next_check_at,
+                        exhausted_notified, processing_until, processing_token
+                    )
+                    VALUES (
+                        ?, ?, ?, 1, datetime('now', '-1 hour'), 0, NULL,
+                        COALESCE(?, datetime('now')), 0, NULL, NULL
+                    )
+                """, (user_id, normalized_query, interval_minutes, pause_until))
+                await db.execute("""
+                    INSERT INTO subscription_creation_state(user_id, last_created_at)
+                    VALUES (?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        last_created_at = CURRENT_TIMESTAMP
+                """, (user_id,))
+                await db.commit()
+                return SubscriptionAddResult(
+                    "created", total_count + 1, active_count + 1,
+                    configured_total, configured_active,
                 )
-                VALUES (
-                    ?, ?, ?, 1, datetime('now', '-1 hour'), 0, NULL,
-                    COALESCE(?, datetime('now')), 0, NULL, NULL
-                )
-                ON CONFLICT(user_id, query) DO UPDATE SET
-                    interval_minutes = excluded.interval_minutes,
-                    is_active = 1
-            """, (user_id, query.strip(), interval_minutes, pause_until))
-            await db.commit()
-            return True
-        except Exception as e:
-            logger.exception("Error adding subscription: %s", e)
-            return False
+            except BaseException:
+                await db.rollback()
+                raise
+    except Exception as exc:
+        logger.exception("Error adding subscription: %s", type(exc).__name__)
+        return SubscriptionAddResult(
+            "internal_error",
+            total_limit=configured_total,
+            active_limit=configured_active,
+        )
 
 
 async def remove_subscription(user_id: int, query: str) -> bool:
@@ -1457,31 +1686,77 @@ async def release_stale_subscription_claims():
         await db.commit()
 
 
-async def toggle_subscription(user_id: int, query: str) -> Optional[bool]:
+async def toggle_subscription(
+    user_id: int,
+    query: str,
+    *,
+    active_limit: int | None = None,
+    total_limit: int | None = None,
+) -> SubscriptionToggleResult:
+    configured_total = max(1, int(
+        SUBSCRIPTION_MAX_TOTAL if total_limit is None else total_limit
+    ))
+    configured_active = max(1, min(configured_total, int(
+        SUBSCRIPTION_MAX_ACTIVE if active_limit is None else active_limit
+    )))
+    stored_query = query.strip() if isinstance(query, str) else ""
     async with connect_db() as db:
-        cursor = await db.execute(
-            "SELECT is_active FROM subscriptions WHERE user_id = ? AND query = ?",
-            (user_id, query.strip())
-        )
-        row = await cursor.fetchone()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await db.execute(
+                "SELECT is_active FROM subscriptions WHERE user_id = ? AND query = ?",
+                (user_id, stored_query)
+            )
+            row = await cursor.fetchone()
+            if not row:
+                await db.rollback()
+                return SubscriptionToggleResult(
+                    "not_found", active_limit=configured_active,
+                    total_limit=configured_total,
+                )
 
-        if row:
-            new_state = not bool(row[0])
+            current_state = bool(row[0])
+            total_count, active_count = await _subscription_counts(db, user_id)
+            if not current_state and total_count > configured_total:
+                await db.rollback()
+                return SubscriptionToggleResult(
+                    "total_limit_reached", False, active_count,
+                    configured_active, total_count, configured_total,
+                )
+            if not current_state and active_count >= configured_active:
+                await db.rollback()
+                return SubscriptionToggleResult(
+                    "active_limit_reached", False, active_count,
+                    configured_active, total_count, configured_total,
+                )
+
+            new_state = not current_state
             await db.execute("""
                 UPDATE subscriptions
                 SET is_active = ?,
                     next_check_at = CASE
                         WHEN ? = 1 THEN datetime('now')
                         ELSE next_check_at
-                    END,
-                    processing_until = NULL,
-                    processing_token = NULL
+                    END
                 WHERE user_id = ? AND query = ?
-            """, (new_state, int(new_state), user_id, query.strip()))
+            """, (
+                new_state,
+                int(new_state),
+                user_id,
+                stored_query,
+            ))
             await db.commit()
-            return new_state
-
-        return None
+            return SubscriptionToggleResult(
+                "reactivated" if new_state else "deactivated",
+                new_state,
+                active_count + (1 if new_state else -1),
+                configured_active,
+                total_count,
+                configured_total,
+            )
+        except BaseException:
+            await db.rollback()
+            raise
 
 
 async def add_favorite(user_id: int, post: Dict[str, Any]) -> bool:

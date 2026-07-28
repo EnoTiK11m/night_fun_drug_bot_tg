@@ -4,8 +4,6 @@ import time
 import random
 import os
 import sys
-import tempfile
-import zipfile
 import json
 import shutil
 import io
@@ -13,9 +11,6 @@ import re
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
-from urllib.parse import urlparse
-
-import aiohttp
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -48,7 +43,10 @@ from config import (
     DB_PATH,
     SEARCH_COOLDOWN_SECONDS,
     SUBSCRIPTION_CHECK_INTERVAL_SECONDS,
+    SUBSCRIPTION_MAX_ACTIVE,
+    SUBSCRIPTION_MAX_TOTAL,
     SUBSCRIPTION_MAX_POSTS_PER_USER_PASS,
+    ZIP_EXPORT_MAX_FILES,
     TAG_TRANSLATION_ENABLED,
     validate_config,
 )
@@ -111,7 +109,6 @@ from bot_features import (
     runtime_metrics,
 )
 from bot_media import (
-    _download_photo_file,
     get_media_url_candidates,
     media_url_path_lower,
     send_post_media as send_post_media_with_retries,
@@ -128,6 +125,7 @@ from project_update import (
     update_operation_lock,
     write_update_marker,
 )
+from bot_zip_export import ZipExportManager, ZipExportSource
 from bot_state import (
     get_callback_payload,
     get_callback_payload_by_token,
@@ -154,6 +152,7 @@ from database import (
     pause_all_active_subscriptions,
     resume_all_active_subscriptions,
     get_subscription_pause_until,
+    get_subscription_usage,
     get_due_subscriptions,
     claim_due_subscription,
     release_subscription_claim,
@@ -331,20 +330,17 @@ pending_subscription_options: dict[int, str] = {}
 subscription_task = None
 heartbeat_task = None
 tag_translation_task = None
+zip_export_manager: ZipExportManager | None = None
 user_last_search_at = {}
 MEDIA_SEND_RETRIES = 2
 SUBSCRIPTION_CONCURRENCY = 5
 HEARTBEAT_INTERVAL_SECONDS = 5 * 60
-FAVORITES_EXPORT_ZIP_LIMIT_BYTES = 45 * 1024 * 1024
-FAVORITES_EXPORT_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 FAVORITES_EXPORT_COOLDOWN_SECONDS = 5 * 60
 POST_TAGS_PAGE_SIZE = 8
 FAVORITES_GALLERY_PAGE_SIZE = 10
 RESTART_EXIT_CODE = 42
 restart_requested = False
 RESTART_TEXT_COMMANDS = {"restart", "рестарт"}
-favorites_export_users: set[int] = set()
-favorites_export_last_finished_at: dict[int, float] = {}
 upstream_failure_streak = 0
 last_admin_alert_at = 0.0
 ADMIN_ALERT_COOLDOWN_SECONDS = 15 * 60
@@ -471,6 +467,7 @@ async def get_user_subscriptions_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 async def build_subscriptions_menu_text(user_id: int) -> str:
     remaining = format_remaining_pause(await get_subscription_pause_until(user_id))
+    total_count, active_count = await get_subscription_usage(user_id)
     status = (
         f"⏸ Сейчас приостановлены, осталось: {remaining}."
         if remaining
@@ -479,6 +476,8 @@ async def build_subscriptions_menu_text(user_id: int) -> str:
     return (
         "🔔 *Подписки*\n\n"
         "Бот автоматически пришлёт новые посты по сохранённым запросам.\n\n"
+        f"Подписки: {total_count} из {SUBSCRIPTION_MAX_TOTAL}.\n"
+        f"Активные: {active_count} из {SUBSCRIPTION_MAX_ACTIVE}.\n\n"
         f"{status}"
     )
 
@@ -1391,10 +1390,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("col_export_"):
         value = data.replace("col_export_", "", 1)
         if value.isdigit():
-            schedule_background_task(
-                context,
-                start_collection_zip_export(query.message, user_id, int(value)),
-            )
+            await enqueue_collection_zip_export(query.message, user_id, int(value))
+
+    elif data.startswith("zip_cancel_"):
+        job_id = data.replace("zip_cancel_", "", 1)
+        cancelled = bool(zip_export_manager) and await zip_export_manager.cancel_for_user(
+            user_id, job_id
+        )
+        if not cancelled:
+            await query.message.reply_text("ℹ️ ZIP-экспорт уже завершён или не найден.")
 
     elif data.startswith("fav_note_"):
         value = data.replace("fav_note_", "", 1)
@@ -1423,7 +1427,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "fav_export":
-        schedule_background_task(context, start_favorites_zip_export(query.message, user_id))
+        await enqueue_favorites_zip_export(query.message, user_id)
 
     elif data.startswith("fav_list_page_"):
         page_text = data.replace("fav_list_page_", "", 1)
@@ -1911,13 +1915,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        new_state = await toggle_subscription(user_id, sub_query)
-        if new_state is None:
+        toggle_result = await toggle_subscription(user_id, sub_query)
+        if toggle_result.status == "not_found":
             await query.edit_message_text(
                 "❌ Подписка не найдена.", parse_mode="Markdown"
             )
+        elif toggle_result.status in {"active_limit_reached", "total_limit_reached"}:
+            await query.edit_message_text(
+                (
+                    "❌ Сначала удалите лишние подписки до общего лимита."
+                    if toggle_result.status == "total_limit_reached"
+                    else "❌ Сначала приостановите или удалите одну из активных подписок."
+                ),
+                reply_markup=await get_user_subscriptions_keyboard(user_id),
+                parse_mode="Markdown",
+            )
         else:
-            state_text = "запущена" if new_state else "остановлена"
+            state_text = "запущена" if toggle_result.is_active else "остановлена"
             await query.edit_message_text(
                 f"✅ Подписка `{md_code(sub_query)}` {state_text}.",
                 reply_markup=await get_user_subscriptions_keyboard(user_id),
@@ -1933,11 +1947,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             await query.edit_message_text("❌ Предпросмотр устарел. Создайте подписку заново.")
             return
-        success = await add_subscription(user_id, sub_query, interval)
+        result = await add_subscription(user_id, sub_query, interval)
         await query.edit_message_text(
             await build_subscription_added_text(sub_query, interval, user_id)
-            if success
-            else "❌ Не удалось создать подписку.",
+            if result
+            else build_subscription_create_error(result),
             reply_markup=await get_user_subscriptions_keyboard(user_id),
             parse_mode="Markdown",
         )
@@ -2633,18 +2647,6 @@ async def send_post_media_to_chat(
     )
 
 
-def image_extension_from_url(url: str) -> str:
-    path = urlparse(url).path.lower()
-    _, extension = os.path.splitext(path)
-    if extension in FAVORITES_EXPORT_IMAGE_EXTENSIONS:
-        return extension
-    return ""
-
-
-def is_exportable_image_url(url: str) -> bool:
-    return bool(image_extension_from_url(url))
-
-
 async def ensure_favorite_original_url(post: dict) -> dict:
     if post.get("file_url"):
         return post
@@ -2661,156 +2663,78 @@ async def ensure_favorite_original_url(post: dict) -> dict:
     return post
 
 
-async def download_original_favorite_image(
-    session: aiohttp.ClientSession,
-    post: dict,
-) -> tuple[str, bytes] | None:
-    post = await ensure_favorite_original_url(post)
-    url = post.get("file_url", "")
-    extension = image_extension_from_url(url)
-    if not extension:
-        return None
-
-    post_id = post.get("id", "unknown")
-    filename = f"{post_id}{extension}"
-    photo = await _download_photo_file(
-        url, max_bytes=FAVORITES_EXPORT_ZIP_LIMIT_BYTES
-    )
-    try:
-        return filename, photo.read()
-    finally:
-        photo.close()
-
-
-async def send_favorites_zip_export(
-    message, user_id: int, favorites: list[dict] | None = None, title: str = "Избранное"
-):
-    total = len(favorites) if favorites is not None else await count_favorites(user_id)
-    if total <= 0:
-        await message.reply_text("⭐ Избранное пока пустое.")
-        return
-
-    await message.reply_text(
-        f"📦 Собираю ZIP «{title}»: {total} постов. Беру только оригинальные картинки."
-    )
-
-    if favorites is None:
-        favorites = await get_favorites(user_id, limit=None)
-    exported = 0
-    skipped = 0
-    part = 1
-
-    with tempfile.TemporaryDirectory(prefix=f"favorites_{user_id}_") as tempdir:
-        archive_path = os.path.join(tempdir, f"favorites_{part}.zip")
-        archive = zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED)
-        archive_size = 0
-        archive_count = 0
-        sent_parts = 0
-
-        async with aiohttp.ClientSession() as session:
-            for favorite in favorites:
-                downloaded = None
-                try:
-                    downloaded = await download_original_favorite_image(session, favorite)
-                except Exception as exc:
-                    logger.warning(
-                        "Favorite export failed post=%s: %s",
-                        favorite.get("id"),
-                        exc,
-                    )
-
-                if not downloaded:
-                    skipped += 1
-                    continue
-
-                filename, data = downloaded
-                if archive_count and archive_size + len(data) > FAVORITES_EXPORT_ZIP_LIMIT_BYTES:
-                    archive.close()
-                    with open(archive_path, "rb") as document:
-                        await message.reply_document(
-                            document=document,
-                            filename=os.path.basename(archive_path),
-                            caption=f"📦 {title}, часть {part}",
-                        )
-                    sent_parts += 1
-                    part += 1
-                    archive_path = os.path.join(tempdir, f"favorites_{part}.zip")
-                    archive = zipfile.ZipFile(
-                        archive_path,
-                        "w",
-                        compression=zipfile.ZIP_DEFLATED,
-                    )
-                    archive_size = 0
-                    archive_count = 0
-
-                archive.writestr(filename, data)
-                archive_size += len(data)
-                archive_count += 1
-                exported += 1
-
-        archive.close()
-        if archive_count:
-            with open(archive_path, "rb") as document:
-                await message.reply_document(
-                    document=document,
-                    filename=os.path.basename(archive_path),
-                    caption=f"📦 {title}, часть {part}",
-                )
-            sent_parts += 1
-
-    if exported:
-        await message.reply_text(
-            f"✅ Готово: {exported} картинок в {sent_parts} ZIP. Пропущено: {skipped}."
+async def load_zip_export_source(
+    user_id: int, source_kind: str, collection_id: int | None
+) -> ZipExportSource:
+    if source_kind == "favorites":
+        candidates = await get_favorites(
+            user_id, limit=ZIP_EXPORT_MAX_FILES + 1
         )
-    else:
-        await message.reply_text(
-            "❌ Не нашлось оригинальных картинок для архива. GIF, видео и посты без доступного file_url пропущены."
+        return ZipExportSource(
+            title="Избранное",
+            posts=candidates[:ZIP_EXPORT_MAX_FILES],
+            truncated=len(candidates) > ZIP_EXPORT_MAX_FILES,
         )
 
-
-async def start_favorites_zip_export(message, user_id: int):
-    if user_id in favorites_export_users:
-        await message.reply_text("📦 Архив избранного уже собирается.")
-        return
-
-    now = time.monotonic()
-    last_finished_at = favorites_export_last_finished_at.get(user_id, 0)
-    remaining = FAVORITES_EXPORT_COOLDOWN_SECONDS - (now - last_finished_at)
-    if remaining > 0:
-        minutes = max(1, int((remaining + 59) // 60))
-        await message.reply_text(
-            f"📦 Экспорт уже недавно запускался. Попробуйте через {minutes} мин."
-        )
-        return
-
-    favorites_export_users.add(user_id)
-    try:
-        await send_favorites_zip_export(message, user_id)
-    finally:
-        favorites_export_users.discard(user_id)
-        favorites_export_last_finished_at[user_id] = time.monotonic()
-
-
-async def start_collection_zip_export(message, user_id: int, collection_id: int):
+    if collection_id is None:
+        return ZipExportSource(title="Коллекция", posts=[])
     collection = await get_favorite_collection(user_id, collection_id)
     if not collection:
-        await message.reply_text("❌ Коллекция не найдена.")
-        return
-    posts = await get_collection_favorites(user_id, collection_id, limit=None)
-    if not posts:
-        await message.reply_text("❌ Коллекция пуста.")
-        return
-    if user_id in favorites_export_users:
-        await message.reply_text("📦 Другой архив уже собирается.")
-        return
-    favorites_export_users.add(user_id)
-    try:
-        await send_favorites_zip_export(
-            message, user_id, favorites=posts, title=collection["name"]
+        return ZipExportSource(title="Коллекция", posts=[])
+    candidates = await get_collection_favorites(
+        user_id, collection_id, limit=ZIP_EXPORT_MAX_FILES + 1
+    )
+    return ZipExportSource(
+        title=collection["name"],
+        posts=candidates[:ZIP_EXPORT_MAX_FILES],
+        truncated=len(candidates) > ZIP_EXPORT_MAX_FILES,
+    )
+
+
+def get_zip_export_cancel_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛑 Отменить экспорт", callback_data=f"zip_cancel_{job_id}")
+    ]])
+
+
+async def show_zip_enqueue_rejection(message, result) -> None:
+    if result.status == "duplicate":
+        position = result.position
+        text = (
+            "📦 ZIP-экспорт уже выполняется."
+            if position == 0
+            else f"📦 ZIP-экспорт уже ожидает в очереди. Позиция: {position}."
         )
-    finally:
-        favorites_export_users.discard(user_id)
-        favorites_export_last_finished_at[user_id] = time.monotonic()
+    elif result.status == "queue_full":
+        text = "⏳ Очередь ZIP-экспорта заполнена. Попробуйте позже."
+    elif result.status == "cooldown":
+        minutes = max(1, ((result.retry_after_seconds or 1) + 59) // 60)
+        text = f"📦 Экспорт уже недавно запускался. Попробуйте через {minutes} мин."
+    elif result.status == "cancelled":
+        text = "🛑 ZIP-экспорт отменён."
+    else:
+        text = "🛑 ZIP-экспорт сейчас недоступен: бот завершает работу."
+    await message.reply_text(text)
+
+
+async def enqueue_favorites_zip_export(message, user_id: int) -> None:
+    if zip_export_manager is None:
+        await message.reply_text("❌ ZIP-экспорт временно недоступен.")
+        return
+    result = await zip_export_manager.enqueue_favorites(message, user_id)
+    if result.status != "queued":
+        await show_zip_enqueue_rejection(message, result)
+
+
+async def enqueue_collection_zip_export(message, user_id: int, collection_id: int) -> None:
+    if zip_export_manager is None:
+        await message.reply_text("❌ ZIP-экспорт временно недоступен.")
+        return
+    result = await zip_export_manager.enqueue_collection(
+        message, user_id, collection_id
+    )
+    if result.status != "queued":
+        await show_zip_enqueue_rejection(message, result)
 
 
 async def show_subscription_posts_menu(
@@ -4375,8 +4299,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_preset_queries.pop(user_id, None)
     pending_bulk_posts.pop(user_id, None)
     pending_subscription_options.pop(user_id, None)
+    export_cancelled = bool(zip_export_manager) and await zip_export_manager.cancel_for_user(user_id)
     await update.message.reply_text(
-        "Действие отменено.\n\n" + await build_main_menu_text(user_id),
+        ("Действие и ZIP-экспорт отменены.\n\n" if export_cancelled else "Действие отменено.\n\n")
+        + await build_main_menu_text(user_id),
         reply_markup=await get_user_main_keyboard(user_id),
     )
 
@@ -4670,6 +4596,27 @@ def _update_error_text(result) -> str:
             f"\nСтало: {result.new_commit[:12]}"
         )
     return text
+
+
+def build_subscription_create_error(result) -> str:
+    if result.status == "total_limit_reached":
+        return f"❌ Достигнут лимит подписок: {result.total_count} из {result.total_limit}."
+    if result.status == "active_limit_reached":
+        return "❌ Сначала приостановите или удалите одну из активных подписок."
+    if result.status == "query_too_long":
+        return "❌ Запрос слишком длинный. Сократите его и попробуйте снова."
+    if result.status == "too_many_tags":
+        return "❌ В запросе слишком много тегов. Удалите лишние и попробуйте снова."
+    if result.status == "cooldown":
+        return f"⏳ Новую подписку можно создать через {max(1, result.retry_after_seconds)} сек."
+    if result.status == "invalid_query":
+        return "❌ Некорректный запрос подписки. Проверьте теги и попробуйте снова."
+    if result.status == "ambiguous_query":
+        return (
+            "❌ Найдено несколько старых подписок с таким запросом. "
+            "Измените нужную подписку из списка или удалите дубликаты."
+        )
+    return "❌ Не удалось создать подписку. Попробуйте позже."
 
 
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5133,12 +5080,16 @@ async def heartbeat_loop():
     while True:
         try:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            export_stats = zip_export_manager.stats() if zip_export_manager else {
+                "queued": 0, "active": 0, "tracked_users": 0,
+            }
             logger.info(
-                "Heartbeat alive uptime=%ss user_states=%s recent_posts=%s export_jobs=%s",
+                "Heartbeat alive uptime=%ss user_states=%s recent_posts=%s export_queued=%s export_active=%s",
                 int(time.monotonic() - started_at),
                 len(user_states),
                 len(recent_posts),
-                len(favorites_export_users),
+                export_stats["queued"],
+                export_stats["active"],
             )
         except asyncio.CancelledError:
             raise
@@ -5147,7 +5098,7 @@ async def heartbeat_loop():
 
 
 async def post_init(application):
-    global subscription_task, heartbeat_task, tag_translation_task
+    global subscription_task, heartbeat_task, tag_translation_task, zip_export_manager
 
     bot = application.bot
 
@@ -5186,6 +5137,16 @@ async def post_init(application):
     await init_db()
     await notify_update_marker(bot)
 
+    if zip_export_manager is None:
+        zip_export_manager = ZipExportManager(
+            application=application,
+            source_loader=load_zip_export_source,
+            post_resolver=ensure_favorite_original_url,
+            cancel_markup_factory=get_zip_export_cancel_keyboard,
+            favorites_cooldown_seconds=FAVORITES_EXPORT_COOLDOWN_SECONDS,
+        )
+    await zip_export_manager.start()
+
     # Запускаем фоновую задачу для подписок
     if subscription_task is None or subscription_task.done():
         subscription_task = asyncio.create_task(
@@ -5208,7 +5169,10 @@ async def post_init(application):
 async def post_shutdown(application):
     """Очистка при завершении"""
     # Останавливаем фоновую задачу
-    global subscription_task, heartbeat_task, tag_translation_task
+    global subscription_task, heartbeat_task, tag_translation_task, zip_export_manager
+    if zip_export_manager is not None:
+        await zip_export_manager.stop()
+        zip_export_manager = None
     if subscription_task and not subscription_task.done():
         subscription_task.cancel()
         try:

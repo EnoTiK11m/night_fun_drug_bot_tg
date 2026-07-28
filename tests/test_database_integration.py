@@ -14,13 +14,16 @@ class TempDatabaseTestCase(unittest.IsolatedAsyncioTestCase):
         self.old_db_path = database.DB_PATH
         self.old_history_retention = database.SEARCH_HISTORY_RETENTION_PER_USER
         self.old_sent_retention = database.SENT_POSTS_RETENTION_PER_USER
+        self.old_subscription_cooldown = database.SUBSCRIPTION_CREATE_COOLDOWN_SECONDS
         database.DB_PATH = os.path.join(self.tempdir, "test.db")
+        database.SUBSCRIPTION_CREATE_COOLDOWN_SECONDS = 0
         await database.init_db()
 
     async def asyncTearDown(self):
         database.DB_PATH = self.old_db_path
         database.SEARCH_HISTORY_RETENTION_PER_USER = self.old_history_retention
         database.SENT_POSTS_RETENTION_PER_USER = self.old_sent_retention
+        database.SUBSCRIPTION_CREATE_COOLDOWN_SECONDS = self.old_subscription_cooldown
         shutil.rmtree(self.tempdir, ignore_errors=True)
 
 

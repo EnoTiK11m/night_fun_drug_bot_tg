@@ -44,8 +44,6 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         bot.pending_preset_queries.pop(1, None)
         bot.pending_bulk_posts.pop(1, None)
         bot.pending_subscription_options.pop(1, None)
-        bot.favorites_export_users.clear()
-        bot.favorites_export_last_finished_at.clear()
 
     async def test_favorite_button_uses_cached_post_without_api_lookup(self):
         post = {
@@ -717,18 +715,16 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mark_sent.await_count, 9)
         send_single.assert_not_awaited()
 
-    async def test_export_button_schedules_zip_export(self):
+    async def test_export_button_enqueues_zip_export(self):
         update, _query = make_callback_update("fav_export")
         context = SimpleNamespace()
-        export_job = object()
 
-        with (
-            patch.object(bot, "start_favorites_zip_export", new=lambda message, user_id: export_job),
-            patch.object(bot, "schedule_background_task") as schedule_task,
-        ):
+        with patch.object(
+            bot, "enqueue_favorites_zip_export", AsyncMock()
+        ) as enqueue_export:
             await bot.button_handler(update, context)
 
-        schedule_task.assert_called_once_with(context, export_job)
+        enqueue_export.assert_awaited_once_with(update.callback_query.message, 1)
 
     async def test_export_fetches_missing_original_url_by_id(self):
         fresh_post = {"id": 123, "file_url": "https://example.test/original.jpg"}
@@ -743,61 +739,35 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         get_post.assert_awaited_once_with(123)
         cache_post.assert_awaited_once_with(fresh_post)
 
-    def test_export_uses_only_static_original_images(self):
-        self.assertTrue(bot.is_exportable_image_url("https://example.test/1.jpg"))
-        self.assertTrue(bot.is_exportable_image_url("https://example.test/2.PNG?download=1"))
-        self.assertFalse(bot.is_exportable_image_url("https://example.test/3.gif"))
-        self.assertFalse(bot.is_exportable_image_url("https://example.test/4.mp4"))
+    async def test_zip_source_loader_bounds_favorites_and_collection_queries(self):
+        candidates = [{"id": index} for index in range(bot.ZIP_EXPORT_MAX_FILES + 1)]
+        with patch.object(
+            bot, "get_favorites", AsyncMock(return_value=candidates)
+        ) as get_favorites:
+            favorites = await bot.load_zip_export_source(1, "favorites", None)
 
-    async def test_zip_export_sends_downloaded_static_images_and_skips_others(self):
-        class FakeClientSession:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, traceback):
-                return False
-
-        message = SimpleNamespace(reply_text=AsyncMock(), reply_document=AsyncMock())
-        favorites = [
-            {"id": 1, "file_url": "https://example.test/1.jpg"},
-            {"id": 2, "file_url": "https://example.test/2.gif"},
-            {"id": 3, "file_url": "https://example.test/3.png"},
-        ]
-
-        async def fake_download(_session, favorite):
-            if favorite["id"] == 2:
-                return None
-            return f"{favorite['id']}.jpg", b"image-data"
+        get_favorites.assert_awaited_once_with(
+            1, limit=bot.ZIP_EXPORT_MAX_FILES + 1
+        )
+        self.assertEqual(len(favorites.posts), bot.ZIP_EXPORT_MAX_FILES)
+        self.assertTrue(favorites.truncated)
 
         with (
-            patch.object(bot, "count_favorites", AsyncMock(return_value=3)),
-            patch.object(bot, "get_favorites", AsyncMock(return_value=favorites)),
-            patch.object(bot, "download_original_favorite_image", AsyncMock(side_effect=fake_download)),
-            patch.object(bot.aiohttp, "ClientSession", return_value=FakeClientSession()),
+            patch.object(
+                bot, "get_favorite_collection",
+                AsyncMock(return_value={"name": "bounded"}),
+            ),
+            patch.object(
+                bot, "get_collection_favorites", AsyncMock(return_value=candidates)
+            ) as get_collection_favorites,
         ):
-            await bot.send_favorites_zip_export(message, 1)
+            collection = await bot.load_zip_export_source(1, "collection", 7)
 
-        message.reply_document.assert_awaited_once()
-        final_text = message.reply_text.await_args_list[-1].args[0]
-        self.assertIn("2", final_text)
-        self.assertIn("1", final_text)
-
-    async def test_zip_export_rejects_parallel_export_for_same_user(self):
-        bot.favorites_export_users.add(1)
-        message = SimpleNamespace(reply_text=AsyncMock())
-
-        await bot.start_favorites_zip_export(message, 1)
-
-        message.reply_text.assert_awaited_once_with("📦 Архив избранного уже собирается.")
-
-    async def test_zip_export_uses_cooldown_after_success(self):
-        message = SimpleNamespace(reply_text=AsyncMock())
-        bot.favorites_export_last_finished_at[1] = bot.time.monotonic()
-
-        await bot.start_favorites_zip_export(message, 1)
-
-        text = message.reply_text.await_args.args[0]
-        self.assertIn("Экспорт уже недавно запускался", text)
+        get_collection_favorites.assert_awaited_once_with(
+            1, 7, limit=bot.ZIP_EXPORT_MAX_FILES + 1
+        )
+        self.assertEqual(len(collection.posts), bot.ZIP_EXPORT_MAX_FILES)
+        self.assertTrue(collection.truncated)
 
     async def test_favorites_gallery_sends_ten_post_pages_as_new_albums(self):
         message = SimpleNamespace(

@@ -1,8 +1,11 @@
 import asyncio
+from dataclasses import dataclass
 import io
 import logging
 import ipaddress
+import os
 import socket
+import tempfile
 from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
@@ -12,6 +15,7 @@ from bot_delivery import telegram_rate_limiter
 from bot_features import runtime_metrics
 from bot_formatting import md_text
 from bot_keyboards import get_subscription_image_keyboard
+from config import GLOBAL_DOWNLOAD_CONCURRENCY
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,46 @@ ALLOWED_PHOTO_CONTENT_TYPES = {
     "application/octet-stream",
 }
 PHOTO_DOWNLOAD_MAX_REDIRECTS = 5
+PHOTO_DOWNLOAD_CHUNK_SIZE = 64 * 1024
+global_download_semaphore = asyncio.Semaphore(GLOBAL_DOWNLOAD_CONCURRENCY)
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadedPhotoMeta:
+    final_url: str
+    content_type: str
+    extension: str
+    bytes_read: int
+    filename: str
+
+
+class PhotoDownloadLimitExceeded(ValueError):
+    """Base class for typed streaming download limits."""
+
+
+class FileDownloadLimitExceeded(PhotoDownloadLimitExceeded):
+    pass
+
+
+class TotalDownloadLimitExceeded(PhotoDownloadLimitExceeded):
+    pass
+
+
+@dataclass(slots=True)
+class DownloadByteBudget:
+    limit: int
+    consumed: int = 0
+
+    def __post_init__(self) -> None:
+        self.limit = max(1, int(self.limit))
+        self.consumed = max(0, int(self.consumed))
+
+    def consume(self, byte_count: int) -> None:
+        self.consumed += max(0, int(byte_count))
+        if self.consumed > self.limit:
+            raise TotalDownloadLimitExceeded(
+                f"Total download budget exceeded: {self.consumed} > {self.limit}"
+            )
 
 
 def _message_user_id(message) -> int:
@@ -74,10 +118,14 @@ def _telegram_url_fetch_failed(error: Exception) -> bool:
     )
 
 
-def _download_filename_from_url(url: str) -> str:
+def _download_filename_from_url(url: str, extension: str | None = None) -> str:
     path = unquote(urlparse(url).path)
     filename = path.rsplit("/", 1)[-1] or "image.jpg"
-    if not filename.lower().endswith(DOWNLOADABLE_PHOTO_EXTENSIONS):
+    stem, current_ext = os.path.splitext(filename)
+    if extension:
+        safe_stem = stem or "image"
+        filename = f"{safe_stem}{extension}"
+    elif current_ext.lower() not in DOWNLOADABLE_PHOTO_EXTENSIONS:
         filename += ".jpg"
     return filename
 
@@ -88,6 +136,27 @@ def _looks_like_supported_photo(data: bytes) -> bool:
         or data.startswith(b"\x89PNG\r\n\x1a\n")
         or (len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP")
     )
+
+
+def _photo_extension_from_header(data: bytes) -> str | None:
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def _photo_extension_from_content_type(content_type: str) -> str | None:
+    mapping = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/pjpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }
+    return mapping.get(content_type.lower())
 
 
 def _is_public_ip(value: str) -> bool:
@@ -121,19 +190,31 @@ async def _validate_public_photo_url(url: str):
         raise ValueError("Private or non-public photo host is not allowed")
 
 
-async def _download_photo_file(
-    url: str, max_bytes: int = MAX_DOWNLOADED_PHOTO_BYTES
-) -> io.BytesIO:
+async def download_photo_to_path(
+    url: str,
+    destination_path: str,
+    *,
+    session: aiohttp.ClientSession | None = None,
+    max_bytes: int = MAX_DOWNLOADED_PHOTO_BYTES,
+    semaphore: asyncio.Semaphore | None = None,
+    cancel_event: asyncio.Event | None = None,
+    byte_budget: DownloadByteBudget | None = None,
+) -> DownloadedPhotoMeta:
     max_bytes = max(1, int(max_bytes))
     timeout = aiohttp.ClientTimeout(total=PHOTO_DOWNLOAD_TIMEOUT_SECONDS)
     headers = {"User-Agent": PHOTO_DOWNLOAD_USER_AGENT}
     current_url = url
-    photo = io.BytesIO()
+    close_session = session is None
+    active_session = session or aiohttp.ClientSession(timeout=timeout, headers=headers)
+    limiter = semaphore or global_download_semaphore
+
     try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with limiter:
             for redirect_count in range(PHOTO_DOWNLOAD_MAX_REDIRECTS + 1):
+                if cancel_event and cancel_event.is_set():
+                    raise asyncio.CancelledError
                 await _validate_public_photo_url(current_url)
-                async with session.get(current_url, allow_redirects=False) as response:
+                async with active_session.get(current_url, allow_redirects=False) as response:
                     if 300 <= response.status < 400 and response.headers.get("Location"):
                         if redirect_count >= PHOTO_DOWNLOAD_MAX_REDIRECTS:
                             raise ValueError("Too many photo redirects")
@@ -148,34 +229,94 @@ async def _download_photo_file(
                     if content_length:
                         try:
                             if int(content_length) > max_bytes:
-                                raise ValueError("Downloaded photo exceeds the configured size limit")
+                                raise FileDownloadLimitExceeded(
+                                    "Downloaded photo exceeds the configured per-file size limit"
+                                )
                         except ValueError as exc:
-                            if "configured size limit" in str(exc):
+                            if isinstance(exc, FileDownloadLimitExceeded):
                                 raise
                             raise ValueError("Invalid photo content-length") from exc
 
-                    async for chunk in response.content.iter_chunked(64 * 1024):
-                        photo.write(chunk)
-                        if photo.tell() > max_bytes:
-                            raise ValueError("Downloaded photo exceeds the configured size limit")
+                    bytes_read = 0
+                    header = bytearray()
+                    with open(destination_path, "wb") as destination:
+                        async for chunk in response.content.iter_chunked(PHOTO_DOWNLOAD_CHUNK_SIZE):
+                            if byte_budget is not None:
+                                byte_budget.consume(len(chunk))
+                            if cancel_event and cancel_event.is_set():
+                                raise asyncio.CancelledError
+                            bytes_read += len(chunk)
+                            if bytes_read > max_bytes:
+                                raise FileDownloadLimitExceeded(
+                                    "Downloaded photo exceeds the configured per-file size limit"
+                                )
+                            destination.write(chunk)
+                            if len(header) < 12:
+                                header.extend(chunk[: 12 - len(header)])
                     break
             else:
                 raise ValueError("Too many photo redirects")
-    except Exception:
-        photo.close()
+    except BaseException:
+        try:
+            if os.path.exists(destination_path):
+                os.remove(destination_path)
+        except OSError:
+            logger.warning("Failed to remove partial downloaded photo at %s", destination_path)
         raise
+    finally:
+        if close_session and not active_session.closed:
+            await active_session.close()
 
-    if photo.tell() == 0:
+    if bytes_read == 0:
+        try:
+            os.remove(destination_path)
+        except OSError:
+            logger.warning("Failed to remove empty downloaded photo at %s", destination_path)
         raise ValueError("Downloaded photo is empty")
 
-    photo.seek(0)
-    header = photo.read(12)
-    if not _looks_like_supported_photo(header):
-        photo.close()
+    header_bytes = bytes(header)
+    extension = _photo_extension_from_header(header_bytes) or _photo_extension_from_content_type(
+        content_type
+    )
+    if not extension or not _looks_like_supported_photo(header_bytes):
+        try:
+            os.remove(destination_path)
+        except OSError:
+            logger.warning("Failed to remove unsupported downloaded photo at %s", destination_path)
         raise ValueError("Downloaded file is not a supported JPEG, PNG or WebP image")
 
+    return DownloadedPhotoMeta(
+        final_url=current_url,
+        content_type=content_type,
+        extension=extension,
+        bytes_read=bytes_read,
+        filename=_download_filename_from_url(current_url, extension=extension),
+    )
+
+
+async def _download_photo_file(
+    url: str, max_bytes: int = MAX_DOWNLOADED_PHOTO_BYTES
+) -> io.BytesIO:
+    photo = io.BytesIO()
+    try:
+        with tempfile.NamedTemporaryFile(prefix="download_photo_", suffix=".tmp", delete=False) as temp_file:
+            destination_path = temp_file.name
+        meta = await download_photo_to_path(url, destination_path, max_bytes=max_bytes)
+        with open(destination_path, "rb") as source:
+            photo.write(source.read())
+        photo.name = meta.filename
+    except BaseException:
+        photo.close()
+        raise
+    finally:
+        if "destination_path" in locals():
+            try:
+                if os.path.exists(destination_path):
+                    os.remove(destination_path)
+            except OSError:
+                logger.warning("Failed to remove temporary downloaded photo at %s", destination_path)
+
     photo.seek(0)
-    photo.name = _download_filename_from_url(url)
     return photo
 
 
