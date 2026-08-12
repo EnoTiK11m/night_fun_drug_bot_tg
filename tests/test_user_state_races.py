@@ -586,6 +586,25 @@ class UserStateRaceTests(unittest.IsolatedAsyncioTestCase):
         await bot.invalidate_user_flow(1)
         self.assertFalse(await bot.consume_one_shot_callback(1, data))
 
+    async def test_subscription_callback_survives_flow_and_state_cleanup(self):
+        data = bot.subscription_callback_issuer_for(1).side_effect("sub_fav_42")
+
+        await bot.invalidate_user_flow(1)
+        bot.temporary_user_state.clear_user(1)
+
+        self.assertTrue(await bot.consume_one_shot_callback(1, data))
+        self.assertFalse(await bot.consume_one_shot_callback(1, data))
+        self.assertFalse(await bot.consume_one_shot_callback(2, data))
+
+    async def test_reissued_subscription_callback_is_not_a_logical_duplicate(self):
+        first = bot.subscription_callback_issuer_for(1).side_effect("sub_fav_42")
+        self.assertTrue(await bot.consume_one_shot_callback(1, first))
+        await bot.finish_one_shot_processing(1, first)
+
+        second = bot.subscription_callback_issuer_for(1).side_effect("sub_fav_42")
+
+        self.assertTrue(await bot.consume_one_shot_callback(1, second))
+
     async def test_rerendered_mutable_controls_remain_repeatable(self):
         for data in ("settings_spoiler", "toggle_show_tags", "gallery_size_up"):
             self.assertTrue(await bot.consume_one_shot_callback(1, data))

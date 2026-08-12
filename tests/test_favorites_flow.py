@@ -504,8 +504,10 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_subscription_favorite_uses_cache_queries_from_database(self):
         post = {"id": 123, "file_url": "https://example.test/123.jpg"}
         update, query = make_callback_update(
-            bot.store_side_effect_callback("sub_fav_123", 1)
+            bot.subscription_callback_issuer_for(1).side_effect("sub_fav_123")
         )
+        await bot.invalidate_user_flow(1)
+        bot.temporary_user_state.clear_user(1)
 
         with (
             patch.object(bot, "get_known_post", AsyncMock(return_value=post)),

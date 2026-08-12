@@ -511,6 +511,7 @@ class OneShotCallbackEntry:
     created_at: float
     logical_action: str
     canonical_payload: str
+    flow_scoped: bool = True
     status: str = "issued"
 
 
@@ -706,9 +707,14 @@ def register_one_shot_callback(
     logical_action: str,
     canonical_payload: str,
     expected_generation: int | None = None,
+    flow_scoped: bool = True,
 ) -> str:
     generation = temporary_user_state.generation(user_id)
-    if expected_generation is not None and generation != expected_generation:
+    if (
+        flow_scoped
+        and expected_generation is not None
+        and generation != expected_generation
+    ):
         raise StaleCallbackIssuer("Callback flow generation is no longer current")
     cleanup_one_shot_callbacks(max_removals=ONE_SHOT_CLEANUP_BATCH)
     _make_one_shot_capacity(int(user_id))
@@ -718,6 +724,7 @@ def register_one_shot_callback(
         created_at=time.monotonic(),
         logical_action=logical_action,
         canonical_payload=canonical_payload,
+        flow_scoped=flow_scoped,
     )
     issued_one_shot_callbacks.move_to_end(data)
     return data
@@ -781,14 +788,20 @@ def ensure_user_generation(user_id: int) -> int:
 class OneShotCallbackIssuer:
     user_id: int
     expected_generation: int
+    flow_scoped: bool = True
 
     def _check_current(self) -> None:
-        if temporary_user_state.generation(self.user_id) != self.expected_generation:
+        if (
+            self.flow_scoped
+            and temporary_user_state.generation(self.user_id)
+            != self.expected_generation
+        ):
             raise StaleCallbackIssuer("Callback issuer belongs to a stale flow")
 
     def _token_prefix(self) -> str:
         material = (
-            f"{ONE_SHOT_PROCESS_EPOCH}:{self.user_id}:{self.expected_generation}"
+            f"{ONE_SHOT_PROCESS_EPOCH}:{self.user_id}:"
+            f"{self.expected_generation if self.flow_scoped else 'durable'}"
         )
         digest = hashlib.blake2s(
             material.encode("ascii"), digest_size=5
@@ -809,6 +822,7 @@ class OneShotCallbackIssuer:
             logical_action=action,
             canonical_payload=payload,
             expected_generation=self.expected_generation,
+            flow_scoped=self.flow_scoped,
         )
 
     def side_effect(self, data: str) -> str:
@@ -825,6 +839,7 @@ class OneShotCallbackIssuer:
             logical_action="side_effect",
             canonical_payload=data,
             expected_generation=self.expected_generation,
+            flow_scoped=self.flow_scoped,
         )
 
     def __call__(self, data: str) -> str:
@@ -832,16 +847,20 @@ class OneShotCallbackIssuer:
 
 
 def callback_issuer_for(
-    user_id: int, expected_generation: int | None = None
+    user_id: int,
+    expected_generation: int | None = None,
+    *,
+    flow_scoped: bool = True,
 ) -> OneShotCallbackIssuer:
-    generation = (
-        ensure_user_generation(user_id)
-        if expected_generation is None
-        else expected_generation
-    )
-    if temporary_user_state.generation(user_id) != generation:
+    if expected_generation is not None:
+        generation = expected_generation
+    elif flow_scoped:
+        generation = ensure_user_generation(user_id)
+    else:
+        generation = temporary_user_state.generation(user_id)
+    if flow_scoped and temporary_user_state.generation(user_id) != generation:
         raise StaleCallbackIssuer("Cannot create issuer for a stale generation")
-    return OneShotCallbackIssuer(int(user_id), generation)
+    return OneShotCallbackIssuer(int(user_id), generation, flow_scoped)
 
 
 def store_user_one_shot_payload(action: str, payload: str, user_id: int) -> str:
@@ -858,6 +877,11 @@ def side_effect_callback_for(
     return callback_issuer_for(user_id, expected_generation)
 
 
+def subscription_callback_issuer_for(user_id: int) -> OneShotCallbackIssuer:
+    """Issue notification actions that survive unrelated interactive flows."""
+    return callback_issuer_for(user_id, flow_scoped=False)
+
+
 def resolved_callback_data(data: str) -> str:
     entry = issued_one_shot_callbacks.get(data)
     if entry and entry.logical_action == "side_effect":
@@ -869,59 +893,69 @@ def stale_user_one_shot_callbacks(user_id: int, current_generation: int) -> None
     for entry in issued_one_shot_callbacks.values():
         if (
             entry.owner_id == user_id
+            and entry.flow_scoped
             and entry.generation != current_generation
             and entry.status in {"issued", "reserved"}
         ):
             entry.status = "stale"
 
 
-async def reserve_one_shot_callback(user_id: int, data: str) -> bool:
+async def reserve_one_shot_callback_result(user_id: int, data: str) -> str:
     global duplicate_callbacks_rejected
     if not is_one_shot_callback(data):
-        return True
+        return "accepted"
     async with guarded_user_state(user_id):
         cleanup_one_shot_callbacks(max_removals=ONE_SHOT_CLEANUP_BATCH)
         generation = temporary_user_state.generation(user_id)
         issued = issued_one_shot_callbacks.get(data)
-        if (
-            issued is None
-            or issued.owner_id != user_id
-            or issued.generation != generation
-            or issued.status != "issued"
-        ):
+        if issued is None or issued.owner_id != user_id:
             duplicate_callbacks_rejected += 1
-            return False
+            return "stale"
+        if issued.flow_scoped and issued.generation != generation:
+            duplicate_callbacks_rejected += 1
+            return "stale"
+        if issued.status != "issued":
+            duplicate_callbacks_rejected += 1
+            return "duplicate" if issued.status in {
+                "reserved", "processing", "consumed"
+            } else "stale"
 
-        logical_key = (
-            issued.owner_id,
-            issued.generation,
-            issued.logical_action,
-            issued.canonical_payload,
-        )
-        for candidate in issued_one_shot_callbacks.values():
-            candidate_key = (
-                candidate.owner_id,
-                candidate.generation,
-                candidate.logical_action,
-                candidate.canonical_payload,
+        if issued.flow_scoped:
+            logical_key = (
+                issued.owner_id,
+                issued.generation,
+                issued.logical_action,
+                issued.canonical_payload,
             )
-            if candidate_key != logical_key or candidate is issued:
-                continue
-            if candidate.status in {"reserved", "processing", "consumed"}:
-                issued.status = "stale"
-                duplicate_callbacks_rejected += 1
-                return False
+            for candidate in issued_one_shot_callbacks.values():
+                candidate_key = (
+                    candidate.owner_id,
+                    candidate.generation,
+                    candidate.logical_action,
+                    candidate.canonical_payload,
+                )
+                if candidate_key != logical_key or candidate is issued:
+                    continue
+                if candidate.status in {"reserved", "processing", "consumed"}:
+                    issued.status = "stale"
+                    duplicate_callbacks_rejected += 1
+                    return "duplicate"
         issued.status = "reserved"
-        for candidate in issued_one_shot_callbacks.values():
-            candidate_key = (
-                candidate.owner_id,
-                candidate.generation,
-                candidate.logical_action,
-                candidate.canonical_payload,
-            )
-            if candidate is not issued and candidate_key == logical_key:
-                candidate.status = "stale"
-        return True
+        if issued.flow_scoped:
+            for candidate in issued_one_shot_callbacks.values():
+                candidate_key = (
+                    candidate.owner_id,
+                    candidate.generation,
+                    candidate.logical_action,
+                    candidate.canonical_payload,
+                )
+                if candidate is not issued and candidate_key == logical_key:
+                    candidate.status = "stale"
+        return "accepted"
+
+
+async def reserve_one_shot_callback(user_id: int, data: str) -> bool:
+    return await reserve_one_shot_callback_result(user_id, data) == "accepted"
 
 
 async def begin_one_shot_processing(user_id: int, data: str) -> bool:
@@ -932,7 +966,10 @@ async def begin_one_shot_processing(user_id: int, data: str) -> bool:
         if (
             entry is None
             or entry.owner_id != user_id
-            or entry.generation != temporary_user_state.generation(user_id)
+            or (
+                entry.flow_scoped
+                and entry.generation != temporary_user_state.generation(user_id)
+            )
             or entry.status != "reserved"
         ):
             return False
@@ -1448,11 +1485,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Эта кнопка устарела.")
         return
 
-    if not await reserve_one_shot_callback(user_id, raw_data):
+    reservation = await reserve_one_shot_callback_result(user_id, raw_data)
+    if reservation != "accepted":
+        already_processed = reservation == "duplicate"
         if deferred_answer:
-            await safe_query_answer(query, "Кнопка уже обработана")
+            await safe_query_answer(
+                query,
+                "Кнопка уже обработана" if already_processed else "Кнопка устарела",
+            )
         else:
-            await query.message.reply_text("Эта кнопка уже была обработана.")
+            await query.message.reply_text(
+                "Эта кнопка уже была обработана."
+                if already_processed
+                else "Эта кнопка устарела."
+            )
         return
     if not await begin_one_shot_processing(user_id, raw_data):
         if deferred_answer:
@@ -4753,7 +4799,7 @@ async def send_digest_posts(
                     caption="📨 Дайджест подписок" if index == 0 else "",
                     keyboard=get_subscription_image_keyboard(
                         post.get("id", 0),
-                        side_effect_callback=side_effect_callback_for(user_id),
+                        side_effect_callback=subscription_callback_issuer_for(user_id),
                     ),
                     settings=settings,
                     raise_on_timeout=True,
@@ -4851,7 +4897,7 @@ async def send_digest_to_chat(
                     caption="📨 Дайджест подписок" if index == 0 else "",
                     keyboard=get_subscription_image_keyboard(
                         post.get("id", 0),
-                        side_effect_callback=side_effect_callback_for(user_id),
+                        side_effect_callback=subscription_callback_issuer_for(user_id),
                     ),
                     settings=settings,
                     raise_on_timeout=True,
@@ -5491,7 +5537,9 @@ async def retry_failed_command(update: Update, context: ContextTypes.DEFAULT_TYP
             failure["caption"],
             keyboard=get_subscription_image_keyboard(
                 failure["post"].get("id", 0),
-                side_effect_callback=side_effect_callback_for(failure["user_id"]),
+                side_effect_callback=subscription_callback_issuer_for(
+                    failure["user_id"]
+                ),
             ),
         )
         if ok:
@@ -5872,7 +5920,7 @@ async def process_one_subscription(app, subscription):
                 post_id,
                 query,
                 should_show_tags_button(settings),
-                side_effect_callback=side_effect_callback_for(user_id),
+                side_effect_callback=subscription_callback_issuer_for(user_id),
             )
 
             caption = ""
