@@ -9,7 +9,7 @@ import tempfile
 from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
-from telegram.error import RetryAfter, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
 from bot_delivery import execute_telegram_request
 from bot_features import runtime_metrics
@@ -135,6 +135,10 @@ def _looks_like_supported_photo(data: bytes) -> bool:
         or data.startswith(b"\x89PNG\r\n\x1a\n")
         or (len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP")
     )
+
+
+def _is_ambiguous_network_error(error: Exception) -> bool:
+    return isinstance(error, NetworkError) and not isinstance(error, BadRequest)
 
 
 def _photo_extension_from_header(data: bytes) -> str | None:
@@ -539,6 +543,8 @@ async def send_post_media(
             except TimedOut:
                 raise
             except Exception as exc:
+                if _is_ambiguous_network_error(exc):
+                    raise
                 logger.warning(
                     "Media send failed post=%s url_kind=%s attempt=%s/%s: %s",
                     post.get("id"),
@@ -565,6 +571,8 @@ async def send_post_media(
                     except TimedOut:
                         raise
                     except Exception as fallback_exc:
+                        if _is_ambiguous_network_error(fallback_exc):
+                            raise
                         logger.warning(
                             "Media downloaded fallback failed post=%s url_kind=%s attempt=%s/%s: %s",
                             post.get("id"),
@@ -649,6 +657,8 @@ async def send_post_media_to_chat(
             except TimedOut:
                 raise
             except Exception as exc:
+                if _is_ambiguous_network_error(exc):
+                    raise
                 logger.warning(
                     "Subscription media send failed user=%s post=%s url_kind=%s attempt=%s/%s: %s",
                     chat_id,
@@ -677,6 +687,8 @@ async def send_post_media_to_chat(
                     except TimedOut:
                         raise
                     except Exception as fallback_exc:
+                        if _is_ambiguous_network_error(fallback_exc):
+                            raise
                         logger.warning(
                             "Subscription media downloaded fallback failed user=%s post=%s url_kind=%s attempt=%s/%s: %s",
                             chat_id,

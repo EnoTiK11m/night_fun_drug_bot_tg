@@ -1,5 +1,6 @@
 import os
 import math
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -84,7 +85,13 @@ SUBSCRIPTION_CHECK_INTERVAL_SECONDS = max(
 SUBSCRIPTION_MAX_POSTS_PER_USER_PASS = max(
     1, min(45, _get_int_env("SUBSCRIPTION_MAX_POSTS_PER_USER_PASS", 45))
 )
-DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+PROJECT_ROOT = Path(__file__).resolve().parent
+_configured_db_path = Path(os.getenv("DB_PATH", "bot_data.db")).expanduser()
+DB_PATH = str(
+    _configured_db_path.resolve()
+    if _configured_db_path.is_absolute()
+    else (PROJECT_ROOT / _configured_db_path).resolve()
+)
 INSTANCE_LOCK_WAIT_SECONDS = _get_bounded_float_env(
     "INSTANCE_LOCK_WAIT_SECONDS", 20.0, 0.0, 120.0
 )

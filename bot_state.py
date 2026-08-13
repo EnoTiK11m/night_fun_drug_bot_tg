@@ -32,8 +32,13 @@ def _connect_payload_db():
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=0.05)
-    conn.execute("PRAGMA busy_timeout=50")
+    # Callback payloads back buttons that may outlive the current process.  A
+    # 50 ms writer timeout made otherwise valid buttons memory-only during
+    # ordinary WAL contention, so use the same bounded wait policy as the
+    # asynchronous database layer.
+    conn = sqlite3.connect(DB_PATH, timeout=1.0)
+    conn.execute("PRAGMA busy_timeout=1000")
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 

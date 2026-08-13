@@ -330,11 +330,17 @@ def get_blacklist_keyboard() -> InlineKeyboardMarkup:
 def get_subscriptions_keyboard(
     subscriptions_paused: bool = False,
     has_digest_posts: bool = False,
+    *,
+    side_effect_callback: Callable[[str], str] | None = None,
 ) -> InlineKeyboardMarkup:
+    if (subscriptions_paused or has_digest_posts) and side_effect_callback is None:
+        raise ValueError("side_effect_callback is required for subscription actions")
     subscription_control = (
         InlineKeyboardButton(
             "▶️ Возобновить все подписки",
-            callback_data="settings_resume_subscriptions",
+            callback_data=_side_effect_data(
+                "settings_resume_subscriptions", side_effect_callback
+            ),
         )
         if subscriptions_paused
         else InlineKeyboardButton(
@@ -363,7 +369,9 @@ def get_subscriptions_keyboard(
         keyboard.append([
             InlineKeyboardButton(
                 "📨 Отправить накопленный дайджест",
-                callback_data="sub_digest_send",
+                callback_data=_side_effect_data(
+                    "sub_digest_send", side_effect_callback
+                ),
             )
         ])
     keyboard.extend([

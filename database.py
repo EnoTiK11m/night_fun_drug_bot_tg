@@ -30,9 +30,12 @@ SENT_POSTS_RETENTION_PER_USER = 5000
 SEARCH_HISTORY_RETENTION_PER_USER = 200
 SUBSCRIPTION_CLAIM_MINUTES = 5
 DIGEST_CLAIM_MINUTES = 10
+DELIVERY_FAILURE_CLAIM_MINUTES = 5
 DIGEST_CLAIM_MIGRATION_VERSION = 1
 SUBSCRIPTION_QUOTA_MIGRATION_VERSION = 2
 CACHE_RETENTION_MIGRATION_VERSION = 3
+DIGEST_RETRY_MIGRATION_VERSION = 4
+DELIVERY_FAILURE_CLAIM_MIGRATION_VERSION = 5
 SUBSCRIPTION_CACHE_TTL_MINUTES = 60
 SUBSCRIPTION_CACHE_MIN_AVAILABLE = 20
 SUBSCRIPTION_PAUSE_SETTING = "subscription_pause_until"
@@ -313,6 +316,47 @@ async def apply_versioned_migrations(db):
                     "Cache retention migration is recorded but indexes are invalid: "
                     + ", ".join(sorted(invalid_indexes))
                 )
+
+        for version, table_name, required_columns in (
+            (
+                DIGEST_RETRY_MIGRATION_VERSION,
+                "subscription_digest_queue",
+                {
+                    "delivery_state": "TEXT NOT NULL DEFAULT 'pending'",
+                    "retry_after": "TIMESTAMP",
+                },
+            ),
+            (
+                DELIVERY_FAILURE_CLAIM_MIGRATION_VERSION,
+                "delivery_failures",
+                {
+                    "claim_token": "TEXT",
+                    "claimed_at": "TIMESTAMP",
+                    "claim_until": "TIMESTAMP",
+                },
+            ),
+        ):
+            cursor = await db.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = ?", (version,)
+            )
+            migration_applied = await cursor.fetchone() is not None
+            cursor = await db.execute(f"PRAGMA table_info({table_name})")
+            columns = {row[1] for row in await cursor.fetchall()}
+            if not migration_applied:
+                for column, definition in required_columns.items():
+                    if column not in columns:
+                        await db.execute(
+                            f"ALTER TABLE {table_name} ADD COLUMN {column} {definition}"
+                        )
+                await db.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (?)", (version,)
+                )
+            elif not required_columns.keys() <= columns:
+                missing = sorted(required_columns.keys() - columns)
+                raise RuntimeError(
+                    f"Migration {version} for {table_name} is recorded but columns "
+                    "are missing: " + ", ".join(missing)
+                )
         await db.commit()
     except BaseException:
         await db.rollback()
@@ -509,6 +553,9 @@ async def init_db():
                 last_error TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                claim_token TEXT,
+                claimed_at TIMESTAMP,
+                claim_until TIMESTAMP,
                 UNIQUE(user_id, post_id)
             )
         """)
@@ -553,6 +600,8 @@ async def init_db():
                 claim_token TEXT,
                 claimed_at TIMESTAMP,
                 claim_until TIMESTAMP,
+                delivery_state TEXT NOT NULL DEFAULT 'pending',
+                retry_after TIMESTAMP,
                 PRIMARY KEY(user_id, query, post_id)
             )
         """)
@@ -1410,58 +1459,68 @@ async def get_user_settings(user_id: int) -> Dict[str, Any]:
 
 async def save_user_settings(user_id: int, settings: Dict[str, Any]):
     async with connect_db() as db:
-        merged_settings = DEFAULT_USER_SETTINGS.copy()
-        cursor = await db.execute(
-            "SELECT * FROM user_settings WHERE user_id = ?",
-            (user_id,),
-        )
-        row = await cursor.fetchone()
-        if row:
-            merged_settings.update({
-                "show_caption": bool(row[1]),
-                "show_search_query": bool(row[2]),
-                "show_subscription_label": bool(row[3]),
-                "show_id": bool(row[4]),
-                "show_score": bool(row[5]),
-                "show_rating": bool(row[6]),
-                "show_tags": bool(row[7]),
-            })
-            if row[8]:
-                try:
-                    merged_settings.update(json.loads(row[8]))
-                except json.JSONDecodeError:
-                    logger.warning("Invalid settings JSON for user %s", user_id)
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            merged_settings = DEFAULT_USER_SETTINGS.copy()
+            cursor = await db.execute(
+                "SELECT * FROM user_settings WHERE user_id = ?", (user_id,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                merged_settings.update({
+                    "show_caption": bool(row[1]),
+                    "show_search_query": bool(row[2]),
+                    "show_subscription_label": bool(row[3]),
+                    "show_id": bool(row[4]),
+                    "show_score": bool(row[5]),
+                    "show_rating": bool(row[6]),
+                    "show_tags": bool(row[7]),
+                })
+                if row[8]:
+                    try:
+                        merged_settings.update(json.loads(row[8]))
+                    except json.JSONDecodeError:
+                        logger.warning("Invalid settings JSON for user %s", user_id)
 
-        merged_settings.update(settings)
-        json_settings = {
-            key: value
-            for key, value in merged_settings.items()
-            if key not in MAIN_SETTING_FIELDS
-        }
-        await db.execute("""
-            INSERT OR REPLACE INTO user_settings
-            (user_id, show_caption, show_search_query, show_subscription_label,
-             show_id, show_score, show_rating, show_tags, settings_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            user_id,
-            bool(merged_settings["show_caption"]),
-            bool(merged_settings["show_search_query"]),
-            bool(merged_settings["show_subscription_label"]),
-            bool(merged_settings["show_id"]),
-            bool(merged_settings["show_score"]),
-            bool(merged_settings["show_rating"]),
-            bool(merged_settings["show_tags"]),
-            json.dumps(json_settings),
-        ))
-
-        await db.commit()
+            merged_settings.update(settings)
+            json_settings = {
+                key: value
+                for key, value in merged_settings.items()
+                if key not in MAIN_SETTING_FIELDS
+            }
+            await db.execute("""
+                INSERT INTO user_settings
+                (user_id, show_caption, show_search_query, show_subscription_label,
+                 show_id, show_score, show_rating, show_tags, settings_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    show_caption = excluded.show_caption,
+                    show_search_query = excluded.show_search_query,
+                    show_subscription_label = excluded.show_subscription_label,
+                    show_id = excluded.show_id,
+                    show_score = excluded.show_score,
+                    show_rating = excluded.show_rating,
+                    show_tags = excluded.show_tags,
+                    settings_json = excluded.settings_json
+            """, (
+                user_id,
+                bool(merged_settings["show_caption"]),
+                bool(merged_settings["show_search_query"]),
+                bool(merged_settings["show_subscription_label"]),
+                bool(merged_settings["show_id"]),
+                bool(merged_settings["show_score"]),
+                bool(merged_settings["show_rating"]),
+                bool(merged_settings["show_tags"]),
+                json.dumps(json_settings),
+            ))
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
 
 
 async def update_user_setting(user_id: int, setting_name: str, value: Any):
-    settings = await get_user_settings(user_id)
-    settings[setting_name] = value
-    await save_user_settings(user_id, settings)
+    await save_user_settings(user_id, {setting_name: value})
 
 
 def _parse_sqlite_timestamp(value: Optional[str]) -> Optional[datetime]:
@@ -1511,9 +1570,14 @@ async def _get_active_subscription_pause_until(db, user_id: int) -> Optional[str
 
 async def get_subscription_pause_until(user_id: int) -> Optional[str]:
     async with connect_db() as db:
-        pause_until = await _get_active_subscription_pause_until(db, user_id)
-        await db.commit()
-        return pause_until
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            pause_until = await _get_active_subscription_pause_until(db, user_id)
+            await db.commit()
+            return pause_until
+        except BaseException:
+            await db.rollback()
+            raise
 
 
 async def _subscription_counts(db, user_id: int) -> tuple[int, int]:
@@ -1694,18 +1758,23 @@ async def add_subscription(
 async def remove_subscription(user_id: int, query: str) -> bool:
     async with connect_db() as db:
         normalized_query = query.strip()
-        # Pending and claimed digest rows belong to the subscription and must not
-        # outlive it. Shared post_cache rows are intentionally retained.
-        await db.execute(
-            "DELETE FROM subscription_digest_queue WHERE user_id = ? AND query = ?",
-            (user_id, normalized_query),
-        )
-        cursor = await db.execute(
-            "DELETE FROM subscriptions WHERE user_id = ? AND query = ?",
-            (user_id, normalized_query)
-        )
-        await db.commit()
-        return cursor.rowcount > 0
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            # Pending and claimed digest rows belong to a deleted subscription.
+            # Deactivation, in contrast, preserves them until reactivation.
+            await db.execute(
+                "DELETE FROM subscription_digest_queue WHERE user_id = ? AND query = ?",
+                (user_id, normalized_query),
+            )
+            cursor = await db.execute(
+                "DELETE FROM subscriptions WHERE user_id = ? AND query = ?",
+                (user_id, normalized_query)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+        except BaseException:
+            await db.rollback()
+            raise
 
 
 async def get_user_subscriptions(user_id: int) -> List[Tuple[str, int]]:
@@ -1820,13 +1889,15 @@ async def update_subscription_interval(user_id: int, query: str, interval_minute
 
 async def pause_all_active_subscriptions(user_id: int, pause_minutes: int) -> int:
     async with connect_db() as db:
-        pause_until = (
-            datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=pause_minutes)
-        ).strftime(SQLITE_TIMESTAMP_FORMAT)
-        settings_json = await _get_settings_json(db, user_id)
-        settings_json[SUBSCRIPTION_PAUSE_SETTING] = pause_until
-        await _save_settings_json(db, user_id, settings_json)
-        cursor = await db.execute("""
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            pause_until = (
+                datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=pause_minutes)
+            ).strftime(SQLITE_TIMESTAMP_FORMAT)
+            settings_json = await _get_settings_json(db, user_id)
+            settings_json[SUBSCRIPTION_PAUSE_SETTING] = pause_until
+            await _save_settings_json(db, user_id, settings_json)
+            cursor = await db.execute("""
             UPDATE subscriptions
             SET next_check_at = CASE
                     WHEN datetime(COALESCE(next_check_at, last_sent)) >
@@ -1838,39 +1909,58 @@ async def pause_all_active_subscriptions(user_id: int, pause_minutes: int) -> in
                 processing_token = NULL
             WHERE user_id = ?
               AND is_active = 1
-        """, (pause_until, pause_until, user_id))
-        await db.commit()
-        return cursor.rowcount
+            """, (pause_until, pause_until, user_id))
+            await db.commit()
+            return cursor.rowcount
+        except BaseException:
+            await db.rollback()
+            raise
 
 
 async def resume_all_active_subscriptions(user_id: int) -> int:
     async with connect_db() as db:
-        settings_json = await _get_settings_json(db, user_id)
-        settings_json.pop(SUBSCRIPTION_PAUSE_SETTING, None)
-        await _save_settings_json(db, user_id, settings_json)
-        cursor = await db.execute("""
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            settings_json = await _get_settings_json(db, user_id)
+            settings_json.pop(SUBSCRIPTION_PAUSE_SETTING, None)
+            await _save_settings_json(db, user_id, settings_json)
+            cursor = await db.execute("""
             UPDATE subscriptions
             SET next_check_at = datetime('now'),
                 processing_until = NULL,
                 processing_token = NULL
             WHERE user_id = ?
               AND is_active = 1
-        """, (user_id,))
-        await db.commit()
-        return cursor.rowcount
+            """, (user_id,))
+            await db.commit()
+            return cursor.rowcount
+        except BaseException:
+            await db.rollback()
+            raise
 
 
 async def get_due_subscriptions() -> List[Tuple[int, str, int, int]]:
     async with connect_db() as db:
         cursor = await db.execute("""
-            SELECT user_id, query, interval_minutes, no_new_posts_count
-            FROM subscriptions
-            WHERE is_active = 1
+            SELECT s.user_id, s.query, s.interval_minutes, s.no_new_posts_count
+            FROM subscriptions s
+            WHERE s.is_active = 1
             AND datetime(COALESCE(next_check_at, last_sent)) <= datetime('now')
             AND (
                 processing_until IS NULL
                 OR datetime(processing_until) <= datetime('now')
             )
+            AND NOT EXISTS (
+                SELECT 1 FROM user_settings us
+                WHERE us.user_id = s.user_id
+                  AND datetime(json_extract(
+                      CASE WHEN json_valid(COALESCE(us.settings_json, '{}'))
+                           THEN us.settings_json ELSE '{}' END,
+                      '$.subscription_pause_until'
+                  )) > datetime('now')
+            )
+            ORDER BY datetime(COALESCE(s.next_check_at, s.last_sent)),
+                     s.user_id, s.query COLLATE BINARY
             LIMIT 50
         """)
         return await cursor.fetchall()
@@ -1889,11 +1979,65 @@ async def claim_due_subscription(user_id: int, query: str) -> Optional[str]:
               AND datetime(COALESCE(next_check_at, last_sent)) <= datetime('now')
               AND (
                 processing_until IS NULL
-                OR datetime(processing_until) <= datetime('now')
+                  OR datetime(processing_until) <= datetime('now')
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM user_settings us
+                  WHERE us.user_id = subscriptions.user_id
+                    AND datetime(json_extract(
+                        CASE WHEN json_valid(COALESCE(us.settings_json, '{}'))
+                             THEN us.settings_json ELSE '{}' END,
+                        '$.subscription_pause_until'
+                    )) > datetime('now')
               )
         """, (SUBSCRIPTION_CLAIM_MINUTES, token, user_id, query.strip()))
         await db.commit()
         return token if cursor.rowcount == 1 else None
+
+
+async def defer_subscription_after_transient_failure(
+    user_id: int,
+    query: str,
+    processing_token: str,
+    backoff_seconds: int = 60,
+) -> bool:
+    """Persist a short retry delay and release only the caller's live claim."""
+    bounded_backoff = max(1, min(int(backoff_seconds), 3600))
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            UPDATE subscriptions
+            SET next_check_at = datetime('now', '+' || ? || ' seconds'),
+                processing_until = NULL,
+                processing_token = NULL
+            WHERE user_id = ? AND query = ? AND processing_token = ?
+        """, (bounded_backoff, user_id, query.strip(), processing_token))
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def is_subscription_claim_active(
+    user_id: int, query: str, processing_token: str
+) -> bool:
+    """Check that a subscription claim is live, active, and not globally paused."""
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            SELECT 1 FROM subscriptions s
+            WHERE s.user_id = ? AND s.query = ?
+              AND s.processing_token = ?
+              AND s.processing_until IS NOT NULL
+              AND datetime(s.processing_until) > datetime('now')
+              AND s.is_active = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM user_settings us
+                  WHERE us.user_id = s.user_id
+                    AND datetime(json_extract(
+                        CASE WHEN json_valid(COALESCE(us.settings_json, '{}'))
+                             THEN us.settings_json ELSE '{}' END,
+                        '$.subscription_pause_until'
+                    )) > datetime('now')
+              )
+        """, (user_id, query.strip(), processing_token))
+        return await cursor.fetchone() is not None
 
 
 async def release_subscription_claim(user_id: int, query: str, processing_token: str):
@@ -2631,6 +2775,97 @@ async def get_delivery_failures(limit: int = 20) -> List[Dict[str, Any]]:
         return result
 
 
+async def claim_delivery_failures(
+    limit: int = 20,
+    lease_minutes: int = DELIVERY_FAILURE_CLAIM_MINUTES,
+) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Atomically lease delivery failures for one retry worker."""
+    token = uuid.uuid4().hex
+    bounded_limit = max(1, min(int(limit), 100))
+    bounded_lease = max(1, min(int(lease_minutes), 60))
+    async with connect_db() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await db.execute("""
+                SELECT failure_id FROM delivery_failures
+                WHERE claim_token IS NULL OR claim_until IS NULL
+                   OR datetime(claim_until) <= datetime('now')
+                ORDER BY updated_at, failure_id
+                LIMIT ?
+            """, (bounded_limit,))
+            failure_ids = [int(row[0]) for row in await cursor.fetchall()]
+            if failure_ids:
+                await db.executemany("""
+                    UPDATE delivery_failures
+                    SET claim_token = ?, claimed_at = CURRENT_TIMESTAMP,
+                        claim_until = datetime('now', '+' || ? || ' minutes')
+                    WHERE failure_id = ?
+                      AND (claim_token IS NULL OR claim_until IS NULL
+                           OR datetime(claim_until) <= datetime('now'))
+                """, [(token, bounded_lease, failure_id) for failure_id in failure_ids])
+            cursor = await db.execute("""
+                SELECT failure_id, user_id, post_id, post_json, caption, attempts,
+                       last_error, created_at, updated_at
+                FROM delivery_failures
+                WHERE claim_token = ?
+                ORDER BY updated_at, failure_id
+            """, (token,))
+            rows = await cursor.fetchall()
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+
+    failures = []
+    for row in rows:
+        try:
+            post = json.loads(row[3])
+        except json.JSONDecodeError:
+            post = {"id": row[2]}
+        failures.append({
+            "id": row[0], "user_id": row[1], "post_id": row[2],
+            "post": post, "caption": row[4], "attempts": row[5],
+            "last_error": row[6], "created_at": row[7], "updated_at": row[8],
+        })
+    return (token if failures else None), failures
+
+
+async def release_delivery_failure_claim(claim_token: str) -> int:
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            UPDATE delivery_failures
+            SET claim_token = NULL, claimed_at = NULL, claim_until = NULL
+            WHERE claim_token = ?
+        """, (claim_token,))
+        await db.commit()
+        return max(0, cursor.rowcount)
+
+
+async def delete_delivery_failure_for_post(
+    user_id: int, post_id: int, claim_token: str
+) -> bool:
+    """Acknowledge confirmed delivery only when the retry lease is still owned."""
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            DELETE FROM delivery_failures
+            WHERE user_id = ? AND post_id = ? AND claim_token = ?
+              AND claim_until IS NOT NULL
+              AND datetime(claim_until) > datetime('now')
+        """, (user_id, post_id, claim_token))
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def clear_delivery_failure_for_post(user_id: int, post_id: int) -> bool:
+    """Remove stale failure bookkeeping after any independently confirmed send."""
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            DELETE FROM delivery_failures WHERE user_id = ? AND post_id = ?
+        """, (user_id, post_id))
+        await db.commit()
+        return cursor.rowcount == 1
+
+
 async def delete_delivery_failure(failure_id: int):
     async with connect_db() as db:
         await db.execute("DELETE FROM delivery_failures WHERE failure_id = ?", (failure_id,))
@@ -2702,13 +2937,10 @@ async def delete_search_preset(user_id: int, preset_id: int) -> bool:
 
 async def get_subscription_options(user_id: int, query: str) -> Dict[str, Any]:
     async with connect_db() as db:
-        try:
-            cursor = await db.execute("""
-                SELECT settings_json, digest_mode FROM subscriptions
-                WHERE user_id = ? AND query = ?
-            """, (user_id, query.strip()))
-        except aiosqlite.OperationalError:
-            return {"digest_mode": "instant"}
+        cursor = await db.execute("""
+            SELECT settings_json, digest_mode FROM subscriptions
+            WHERE user_id = ? AND query = ?
+        """, (user_id, query.strip()))
         row = await cursor.fetchone()
         if not row:
             return {"digest_mode": "instant"}
@@ -2795,7 +3027,8 @@ async def enqueue_subscription_digest(user_id: int, query: str, post: Dict[str, 
             (user_id, query, post_id, post_json)
             SELECT ?, ?, ?, ?
             WHERE EXISTS (
-                SELECT 1 FROM subscriptions WHERE user_id = ? AND query = ?
+                SELECT 1 FROM subscriptions
+                WHERE user_id = ? AND query = ? AND is_active = 1
             )
         """, (
             user_id,
@@ -2832,19 +3065,28 @@ async def claim_subscription_digest(
         await db.execute("BEGIN IMMEDIATE")
         try:
             cursor = await db.execute("""
-            SELECT query, post_id, post_json FROM subscription_digest_queue
-            WHERE user_id = ?
-              AND EXISTS (
-                  SELECT 1 FROM subscriptions s
-                  WHERE s.user_id = subscription_digest_queue.user_id
-                    AND s.query = subscription_digest_queue.query
-              )
+            SELECT q.query, q.post_id, q.post_json
+            FROM subscription_digest_queue q
+            INNER JOIN subscriptions s
+              ON s.user_id = q.user_id AND s.query = q.query
+            WHERE q.user_id = ?
+              AND s.is_active = 1
+              AND (q.retry_after IS NULL OR datetime(q.retry_after) <= datetime('now'))
               AND (
-                  claim_token IS NULL
-                  OR claim_until IS NULL
-                  OR datetime(claim_until) <= datetime('now')
+                  q.claim_token IS NULL
+                  OR q.claim_until IS NULL
+                  OR datetime(q.claim_until) <= datetime('now')
               )
-            ORDER BY queued_at, query, post_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM user_settings us
+                  WHERE us.user_id = q.user_id
+                    AND datetime(json_extract(
+                        CASE WHEN json_valid(COALESCE(us.settings_json, '{}'))
+                             THEN us.settings_json ELSE '{}' END,
+                        '$.subscription_pause_until'
+                    )) > datetime('now')
+              )
+            ORDER BY q.queued_at, q.query, q.post_id
             LIMIT ?
         """, (user_id, bounded_limit))
             selected = await cursor.fetchall()
@@ -2853,7 +3095,9 @@ async def claim_subscription_digest(
                 UPDATE subscription_digest_queue
                 SET claim_token = ?,
                     claimed_at = CURRENT_TIMESTAMP,
-                    claim_until = datetime('now', '+' || ? || ' minutes')
+                    claim_until = datetime('now', '+' || ? || ' minutes'),
+                    delivery_state = 'pending',
+                    retry_after = NULL
                 WHERE user_id = ? AND query = ? AND post_id = ?
                   AND (
                       claim_token IS NULL
@@ -2866,9 +3110,23 @@ async def claim_subscription_digest(
                 ])
             cursor = await db.execute("""
                 SELECT query, post_id, post_json
-                FROM subscription_digest_queue
-                WHERE user_id = ? AND claim_token = ?
-                ORDER BY queued_at, query, post_id
+                FROM subscription_digest_queue q
+                WHERE q.user_id = ? AND q.claim_token = ?
+                  AND EXISTS (
+                      SELECT 1 FROM subscriptions s
+                      WHERE s.user_id = q.user_id AND s.query = q.query
+                        AND s.is_active = 1
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM user_settings us
+                      WHERE us.user_id = q.user_id
+                        AND datetime(json_extract(
+                            CASE WHEN json_valid(COALESCE(us.settings_json, '{}'))
+                                 THEN us.settings_json ELSE '{}' END,
+                            '$.subscription_pause_until'
+                        )) > datetime('now')
+                  )
+                ORDER BY q.queued_at, q.query, q.post_id
             """, (user_id, token))
             rows = await cursor.fetchall()
             await db.commit()
@@ -2923,6 +3181,21 @@ async def renew_subscription_digest_claim(
             WHERE user_id = ? AND claim_token = ?
               AND claim_until IS NOT NULL
               AND datetime(claim_until) > datetime('now')
+              AND EXISTS (
+                  SELECT 1 FROM subscriptions s
+                  WHERE s.user_id = subscription_digest_queue.user_id
+                    AND s.query = subscription_digest_queue.query
+                    AND s.is_active = 1
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM user_settings us
+                  WHERE us.user_id = subscription_digest_queue.user_id
+                    AND datetime(json_extract(
+                        CASE WHEN json_valid(COALESCE(us.settings_json, '{}'))
+                             THEN us.settings_json ELSE '{}' END,
+                        '$.subscription_pause_until'
+                    )) > datetime('now')
+              )
         """, (bounded_lease, user_id, claim_token))
         await db.commit()
         return cursor.rowcount > 0
@@ -2937,9 +3210,21 @@ async def get_subscription_digest_claim_keys(
             SELECT q.query, q.post_id
             FROM subscription_digest_queue q
             WHERE q.user_id = ? AND q.claim_token = ?
+              AND q.claim_until IS NOT NULL
+              AND datetime(q.claim_until) > datetime('now')
               AND EXISTS (
                   SELECT 1 FROM subscriptions s
                   WHERE s.user_id = q.user_id AND s.query = q.query
+                    AND s.is_active = 1
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM user_settings us
+                  WHERE us.user_id = q.user_id
+                    AND datetime(json_extract(
+                        CASE WHEN json_valid(COALESCE(us.settings_json, '{}'))
+                             THEN us.settings_json ELSE '{}' END,
+                        '$.subscription_pause_until'
+                    )) > datetime('now')
               )
         """, (user_id, claim_token))
         rows = await cursor.fetchall()
@@ -2950,14 +3235,23 @@ async def finish_subscription_digest_claim(
     user_id: int,
     claim_token: str,
     delivered_keys,
+    ambiguous_keys=(),
+    ambiguous_backoff_seconds: int = 1800,
 ) -> Tuple[int, int]:
-    """Delete confirmed items and release every unconfirmed item in the claim."""
+    """Delete confirmed items, defer ambiguous items, and release the remainder."""
     normalized_keys = []
     for query, post_id in delivered_keys:
         try:
             normalized_keys.append((str(query), int(post_id)))
         except (TypeError, ValueError):
             continue
+    normalized_ambiguous_keys = []
+    for query, post_id in ambiguous_keys:
+        try:
+            normalized_ambiguous_keys.append((str(query), int(post_id)))
+        except (TypeError, ValueError):
+            continue
+    bounded_backoff = max(1, min(int(ambiguous_backoff_seconds), 86400))
 
     async with connect_db() as db:
         await db.execute("BEGIN IMMEDIATE")
@@ -2970,6 +3264,17 @@ async def finish_subscription_digest_claim(
                       AND claim_token = ?
                 """, (user_id, query, post_id, claim_token))
                 delivered += max(0, cursor.rowcount)
+            for query, post_id in normalized_ambiguous_keys:
+                await db.execute("""
+                    UPDATE subscription_digest_queue
+                    SET delivery_state = 'ambiguous',
+                        retry_after = datetime('now', '+' || ? || ' seconds'),
+                        claim_token = NULL,
+                        claimed_at = NULL,
+                        claim_until = NULL
+                    WHERE user_id = ? AND query = ? AND post_id = ?
+                      AND claim_token = ?
+                """, (bounded_backoff, user_id, query, post_id, claim_token))
             cursor = await db.execute("""
                 UPDATE subscription_digest_queue
                 SET claim_token = NULL, claimed_at = NULL, claim_until = NULL
@@ -2985,27 +3290,35 @@ async def finish_subscription_digest_claim(
 
 async def get_due_digest_users() -> List[int]:
     async with connect_db() as db:
-        try:
-            cursor = await db.execute("""
-                SELECT user_id FROM subscription_digest_queue
+        cursor = await db.execute("""
+                SELECT q.user_id FROM subscription_digest_queue q
                 WHERE EXISTS (
                     SELECT 1 FROM subscriptions s
-                    WHERE s.user_id = subscription_digest_queue.user_id
-                      AND s.query = subscription_digest_queue.query
+                    WHERE s.user_id = q.user_id
+                      AND s.query = q.query
+                      AND s.is_active = 1
                 )
+                  AND (q.retry_after IS NULL OR datetime(q.retry_after) <= datetime('now'))
                   AND (
-                    claim_token IS NULL
-                    OR claim_until IS NULL
-                    OR datetime(claim_until) <= datetime('now')
+                    q.claim_token IS NULL
+                    OR q.claim_until IS NULL
+                    OR datetime(q.claim_until) <= datetime('now')
                   )
-                GROUP BY user_id
+                  AND NOT EXISTS (
+                    SELECT 1 FROM user_settings us
+                    WHERE us.user_id = q.user_id
+                      AND datetime(json_extract(
+                          CASE WHEN json_valid(COALESCE(us.settings_json, '{}'))
+                               THEN us.settings_json ELSE '{}' END,
+                          '$.subscription_pause_until'
+                      )) > datetime('now')
+                  )
+                GROUP BY q.user_id
                 HAVING COUNT(*) >= 5
-                   OR datetime(MIN(queued_at)) <= datetime('now', '-6 hours')
-                ORDER BY MIN(queued_at), user_id
+                   OR datetime(MIN(q.queued_at)) <= datetime('now', '-6 hours')
+                ORDER BY MIN(q.queued_at), q.user_id
                 LIMIT 20
-            """)
-        except aiosqlite.OperationalError:
-            return []
+        """)
         return [int(row[0]) for row in await cursor.fetchall()]
 
 

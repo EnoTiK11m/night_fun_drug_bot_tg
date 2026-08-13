@@ -35,7 +35,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import BadRequest, RetryAfter, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from config import (
     ALLOW_GROUP_CHATS,
     ALLOWED_CHAT_IDS,
@@ -172,6 +172,8 @@ from database import (
     get_subscription_usage,
     get_due_subscriptions,
     claim_due_subscription,
+    is_subscription_claim_active,
+    defer_subscription_after_transient_failure,
     release_subscription_claim,
     release_stale_subscription_claims,
     toggle_subscription,
@@ -219,8 +221,10 @@ from database import (
     get_user_activity_stats,
     clear_user_activity_stats,
     save_delivery_failure,
-    get_delivery_failures,
-    delete_delivery_failure,
+    claim_delivery_failures,
+    release_delivery_failure_claim,
+    delete_delivery_failure_for_post,
+    clear_delivery_failure_for_post,
     get_admin_database_stats,
     create_search_preset,
     get_search_presets,
@@ -676,6 +680,10 @@ ONE_SHOT_CALLBACK_PREFIXES = (
     "fav_remove_do_",
     "fav_col_pick_",
     "fav_note_",
+    "preset_del_",
+    "col_delete_do_",
+    "col_remove_",
+    "col_add_",
     "later_del_",
     "gallery_bulk_fav_",
     "gallery_collection_",
@@ -691,7 +699,12 @@ ONE_SHOT_CALLBACK_PREFIXES = (
     "later_add_",
     "sub_fav_",
 )
-ONE_SHOT_CALLBACK_EXACT: set[str] = set()
+ONE_SHOT_CALLBACK_EXACT: set[str] = {
+    "stats_clear_do",
+    "settings_reset_do",
+    "sub_digest_send",
+    "settings_resume_subscriptions",
+}
 
 
 def is_one_shot_callback(data: str) -> bool:
@@ -889,6 +902,16 @@ def resolved_callback_data(data: str) -> str:
     return data
 
 
+def revoke_unsent_keyboard_callbacks(keyboard) -> None:
+    """Drop issued one-shot tokens belonging to a keyboard never delivered."""
+    for row in getattr(keyboard, "inline_keyboard", ()) or ():
+        for button in row:
+            data = getattr(button, "callback_data", None)
+            entry = issued_one_shot_callbacks.get(data) if data else None
+            if entry is not None and entry.status == "issued":
+                issued_one_shot_callbacks.pop(data, None)
+
+
 def stale_user_one_shot_callbacks(user_id: int, current_generation: int) -> None:
     for entry in issued_one_shot_callbacks.values():
         if (
@@ -920,36 +943,38 @@ async def reserve_one_shot_callback_result(user_id: int, data: str) -> str:
                 "reserved", "processing", "consumed"
             } else "stale"
 
-        if issued.flow_scoped:
-            logical_key = (
-                issued.owner_id,
-                issued.generation,
-                issued.logical_action,
-                issued.canonical_payload,
+        logical_key = (
+            issued.owner_id,
+            issued.generation,
+            issued.flow_scoped,
+            issued.logical_action,
+            issued.canonical_payload,
+        )
+        for candidate in issued_one_shot_callbacks.values():
+            candidate_key = (
+                candidate.owner_id,
+                candidate.generation,
+                candidate.flow_scoped,
+                candidate.logical_action,
+                candidate.canonical_payload,
             )
-            for candidate in issued_one_shot_callbacks.values():
-                candidate_key = (
-                    candidate.owner_id,
-                    candidate.generation,
-                    candidate.logical_action,
-                    candidate.canonical_payload,
-                )
-                if candidate_key != logical_key or candidate is issued:
-                    continue
-                if candidate.status in {"reserved", "processing", "consumed"}:
-                    issued.status = "stale"
-                    duplicate_callbacks_rejected += 1
-                    return "duplicate"
+            if candidate_key != logical_key or candidate is issued:
+                continue
+            if candidate.status in {"reserved", "processing"}:
+                issued.status = "stale"
+                duplicate_callbacks_rejected += 1
+                return "duplicate"
         issued.status = "reserved"
-        if issued.flow_scoped:
-            for candidate in issued_one_shot_callbacks.values():
-                candidate_key = (
-                    candidate.owner_id,
-                    candidate.generation,
-                    candidate.logical_action,
-                    candidate.canonical_payload,
-                )
-                if candidate is not issued and candidate_key == logical_key:
+        for candidate in issued_one_shot_callbacks.values():
+            candidate_key = (
+                candidate.owner_id,
+                candidate.generation,
+                candidate.flow_scoped,
+                candidate.logical_action,
+                candidate.canonical_payload,
+            )
+            if candidate is not issued and candidate_key == logical_key:
+                if candidate.status == "issued":
                     candidate.status = "stale"
         return "accepted"
 
@@ -1066,6 +1091,7 @@ async def get_user_subscriptions_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return get_subscriptions_keyboard(
         subscriptions_paused=bool(pause_until),
         has_digest_posts=digest_count > 0,
+        side_effect_callback=subscription_callback_issuer_for(user_id),
     )
 
 
@@ -1170,10 +1196,14 @@ async def send_resilient_media_group(
                 chat_id=int(getattr(getattr(message, "chat", None), "id", 0) or 0),
             )
             return album_posts, rejected_posts
-        except TimedOut:
+        except (TimedOut, RetryAfter):
             # The album may already have been accepted; sequential retry could duplicate it.
             raise
         except Exception as exc:
+            if isinstance(exc, NetworkError) and not isinstance(exc, BadRequest):
+                # Transport failures are ambiguous: Telegram may have accepted
+                # the whole album, so a fallback send could duplicate it.
+                raise
             failed_index = gallery_failed_item_index(exc, len(album_posts))
             if failed_index is None:
                 logger.warning(
@@ -1451,6 +1481,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     raw_data = query.data
     data = resolved_callback_data(raw_data)
+    deferred_answer = data.startswith((
+        "later_add_",
+        "tag_block_",
+        "bl_quick_",
+        "gallery_bulk_fav_",
+    ))
+    reservation = await reserve_one_shot_callback_result(user_id, raw_data)
+    if reservation != "accepted":
+        already_processed = reservation == "duplicate"
+        if deferred_answer:
+            await safe_query_answer(
+                query,
+                "Кнопка уже обработана" if already_processed else "Кнопка устарела",
+            )
+        else:
+            await safe_query_answer(query)
+            await query.message.reply_text(
+                "Эта кнопка уже была обработана."
+                if already_processed
+                else "Эта кнопка устарела."
+            )
+        return
+    if not await begin_one_shot_processing(user_id, raw_data):
+        if deferred_answer:
+            await safe_query_answer(query, "Кнопка устарела")
+        else:
+            await safe_query_answer(query)
+            await query.message.reply_text("Эта кнопка устарела.")
+        return
+    reserved_entry = issued_one_shot_callbacks.get(raw_data)
+    callback_flow_scoped = (
+        reserved_entry.flow_scoped if reserved_entry is not None else True
+    )
     async with guarded_user_state(user_id):
         callback_generation = temporary_user_state.generation(user_id)
         if callback_generation == 0:
@@ -1464,12 +1527,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             expected_generation=callback_generation,
             **related_state,
         )
-    deferred_answer = data.startswith((
-        "later_add_",
-        "tag_block_",
-        "bl_quick_",
-        "gallery_bulk_fav_",
-    ))
     if not deferred_answer:
         await safe_query_answer(query)
 
@@ -1477,7 +1534,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         callback_is_current = (
             temporary_user_state.generation(user_id) == callback_generation
         )
-    if not callback_is_current:
+    if callback_flow_scoped and not callback_is_current:
         stale_flow_results_discarded += 1
         if deferred_answer:
             await safe_query_answer(query, "Кнопка устарела")
@@ -1485,27 +1542,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Эта кнопка устарела.")
         return
 
-    reservation = await reserve_one_shot_callback_result(user_id, raw_data)
-    if reservation != "accepted":
-        already_processed = reservation == "duplicate"
-        if deferred_answer:
-            await safe_query_answer(
-                query,
-                "Кнопка уже обработана" if already_processed else "Кнопка устарела",
-            )
-        else:
-            await query.message.reply_text(
-                "Эта кнопка уже была обработана."
-                if already_processed
-                else "Эта кнопка устарела."
-            )
-        return
-    if not await begin_one_shot_processing(user_id, raw_data):
-        if deferred_answer:
-            await safe_query_answer(query, "Кнопка устарела")
-        else:
-            await query.message.reply_text("Эта кнопка устарела.")
-        return
     data = resolved_callback_data(raw_data)
 
     if data == "cancel_input":
@@ -1718,7 +1754,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "presets":
-        await show_search_presets(query.message, user_id)
+        await show_search_presets(query.message, user_id, issuer=callback_issuer)
 
     elif data == "preset_save_current":
         saved = await get_user_query(user_id)
@@ -1758,7 +1794,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         value = data.replace("preset_del_", "", 1)
         if value.isdigit():
             await delete_search_preset(user_id, int(value))
-        await show_search_presets(query.message, user_id)
+        await show_search_presets(query.message, user_id, issuer=callback_issuer)
 
     elif data.startswith("preset_from_"):
         preset_query = get_callback_payload("preset_from", data)
@@ -2033,9 +2069,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 delivery = await send_digest_posts(
                     query.message, user_id, posts, lease=lease
                 )
-                await cancellation_safe_digest_finish(
-                    user_id, claim_token, delivery.delivered_ids
-                )
+                if delivery.ambiguous_ids:
+                    await cancellation_safe_digest_finish(
+                        user_id,
+                        claim_token,
+                        delivery.delivered_ids,
+                        delivery.ambiguous_ids,
+                    )
+                else:
+                    await cancellation_safe_digest_finish(
+                        user_id, claim_token, delivery.delivered_ids
+                    )
                 claim_open = False
                 total = len(posts)
                 delivered_count = len(delivery.delivered_ids)
@@ -2053,7 +2097,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             except DigestDeliveryCancelled as exc:
                 await cancellation_safe_digest_finish(
-                    user_id, claim_token, exc.result.delivered_ids
+                    user_id,
+                    claim_token,
+                    exc.result.delivered_ids,
+                    exc.result.ambiguous_ids,
                 )
                 claim_open = False
                 raise
@@ -2123,7 +2170,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             "Очистить историю поиска и отметки просмотренных постов? Избранное и настройки сохранятся.",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Очистить", callback_data="stats_clear_do"),
+                InlineKeyboardButton(
+                    "✅ Очистить",
+                    callback_data=callback_issuer.side_effect("stats_clear_do"),
+                ),
                 InlineKeyboardButton("Отмена", callback_data="stats"),
             ]]),
         )
@@ -2146,12 +2196,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("col_open_"):
         value = data.replace("col_open_", "", 1)
         if value.isdigit():
-            await show_collection(query.message, user_id, int(value))
+            await show_collection(
+                query.message, user_id, int(value), issuer=callback_issuer
+            )
 
     elif data.startswith("col_page_"):
         parts = data.split("_")
         if len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit():
-            await show_collection(query.message, user_id, int(parts[2]), int(parts[3]))
+            await show_collection(
+                query.message,
+                user_id,
+                int(parts[2]),
+                int(parts[3]),
+                issuer=callback_issuer,
+            )
 
     elif data.startswith("col_delete_") and not data.startswith("col_delete_do_"):
         value = data.replace("col_delete_", "", 1)
@@ -2159,7 +2217,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(
                 "Удалить коллекцию? Посты останутся в общем избранном.",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🗑 Удалить", callback_data=f"col_delete_do_{value}"),
+                    InlineKeyboardButton(
+                        "🗑 Удалить",
+                        callback_data=callback_issuer.side_effect(
+                            f"col_delete_do_{value}"
+                        ),
+                    ),
                     InlineKeyboardButton("❌ Отмена", callback_data="fav_collections"),
                 ]]),
             )
@@ -2185,7 +2248,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("fav_col_pick_"):
         value = data.replace("fav_col_pick_", "", 1)
         if value.isdigit():
-            await show_collection_picker(query.message, user_id, int(value))
+            await show_collection_picker(
+                query.message, user_id, int(value), issuer=callback_issuer
+            )
 
     elif data.startswith("col_add_"):
         parts = data.split("_")
@@ -2200,7 +2265,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) == 5 and all(part.isdigit() for part in parts[2:]):
             collection_id, post_id, index = map(int, parts[2:])
             await remove_favorite_from_collection(user_id, collection_id, post_id)
-            await show_collection(query.message, user_id, collection_id, index)
+            await show_collection(
+                query.message,
+                user_id,
+                collection_id,
+                index,
+                issuer=callback_issuer,
+            )
 
     elif data.startswith("col_export_"):
         value = data.replace("col_export_", "", 1)
@@ -2436,7 +2507,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Сбросить все настройки к значениям по умолчанию?\n\n"
             "Библиотека, подписки и чёрный список не будут удалены.",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Сбросить", callback_data="settings_reset_do"),
+                InlineKeyboardButton(
+                    "✅ Сбросить",
+                    callback_data=callback_issuer.side_effect("settings_reset_do"),
+                ),
                 InlineKeyboardButton("❌ Отмена", callback_data="settings"),
             ]]),
         )
@@ -3008,7 +3082,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(
                 f"⭐ Пост `{md_code(post_id)}` добавлен в избранное подписки.",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🗂 В коллекцию", callback_data=f"fav_col_pick_{post_id}")
+                    InlineKeyboardButton(
+                        "🗂 В коллекцию",
+                        callback_data=callback_issuer.side_effect(
+                            f"fav_col_pick_{post_id}"
+                        ),
+                    )
                 ]]),
                 parse_mode="Markdown",
             )
@@ -3016,7 +3095,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(
                 f"⭐ Пост `{md_code(post_id)}` добавлен в избранное.",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🗂 В коллекцию", callback_data=f"fav_col_pick_{post_id}")
+                    InlineKeyboardButton(
+                        "🗂 В коллекцию",
+                        callback_data=callback_issuer.side_effect(
+                            f"fav_col_pick_{post_id}"
+                        ),
+                    )
                 ]]),
                 parse_mode="Markdown",
             )
@@ -3046,7 +3130,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(
                 f"⭐ Пост `{md_code(post_id)}` добавлен в избранное.",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🗂 В коллекцию", callback_data=f"fav_col_pick_{post_id}")
+                    InlineKeyboardButton(
+                        "🗂 В коллекцию",
+                        callback_data=callback_issuer.side_effect(
+                            f"fav_col_pick_{post_id}"
+                        ),
+                    )
                 ]]),
                 parse_mode="Markdown",
             )
@@ -4283,7 +4372,15 @@ async def show_collections(message, user_id: int, edit: bool = False):
         await message.reply_text(text, **kwargs)
 
 
-async def show_collection(message, user_id: int, collection_id: int, index: int = 0):
+async def show_collection(
+    message,
+    user_id: int,
+    collection_id: int,
+    index: int = 0,
+    *,
+    issuer: OneShotCallbackIssuer | None = None,
+):
+    issuer = issuer or callback_issuer_for(user_id)
     collection = await get_favorite_collection(user_id, collection_id)
     if not collection:
         await message.reply_text("❌ Коллекция не найдена.")
@@ -4313,9 +4410,15 @@ async def show_collection(message, user_id: int, collection_id: int, index: int 
             InlineKeyboardButton("▶️", callback_data=f"col_page_{collection_id}_{next_index}"),
         ],
         [
-            InlineKeyboardButton("📝 Заметка", callback_data=f"fav_note_{post['id']}"),
             InlineKeyboardButton(
-                "➖ Из коллекции", callback_data=f"col_remove_{collection_id}_{post['id']}_{index}"
+                "📝 Заметка",
+                callback_data=issuer.side_effect(f"fav_note_{post['id']}"),
+            ),
+            InlineKeyboardButton(
+                "➖ Из коллекции",
+                callback_data=issuer.side_effect(
+                    f"col_remove_{collection_id}_{post['id']}_{index}"
+                ),
             ),
         ],
         [InlineKeyboardButton("📦 ZIP коллекции", callback_data=f"col_export_{collection_id}")],
@@ -4325,7 +4428,14 @@ async def show_collection(message, user_id: int, collection_id: int, index: int 
     await send_post_media(message, post, caption, keyboard, settings=settings)
 
 
-async def show_collection_picker(message, user_id: int, post_id: int):
+async def show_collection_picker(
+    message,
+    user_id: int,
+    post_id: int,
+    *,
+    issuer: OneShotCallbackIssuer | None = None,
+):
+    issuer = issuer or callback_issuer_for(user_id)
     collections = await get_favorite_collections(user_id)
     if not collections:
         await message.reply_text(
@@ -4336,7 +4446,8 @@ async def show_collection_picker(message, user_id: int, post_id: int):
         )
         return
     rows = [[InlineKeyboardButton(
-        f"🗂 {item['name'][:28]}", callback_data=f"col_add_{item['id']}_{post_id}"
+        f"🗂 {item['name'][:28]}",
+        callback_data=issuer.side_effect(f"col_add_{item['id']}_{post_id}"),
     )] for item in collections]
     await message.reply_text("Выберите коллекцию:", reply_markup=InlineKeyboardMarkup(rows))
 
@@ -4368,7 +4479,10 @@ async def show_user_stats(message, user_id: int):
     )
 
 
-async def show_search_presets(message, user_id: int):
+async def show_search_presets(
+    message, user_id: int, *, issuer: OneShotCallbackIssuer | None = None
+):
+    issuer = issuer or callback_issuer_for(user_id)
     presets = await get_search_presets(user_id)
     rows = []
     lines = []
@@ -4376,7 +4490,10 @@ async def show_search_presets(message, user_id: int):
         lines.append(f"• *{md_text(item['name'])}*: `{md_code(item['query'])}`")
         rows.append([
             InlineKeyboardButton("▶️ " + item["name"][:24], callback_data=f"preset_run_{item['id']}"),
-            InlineKeyboardButton("🗑", callback_data=f"preset_del_{item['id']}"),
+            InlineKeyboardButton(
+                "🗑",
+                callback_data=issuer.side_effect(f"preset_del_{item['id']}"),
+            ),
         ])
     rows.extend([
         [InlineKeyboardButton("➕ Сохранить текущий поиск", callback_data="preset_save_current")],
@@ -4777,9 +4894,14 @@ async def send_digest_posts(
             result.add("ambiguous_ids" if request_started else "failed_ids", in_flight)
             raise DigestDeliveryCancelled(result) from exc
         except Exception as exc:
-            logger.warning("Digest album failed, using sequential delivery: %s", exc)
-            sequential_posts = album_posts + standalone_posts
-            in_flight = []
+            if isinstance(exc, NetworkError) and not isinstance(exc, BadRequest):
+                result.add("ambiguous_ids", in_flight)
+                in_flight = []
+                sequential_posts = list(standalone_posts)
+            else:
+                logger.warning("Digest album failed, using sequential delivery: %s", exc)
+                sequential_posts = album_posts + standalone_posts
+                in_flight = []
     elif album_posts:
         sequential_posts = album_posts + standalone_posts
 
@@ -4793,21 +4915,28 @@ async def send_digest_posts(
                 return result
             in_flight = [key]
             try:
+                keyboard = get_subscription_image_keyboard(
+                    post.get("id", 0),
+                    side_effect_callback=subscription_callback_issuer_for(user_id),
+                )
                 delivered = await send_post_media(
                     message,
                     post,
                     caption="📨 Дайджест подписок" if index == 0 else "",
-                    keyboard=get_subscription_image_keyboard(
-                        post.get("id", 0),
-                        side_effect_callback=subscription_callback_issuer_for(user_id),
-                    ),
+                    keyboard=keyboard,
                     settings=settings,
                     raise_on_timeout=True,
                 )
             except TimedOut:
                 result.add("ambiguous_ids", [key])
+            except NetworkError as exc:
+                if isinstance(exc, BadRequest):
+                    raise
+                result.add("ambiguous_ids", [key])
             else:
                 result.add("delivered_ids" if delivered else "failed_ids", [key])
+                if not delivered:
+                    revoke_unsent_keyboard_callbacks(keyboard)
             in_flight = []
     except asyncio.CancelledError as exc:
         result.add("ambiguous_ids", in_flight)
@@ -4874,9 +5003,14 @@ async def send_digest_to_chat(
                 result.add("failed_ids", album_item_keys)
             raise DigestDeliveryCancelled(result) from exc
         except Exception as exc:
-            logger.warning("Scheduled digest album failed, using sequential delivery: %s", exc)
-            sequential_posts = album_posts + standalone_posts
-            in_flight = []
+            if isinstance(exc, NetworkError) and not isinstance(exc, BadRequest):
+                result.add("ambiguous_ids", in_flight)
+                in_flight = []
+                sequential_posts = list(standalone_posts)
+            else:
+                logger.warning("Scheduled digest album failed, using sequential delivery: %s", exc)
+                sequential_posts = album_posts + standalone_posts
+                in_flight = []
     elif album_posts:
         sequential_posts = album_posts + standalone_posts
 
@@ -4890,22 +5024,29 @@ async def send_digest_to_chat(
                 return result
             in_flight = [key]
             try:
+                keyboard = get_subscription_image_keyboard(
+                    post.get("id", 0),
+                    side_effect_callback=subscription_callback_issuer_for(user_id),
+                )
                 delivered = await send_post_media_to_chat(
                     bot,
                     user_id,
                     post,
                     caption="📨 Дайджест подписок" if index == 0 else "",
-                    keyboard=get_subscription_image_keyboard(
-                        post.get("id", 0),
-                        side_effect_callback=subscription_callback_issuer_for(user_id),
-                    ),
+                    keyboard=keyboard,
                     settings=settings,
                     raise_on_timeout=True,
                 )
             except TimedOut:
                 result.add("ambiguous_ids", [key])
+            except NetworkError as exc:
+                if isinstance(exc, BadRequest):
+                    raise
+                result.add("ambiguous_ids", [key])
             else:
                 result.add("delivered_ids" if delivered else "failed_ids", [key])
+                if not delivered:
+                    revoke_unsent_keyboard_callbacks(keyboard)
             in_flight = []
     except asyncio.CancelledError as exc:
         result.add("ambiguous_ids", in_flight)
@@ -4923,10 +5064,19 @@ async def _cancellation_safe_db_call(coroutine):
 
 
 async def cancellation_safe_digest_finish(
-    user_id: int, claim_token: str, delivered_ids
+    user_id: int, claim_token: str, delivered_ids, ambiguous_ids=()
 ):
+    if not ambiguous_ids:
+        return await _cancellation_safe_db_call(
+            finish_subscription_digest_claim(user_id, claim_token, delivered_ids)
+        )
     return await _cancellation_safe_db_call(
-        finish_subscription_digest_claim(user_id, claim_token, delivered_ids)
+        finish_subscription_digest_claim(
+            user_id,
+            claim_token,
+            delivered_ids,
+            ambiguous_keys=ambiguous_ids,
+        )
     )
 
 
@@ -5527,24 +5677,33 @@ async def retry_failed_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if update.effective_user.id not in ADMIN_USER_IDS:
         await update.message.reply_text("❌ Недостаточно прав.")
         return
-    failures = await get_delivery_failures(limit=20)
+    claim_token, failures = await claim_delivery_failures(limit=20)
     delivered = 0
-    for failure in failures:
-        ok = await send_post_media_to_chat(
-            context.bot,
-            failure["user_id"],
-            failure["post"],
-            failure["caption"],
-            keyboard=get_subscription_image_keyboard(
+    try:
+        for failure in failures:
+            keyboard = get_subscription_image_keyboard(
                 failure["post"].get("id", 0),
                 side_effect_callback=subscription_callback_issuer_for(
                     failure["user_id"]
                 ),
-            ),
-        )
-        if ok:
-            delivered += 1
-            await delete_delivery_failure(failure["id"])
+            )
+            ok = await send_post_media_to_chat(
+                context.bot,
+                failure["user_id"],
+                failure["post"],
+                failure["caption"],
+                keyboard=keyboard,
+            )
+            if ok and claim_token:
+                acknowledged = await delete_delivery_failure_for_post(
+                    failure["user_id"], failure["post_id"], claim_token
+                )
+                delivered += int(acknowledged)
+            elif not ok:
+                revoke_unsent_keyboard_callbacks(keyboard)
+    finally:
+        if claim_token:
+            await release_delivery_failure_claim(claim_token)
     await update.message.reply_text(
         f"♻️ Повторено: {len(failures)}, доставлено: {delivered}, осталось: {len(failures) - delivered}."
     )
@@ -5887,6 +6046,7 @@ async def process_one_subscription(app, subscription):
     result = None
     caption = ""
     claim_completed = False
+    delivery_started = False
     try:
         logger.info("Отправляем подписку пользователю %s: %s", user_id, query)
 
@@ -5916,6 +6076,15 @@ async def process_one_subscription(app, subscription):
                     await mark_post_sent(user_id, int(post_id))
                 runtime_metrics.increment("subscription_digest_queued", int(queued))
                 return bool(updated)
+            if not await is_subscription_claim_active(
+                user_id, query, processing_token
+            ):
+                logger.info(
+                    "Subscription changed before delivery user=%s query=%r",
+                    user_id,
+                    query,
+                )
+                return False
             keyboard = get_subscription_image_keyboard(
                 post_id,
                 query,
@@ -5927,6 +6096,7 @@ async def process_one_subscription(app, subscription):
             if settings.get("show_caption", True):
                 caption = await build_caption(settings, result, query, True)
 
+            delivery_started = True
             delivered = await send_post_media_to_chat(
                 app.bot, user_id, result, caption, keyboard, settings=settings
             )
@@ -5936,6 +6106,7 @@ async def process_one_subscription(app, subscription):
                 claim_completed = bool(updated)
                 if updated and post_id:
                     await mark_post_sent(user_id, int(post_id))
+                    await clear_delivery_failure_for_post(user_id, int(post_id))
                 elif not updated:
                     logger.warning(
                         "Subscription claim expired before schedule update for user=%s query=%r",
@@ -5944,6 +6115,7 @@ async def process_one_subscription(app, subscription):
                     )
             else:
                 runtime_metrics.increment("subscription_failed")
+                revoke_unsent_keyboard_callbacks(keyboard)
                 await save_delivery_failure(user_id, result, caption)
             return bool(delivered)
 
@@ -5972,6 +6144,44 @@ async def process_one_subscription(app, subscription):
             )
         return False
 
+    except asyncio.CancelledError:
+        if delivery_started:
+            claim_completed = await _cancellation_safe_db_call(
+                defer_subscription_after_transient_failure(
+                    user_id, query, processing_token, backoff_seconds=1800
+                )
+            )
+        raise
+    except TimedOut:
+        claim_completed = await defer_subscription_after_transient_failure(
+            user_id, query, processing_token, backoff_seconds=1800
+        )
+        logger.warning(
+            "Ambiguous subscription timeout deferred user=%s query=%r",
+            user_id,
+            query,
+        )
+        return False
+    except NetworkError as exc:
+        if isinstance(exc, BadRequest):
+            if result:
+                await save_delivery_failure(
+                    user_id, result, caption, error=f"BadRequest: {exc}"
+                )
+            claim_completed = await defer_subscription_after_transient_failure(
+                user_id, query, processing_token
+            )
+            return False
+        claim_completed = await defer_subscription_after_transient_failure(
+            user_id, query, processing_token, backoff_seconds=1800
+        )
+        logger.warning(
+            "Ambiguous subscription network error deferred user=%s query=%r: %s",
+            user_id,
+            query,
+            exc,
+        )
+        return False
     except APITemporaryError as e:
         await note_upstream_failure(app, str(e))
         logger.warning(
@@ -5980,6 +6190,9 @@ async def process_one_subscription(app, subscription):
             query,
             e,
         )
+        claim_completed = await defer_subscription_after_transient_failure(
+            user_id, query, processing_token
+        )
         return False
     except Exception as exc:
         if result:
@@ -5987,6 +6200,9 @@ async def process_one_subscription(app, subscription):
                 user_id, result, caption, error=f"{type(exc).__name__}: {exc}"
             )
         logger.exception("Subscription processing error for user %s", user_id)
+        claim_completed = await defer_subscription_after_transient_failure(
+            user_id, query, processing_token
+        )
         return False
     finally:
         if not claim_completed:
@@ -6002,13 +6218,25 @@ async def get_subscription_cached_image(
     excluded_post_ids: set,
     settings: dict | None = None,
 ):
+    blocked_tags = {
+        str(tag).strip().lower().lstrip("-")
+        for tag in blacklist
+        if str(tag).strip().lstrip("-")
+    }
+
+    def is_available(post: dict) -> bool:
+        post_tags = {
+            tag.lower() for tag in str(post.get("tags") or "").split() if tag
+        }
+        return (
+            bool(post.get("file_url"))
+            and post.get("id") not in excluded_post_ids
+            and not post_tags.intersection(blocked_tags)
+            and (settings is None or post_matches_preferences(post, settings))
+        )
+
     cached_posts, _ = await get_subscription_cache(user_id, query)
-    available_posts = [
-        post for post in cached_posts
-        if post.get("file_url")
-        and post.get("id") not in excluded_post_ids
-        and (settings is None or post_matches_preferences(post, settings))
-    ]
+    available_posts = [post for post in cached_posts if is_available(post)]
     should_refresh = (
         await is_subscription_cache_stale(user_id, query)
         or len(available_posts) < SUBSCRIPTION_CACHE_MIN_AVAILABLE
@@ -6035,12 +6263,7 @@ async def get_subscription_cached_image(
         if fresh_posts:
             cache_stats = await replace_subscription_cache(user_id, query, fresh_posts)
             cached_posts, _ = await get_subscription_cache(user_id, query)
-            available_posts = [
-                post for post in cached_posts
-                if post.get("file_url")
-                and post.get("id") not in excluded_post_ids
-                and (settings is None or post_matches_preferences(post, settings))
-            ]
+            available_posts = [post for post in cached_posts if is_available(post)]
             logger.info(
                 "Refreshed subscription cache user=%s query=%r api=%s new=%s total=%s available=%s",
                 user_id,
@@ -6114,9 +6337,17 @@ async def process_subscriptions(app):
                     delivery = await send_digest_to_chat(
                         app.bot, digest_user_id, digest_posts, lease=lease
                     )
-                    await cancellation_safe_digest_finish(
-                        digest_user_id, claim_token, delivery.delivered_ids
-                    )
+                    if delivery.ambiguous_ids:
+                        await cancellation_safe_digest_finish(
+                            digest_user_id,
+                            claim_token,
+                            delivery.delivered_ids,
+                            delivery.ambiguous_ids,
+                        )
+                    else:
+                        await cancellation_safe_digest_finish(
+                            digest_user_id, claim_token, delivery.delivered_ids
+                        )
                     claim_open = False
                     logger.info(
                         "Scheduled digest result user=%s delivered=%s failed=%s ambiguous=%s",
@@ -6127,7 +6358,10 @@ async def process_subscriptions(app):
                     )
                 except DigestDeliveryCancelled as exc:
                     await cancellation_safe_digest_finish(
-                        digest_user_id, claim_token, exc.result.delivered_ids
+                        digest_user_id,
+                        claim_token,
+                        exc.result.delivered_ids,
+                        exc.result.ambiguous_ids,
                     )
                     claim_open = False
                     raise

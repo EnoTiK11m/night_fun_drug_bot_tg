@@ -600,7 +600,11 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.button_handler(update, SimpleNamespace())
 
-        picker.assert_awaited_once_with(update.callback_query.message, 1, 123)
+        picker.assert_awaited_once()
+        self.assertEqual(picker.await_args.args, (update.callback_query.message, 1, 123))
+        self.assertIsInstance(
+            picker.await_args.kwargs["issuer"], bot.OneShotCallbackIssuer
+        )
         add_favorite.assert_not_awaited()
 
     async def test_gallery_settings_cycle_persists_sort(self):
@@ -896,7 +900,11 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.user_states[1], "waiting_pause_subscriptions")
         query.edit_message_text.assert_awaited_once()
 
-        update, query = make_callback_update("settings_resume_subscriptions")
+        update, query = make_callback_update(
+            bot.subscription_callback_issuer_for(1).side_effect(
+                "settings_resume_subscriptions"
+            )
+        )
         with (
             patch.object(
                 bot,
@@ -920,13 +928,16 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         }
         paused_callbacks = {
             button.callback_data
-            for row in bot.get_subscriptions_keyboard(subscriptions_paused=True).inline_keyboard
+            for row in bot.get_subscriptions_keyboard(
+                subscriptions_paused=True,
+                side_effect_callback=lambda data: f"token:{data}",
+            ).inline_keyboard
             for button in row
         }
 
         self.assertIn("settings_pause_subscriptions", active_callbacks)
         self.assertNotIn("settings_resume_subscriptions", active_callbacks)
-        self.assertIn("settings_resume_subscriptions", paused_callbacks)
+        self.assertIn("token:settings_resume_subscriptions", paused_callbacks)
         self.assertNotIn("settings_pause_subscriptions", paused_callbacks)
 
     def test_subscriptions_keyboard_shows_digest_action_only_when_queue_has_posts(self):
@@ -937,15 +948,20 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         }
         queued_callbacks = {
             button.callback_data
-            for row in bot.get_subscriptions_keyboard(has_digest_posts=True).inline_keyboard
+            for row in bot.get_subscriptions_keyboard(
+                has_digest_posts=True,
+                side_effect_callback=lambda data: f"token:{data}",
+            ).inline_keyboard
             for button in row
         }
 
         self.assertNotIn("sub_digest_send", empty_callbacks)
-        self.assertIn("sub_digest_send", queued_callbacks)
+        self.assertIn("token:sub_digest_send", queued_callbacks)
 
     async def test_empty_digest_button_reports_that_queue_is_empty(self):
-        update, query = make_callback_update("sub_digest_send")
+        update, query = make_callback_update(
+            bot.subscription_callback_issuer_for(1).side_effect("sub_digest_send")
+        )
 
         with patch.object(
             bot,
@@ -1003,7 +1019,9 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
             for row in query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard
             for button in row
         ]
-        self.assertEqual(callbacks, ["settings_reset_do", "settings"])
+        self.assertEqual(bot.resolved_callback_data(callbacks[0]), "settings_reset_do")
+        self.assertIn(callbacks[0], bot.issued_one_shot_callbacks)
+        self.assertEqual(callbacks[1], "settings")
 
     async def test_favorite_tag_prompt_opens_filtered_list(self):
         bot.user_states[1] = "waiting_fav_tag"

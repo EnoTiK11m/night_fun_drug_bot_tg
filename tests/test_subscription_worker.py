@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from telegram.error import NetworkError
 
 import bot
 from api_handler import APITemporaryError
@@ -12,8 +13,23 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         telegram_rate_limiter.reset()
         bot.user_operation_gate.reset_for_tests()
+        self.claim_active_patcher = patch.object(
+            bot, "is_subscription_claim_active", AsyncMock(return_value=True)
+        )
+        self.clear_failure_patcher = patch.object(
+            bot, "clear_delivery_failure_for_post", AsyncMock(return_value=True)
+        )
+        self.subscription_options_patcher = patch.object(
+            bot, "get_subscription_options", AsyncMock(return_value={})
+        )
+        self.claim_active_patcher.start()
+        self.clear_failure_patcher.start()
+        self.subscription_options_patcher.start()
 
     def tearDown(self):
+        self.subscription_options_patcher.stop()
+        self.clear_failure_patcher.stop()
+        self.claim_active_patcher.stop()
         telegram_rate_limiter.reset()
         bot.user_operation_gate.reset_for_tests()
 
@@ -97,7 +113,7 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
         save_failure.assert_awaited_once()
         release_claim.assert_awaited_once_with(1, "tag", "token")
 
-    async def test_cancellation_during_delivery_releases_claim_and_propagates(self):
+    async def test_cancellation_during_delivery_defers_claim_and_propagates(self):
         app = SimpleNamespace(bot=object())
         result = {"id": "123", "file_url": "https://example.test/file.jpg"}
 
@@ -113,12 +129,52 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
                 "send_post_media_to_chat",
                 AsyncMock(side_effect=asyncio.CancelledError),
             ),
+            patch.object(
+                bot,
+                "defer_subscription_after_transient_failure",
+                AsyncMock(return_value=True),
+            ) as defer_claim,
             patch.object(bot, "release_subscription_claim", AsyncMock()) as release_claim,
         ):
             with self.assertRaises(asyncio.CancelledError):
                 await bot.process_one_subscription(app, (1, "tag", 10, 0))
 
-        release_claim.assert_awaited_once_with(1, "tag", "token")
+        defer_claim.assert_awaited_once_with(
+            1, "tag", "token", backoff_seconds=1800
+        )
+        release_claim.assert_not_awaited()
+
+    async def test_ambiguous_network_delivery_is_deferred_without_retry_queue(self):
+        app = SimpleNamespace(bot=object())
+        result = {"id": "123", "file_url": "https://example.test/file.jpg"}
+        with (
+            patch.object(bot, "claim_due_subscription", AsyncMock(return_value="token")),
+            patch.object(bot, "get_user_blacklist", AsyncMock(return_value=set())),
+            patch.object(bot, "get_user_settings", AsyncMock(return_value={"show_caption": False})),
+            patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
+            patch.object(bot, "get_subscription_cached_image", AsyncMock(return_value=result)),
+            patch.object(bot, "remember_and_cache_post", AsyncMock()),
+            patch.object(
+                bot,
+                "send_post_media_to_chat",
+                AsyncMock(side_effect=NetworkError("response lost")),
+            ),
+            patch.object(
+                bot,
+                "defer_subscription_after_transient_failure",
+                AsyncMock(return_value=True),
+            ) as defer_claim,
+            patch.object(bot, "save_delivery_failure", AsyncMock()) as save_failure,
+            patch.object(bot, "release_subscription_claim", AsyncMock()) as release_claim,
+        ):
+            delivered = await bot.process_one_subscription(app, (1, "tag", 10, 0))
+
+        self.assertFalse(delivered)
+        defer_claim.assert_awaited_once_with(
+            1, "tag", "token", backoff_seconds=1800
+        )
+        save_failure.assert_not_awaited()
+        release_claim.assert_not_awaited()
 
     async def test_expired_claim_update_does_not_mark_sent(self):
         app = SimpleNamespace(bot=object())
@@ -234,7 +290,7 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
         ]
         query = SimpleNamespace(
             from_user=SimpleNamespace(id=1),
-            data="sub_digest_send",
+            data=bot.subscription_callback_issuer_for(1).side_effect("sub_digest_send"),
             answer=AsyncMock(),
             message=SimpleNamespace(reply_text=AsyncMock()),
         )
@@ -278,7 +334,7 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
         ]
         query = SimpleNamespace(
             from_user=SimpleNamespace(id=1),
-            data="sub_digest_send",
+            data=bot.subscription_callback_issuer_for(1).side_effect("sub_digest_send"),
             answer=AsyncMock(),
             message=SimpleNamespace(reply_text=AsyncMock()),
         )
@@ -317,7 +373,10 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
                 await bot.button_handler(update, SimpleNamespace())
 
         finish.assert_awaited_once_with(
-            1, "claim-token", [("tag-a", 7)]
+            1,
+            "claim-token",
+            [("tag-a", 7)],
+            ambiguous_keys=[("tag-b", 8)],
         )
 
     async def test_manual_digest_cancelled_before_send_releases_claim_and_propagates(self):
@@ -326,7 +385,7 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
         ]
         query = SimpleNamespace(
             from_user=SimpleNamespace(id=1),
-            data="sub_digest_send",
+            data=bot.subscription_callback_issuer_for(1).side_effect("sub_digest_send"),
             answer=AsyncMock(),
             message=SimpleNamespace(reply_text=AsyncMock()),
         )
@@ -464,7 +523,7 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
         }]
         query = SimpleNamespace(
             from_user=SimpleNamespace(id=1),
-            data="sub_digest_send",
+            data=bot.subscription_callback_issuer_for(1).side_effect("sub_digest_send"),
             answer=AsyncMock(),
             message=SimpleNamespace(reply_text=AsyncMock()),
         )
@@ -647,7 +706,9 @@ class SubscriptionSchedulerTests(unittest.IsolatedAsyncioTestCase):
         due_users.assert_awaited_once()
         claim.assert_awaited_once_with(1, 10)
         send.assert_awaited_once()
-        finish.assert_awaited_once_with(1, "claim-token", [])
+        finish.assert_awaited_once_with(
+            1, "claim-token", [], ambiguous_keys=[("tag", 1)]
+        )
         sleep.assert_awaited_once_with(bot.SUBSCRIPTION_CHECK_INTERVAL_SECONDS)
 
 

@@ -380,6 +380,29 @@ class UserStateRaceTests(unittest.IsolatedAsyncioTestCase):
             )
         toggle.assert_awaited_once()
 
+    async def test_consumed_logical_action_does_not_block_reissued_token(self):
+        first = bot.store_user_one_shot_payload("sub_toggle", "tag", 1)
+        self.assertTrue(await bot.consume_one_shot_callback(1, first))
+        await bot.finish_one_shot_processing(1, first)
+        self.assertFalse(await bot.consume_one_shot_callback(1, first))
+
+        second = bot.store_user_one_shot_payload("sub_toggle", "tag", 1)
+        self.assertTrue(await bot.consume_one_shot_callback(1, second))
+
+    async def test_unissued_raw_side_effect_callbacks_are_stale(self):
+        for data in (
+            "fav_col_pick_42",
+            "fav_note_42",
+            "stats_clear_do",
+            "col_delete_do_5",
+            "col_remove_5_42_0",
+            "settings_reset_do",
+            "preset_del_7",
+            "sub_digest_send",
+            "settings_resume_subscriptions",
+        ):
+            self.assertFalse(await bot.consume_one_shot_callback(1, data), data)
+
     async def test_old_gallery_collection_button_keeps_original_post_ids(self):
         data = bot.store_side_effect_callback("gallery_col_add:5:1,2", 1)
         bot.pending_bulk_posts[1] = [9]
@@ -595,6 +618,35 @@ class UserStateRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await bot.consume_one_shot_callback(1, data))
         self.assertFalse(await bot.consume_one_shot_callback(1, data))
         self.assertFalse(await bot.consume_one_shot_callback(2, data))
+
+    async def test_durable_callback_survives_generation_change_after_reservation(self):
+        data = bot.subscription_callback_issuer_for(1).side_effect(
+            "settings_resume_subscriptions"
+        )
+        answer_started = asyncio.Event()
+        release_answer = asyncio.Event()
+
+        async def delayed_answer(*_args, **_kwargs):
+            answer_started.set()
+            await release_answer.wait()
+
+        resume = AsyncMock(return_value=2)
+        with (
+            patch.object(bot, "safe_query_answer", side_effect=delayed_answer),
+            patch.object(bot, "resume_all_active_subscriptions", resume),
+            patch.object(
+                bot, "get_user_subscriptions_keyboard", AsyncMock(return_value=None)
+            ),
+        ):
+            task = asyncio.create_task(
+                bot.button_handler(callback_update(data)[0], SimpleNamespace())
+            )
+            await answer_started.wait()
+            await bot.invalidate_user_flow(1)
+            release_answer.set()
+            await task
+
+        resume.assert_awaited_once_with(1)
 
     async def test_reissued_subscription_callback_is_not_a_logical_duplicate(self):
         first = bot.subscription_callback_issuer_for(1).side_effect("sub_fav_42")

@@ -28,6 +28,22 @@ class TempDatabaseTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class SubscriptionClaimTests(TempDatabaseTestCase):
+    async def test_due_subscriptions_have_deterministic_schedule_user_query_order(self):
+        for user_id, query in ((2, "z"), (1, "b"), (1, "a")):
+            self.assertTrue(await database.add_subscription(user_id, query, 10))
+        async with database.connect_db() as db:
+            await db.execute("""
+                UPDATE subscriptions SET next_check_at = '2026-01-01 00:00:00'
+            """)
+            await db.commit()
+
+        due = await database.get_due_subscriptions()
+
+        self.assertEqual(
+            [(row[0], row[1]) for row in due],
+            [(1, "a"), (1, "b"), (2, "z")],
+        )
+
     async def test_concurrent_claims_have_exactly_one_winner(self):
         self.assertTrue(await database.add_subscription(1, "tag", 10))
 
@@ -88,6 +104,30 @@ class SubscriptionClaimTests(TempDatabaseTestCase):
 
         self.assertTrue(await database.update_subscription_time(1, "tag", token))
         self.assertIsNone(await database.claim_due_subscription(1, "tag"))
+
+    async def test_transient_failure_backoff_is_token_fenced_and_persisted(self):
+        self.assertTrue(await database.add_subscription(1, "tag", 10))
+        token = await database.claim_due_subscription(1, "tag")
+
+        self.assertFalse(await database.defer_subscription_after_transient_failure(
+            1, "tag", "wrong-token", 120
+        ))
+        self.assertTrue(await database.defer_subscription_after_transient_failure(
+            1, "tag", token, 120
+        ))
+        self.assertNotIn((1, "tag", 10, 0), await database.get_due_subscriptions())
+        self.assertIsNone(await database.claim_due_subscription(1, "tag"))
+
+    async def test_claim_revalidation_observes_disable_and_global_pause(self):
+        self.assertTrue(await database.add_subscription(1, "tag", 10))
+        token = await database.claim_due_subscription(1, "tag")
+        self.assertTrue(await database.is_subscription_claim_active(1, "tag", token))
+        self.assertFalse(await database.is_subscription_claim_active(
+            1, "tag", "wrong-token"
+        ))
+
+        await database.pause_all_active_subscriptions(1, 60)
+        self.assertFalse(await database.is_subscription_claim_active(1, "tag", token))
 
     async def test_expired_claim_token_cannot_complete_reclaimed_subscription(self):
         self.assertTrue(await database.add_subscription(1, "tag", 10))
@@ -354,6 +394,56 @@ class DigestClaimTests(TempDatabaseTestCase):
             [("tag-b", 42)],
         )
 
+    async def test_disabled_or_globally_paused_subscription_cannot_be_claimed(self):
+        self.assertTrue(await database.add_subscription(1, "tag", 10))
+        self.assertTrue(await database.enqueue_subscription_digest(
+            1, "tag", {"id": 1, "file_url": "https://example.test/1.jpg"}
+        ))
+
+        self.assertFalse((await database.toggle_subscription(1, "tag")).is_active)
+        self.assertEqual(await database.claim_subscription_digest(1), (None, []))
+        self.assertEqual(await database.get_due_digest_users(), [])
+
+        self.assertTrue((await database.toggle_subscription(1, "tag")).is_active)
+        await database.pause_all_active_subscriptions(1, 60)
+        self.assertEqual(await database.claim_subscription_digest(1), (None, []))
+        self.assertEqual(await database.get_due_digest_users(), [])
+
+        await database.resume_all_active_subscriptions(1)
+        token, posts = await database.claim_subscription_digest(1)
+        self.assertIsNotNone(token)
+        self.assertEqual([post["digest_item_key"] for post in posts], [("tag", 1)])
+
+    async def test_ambiguous_digest_item_is_deferred_before_becoming_retryable(self):
+        self.assertTrue(await database.add_subscription(1, "tag", 10))
+        self.assertTrue(await database.enqueue_subscription_digest(
+            1, "tag", {"id": 1, "file_url": "https://example.test/1.jpg"}
+        ))
+        token, posts = await database.claim_subscription_digest(1)
+
+        self.assertEqual(await database.finish_subscription_digest_claim(
+            1,
+            token,
+            [],
+            ambiguous_keys=[posts[0]["digest_item_key"]],
+            ambiguous_backoff_seconds=120,
+        ), (0, 0))
+        self.assertEqual(await database.claim_subscription_digest(1), (None, []))
+        async with database.connect_db() as db:
+            cursor = await db.execute("""
+                SELECT delivery_state FROM subscription_digest_queue
+                WHERE user_id = 1 AND query = 'tag' AND post_id = 1
+            """)
+            self.assertEqual((await cursor.fetchone())[0], "ambiguous")
+            await db.execute("""
+                UPDATE subscription_digest_queue
+                SET retry_after = datetime('now', '-1 second')
+            """)
+            await db.commit()
+        retry_token, retry_posts = await database.claim_subscription_digest(1)
+        self.assertIsNotNone(retry_token)
+        self.assertEqual([post["digest_item_key"] for post in retry_posts], [("tag", 1)])
+
     async def test_renew_and_active_keys_are_guarded_by_claim_ownership(self):
         await self._enqueue_same_post_for_two_queries()
         token, _posts = await database.claim_subscription_digest(1, 10)
@@ -547,6 +637,18 @@ class PostCacheTests(TempDatabaseTestCase):
 
 
 class UserSettingsTests(TempDatabaseTestCase):
+    async def test_concurrent_partial_saves_do_not_lose_json_updates(self):
+        await asyncio.gather(
+            database.save_user_settings(1, {"gallery_size": 25}),
+            database.save_user_settings(1, {"quality_mode": "sample"}),
+            database.save_user_settings(1, {"spoiler_mode": "all"}),
+        )
+
+        settings = await database.get_user_settings(1)
+        self.assertEqual(settings["gallery_size"], 25)
+        self.assertEqual(settings["quality_mode"], "sample")
+        self.assertEqual(settings["spoiler_mode"], "all")
+
     async def test_partial_save_preserves_existing_settings(self):
         await database.save_user_settings(1, {
             "show_caption": False,
@@ -566,6 +668,46 @@ class UserSettingsTests(TempDatabaseTestCase):
         settings = await database.get_user_settings(1)
 
         self.assertTrue(settings["show_tags_button"])
+
+
+class DeliveryFailureClaimTests(TempDatabaseTestCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        for post_id in range(1, 4):
+            await database.save_delivery_failure(1, {
+                "id": post_id,
+                "file_url": f"https://example.test/{post_id}.jpg",
+            })
+
+    async def test_concurrent_retry_claims_do_not_overlap(self):
+        claims = await asyncio.gather(
+            database.claim_delivery_failures(limit=3),
+            database.claim_delivery_failures(limit=3),
+        )
+
+        non_empty = [(token, rows) for token, rows in claims if token]
+        self.assertEqual(len(non_empty), 1)
+        self.assertEqual([row["post_id"] for row in non_empty[0][1]], [1, 2, 3])
+
+    async def test_confirmed_delete_requires_matching_live_user_post_claim(self):
+        token, rows = await database.claim_delivery_failures(limit=3)
+        row = rows[0]
+
+        self.assertFalse(await database.delete_delivery_failure_for_post(
+            row["user_id"], row["post_id"], "wrong-token"
+        ))
+        self.assertTrue(await database.delete_delivery_failure_for_post(
+            row["user_id"], row["post_id"], token
+        ))
+        self.assertEqual(await database.release_delivery_failure_claim(token), 2)
+
+    async def test_independent_confirmed_send_clears_failure_by_unique_key(self):
+        self.assertTrue(await database.clear_delivery_failure_for_post(1, 2))
+        self.assertFalse(await database.clear_delivery_failure_for_post(1, 2))
+        self.assertEqual(
+            [row["post_id"] for row in await database.get_delivery_failures()],
+            [1, 3],
+        )
 
 
 if __name__ == "__main__":

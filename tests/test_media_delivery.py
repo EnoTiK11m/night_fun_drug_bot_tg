@@ -11,7 +11,7 @@ from bot_delivery import (
     TelegramRateLimiter,
     telegram_rate_limiter,
 )
-from telegram.error import RetryAfter, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
 
 class CloseCountingBytesIO(io.BytesIO):
@@ -145,7 +145,7 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_send_post_media_tries_sample_url_after_file_url_failure(self):
         message = AsyncMock()
-        message.reply_photo = AsyncMock(side_effect=[Exception("bad file"), None])
+        message.reply_photo = AsyncMock(side_effect=[BadRequest("bad file"), None])
         post = {
             "id": 1,
             "file_url": "https://example.test/original.jpg",
@@ -167,6 +167,27 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         message.reply_text.assert_not_awaited()
 
+    async def test_send_post_media_network_error_is_not_retried_or_fallen_back(self):
+        message = AsyncMock()
+        error = NetworkError("connection lost after request")
+        message.reply_photo.side_effect = error
+        post = {
+            "id": 1,
+            "file_url": "https://example.test/original.jpg",
+            "sample_url": "https://example.test/sample.jpg",
+        }
+
+        with self.assertRaises(NetworkError) as raised:
+            await bot_media.send_post_media(message, post, retries=2)
+
+        self.assertIs(raised.exception, error)
+        message.reply_photo.assert_awaited_once()
+        self.assertEqual(
+            message.reply_photo.await_args.args[0],
+            "https://example.test/original.jpg",
+        )
+        message.reply_text.assert_not_awaited()
+
     async def test_send_post_media_passes_spoiler_to_telegram(self):
         message = AsyncMock()
         post = {"id": 1, "file_url": "https://example.test/1.jpg", "rating": "e"}
@@ -181,8 +202,8 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_post_media_to_chat_tries_preview_url_after_failures(self):
         telegram_bot = AsyncMock()
         telegram_bot.send_photo = AsyncMock(side_effect=[
-            Exception("bad file"),
-            Exception("bad sample"),
+            BadRequest("bad file"),
+            BadRequest("bad sample"),
             None,
         ])
         post = {
@@ -205,6 +226,29 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         telegram_bot.send_message.assert_not_awaited()
 
+    async def test_send_post_media_to_chat_network_error_is_not_retried_or_fallen_back(self):
+        telegram_bot = AsyncMock()
+        error = NetworkError("connection lost after request")
+        telegram_bot.send_photo.side_effect = error
+        post = {
+            "id": 1,
+            "file_url": "https://example.test/original.jpg",
+            "sample_url": "https://example.test/sample.jpg",
+        }
+
+        with self.assertRaises(NetworkError) as raised:
+            await bot_media.send_post_media_to_chat(
+                telegram_bot, 123, post, retries=2
+            )
+
+        self.assertIs(raised.exception, error)
+        telegram_bot.send_photo.assert_awaited_once()
+        self.assertEqual(
+            telegram_bot.send_photo.await_args.kwargs["photo"],
+            "https://example.test/original.jpg",
+        )
+        telegram_bot.send_message.assert_not_awaited()
+
     async def test_send_post_media_without_any_url_returns_false(self):
         message = AsyncMock()
         post = {"id": 1}
@@ -217,7 +261,7 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_post_media_downloads_photo_when_telegram_cannot_fetch_url(self):
         message = AsyncMock()
         message.reply_photo = AsyncMock(
-            side_effect=[Exception("Failed to get http url content"), None]
+            side_effect=[BadRequest("Failed to get http url content"), None]
         )
         post = {
             "id": 1,
@@ -245,7 +289,7 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_post_media_to_chat_downloads_photo_when_telegram_cannot_fetch_url(self):
         telegram_bot = AsyncMock()
         telegram_bot.send_photo = AsyncMock(
-            side_effect=[Exception("Wrong type of the web page content"), None]
+            side_effect=[BadRequest("Wrong type of the web page content"), None]
         )
         post = {
             "id": 1,
