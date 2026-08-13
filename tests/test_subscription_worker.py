@@ -197,7 +197,7 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
         mark_sent.assert_not_awaited()
         release_claim.assert_awaited_once_with(1, "tag", "token")
 
-    async def test_api_temporary_error_releases_claim_without_empty_backoff(self):
+    async def test_api_temporary_error_defers_claim_without_empty_backoff(self):
         app = SimpleNamespace(bot=object())
 
         with (
@@ -213,6 +213,11 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "mark_subscription_empty", AsyncMock()) as mark_empty,
             patch.object(bot, "update_subscription_time", AsyncMock()) as update_time,
             patch.object(bot, "mark_post_sent", AsyncMock()) as mark_sent,
+            patch.object(
+                bot,
+                "defer_subscription_after_transient_failure",
+                AsyncMock(return_value=True),
+            ) as defer_claim,
             patch.object(bot, "release_subscription_claim", AsyncMock()) as release_claim,
         ):
             await bot.process_one_subscription(app, (1, "tag", 10, 0))
@@ -220,7 +225,8 @@ class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):
         mark_empty.assert_not_awaited()
         update_time.assert_not_awaited()
         mark_sent.assert_not_awaited()
-        release_claim.assert_awaited_once_with(1, "tag", "token")
+        defer_claim.assert_awaited_once_with(1, "tag", "token")
+        release_claim.assert_not_awaited()
 
     async def test_scheduled_digest_with_partial_gif_webm_delivery_is_not_successful(self):
         app_bot = object()
