@@ -9,6 +9,7 @@ import tempfile
 from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
+from aiohttp.abc import AbstractResolver, ResolveResult
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
 from bot_delivery import execute_telegram_request
@@ -54,6 +55,10 @@ class FileDownloadLimitExceeded(PhotoDownloadLimitExceeded):
 
 class TotalDownloadLimitExceeded(PhotoDownloadLimitExceeded):
     pass
+
+
+class DeliveryPreconditionFailed(RuntimeError):
+    """The recipient or claim became invalid before a Telegram request."""
 
 
 @dataclass(slots=True)
@@ -169,6 +174,53 @@ def _is_public_ip(value: str) -> bool:
         return False
 
 
+class PublicPhotoResolver(AbstractResolver):
+    """Resolve once and give aiohttp only addresses already proven public.
+
+    The connector consumes these exact results, closing the validation/request
+    DNS-rebinding window without rewriting the URL hostname (and therefore
+    preserving the HTTP Host header, TLS SNI and certificate verification).
+    """
+
+    def __init__(self, resolver: AbstractResolver | None = None):
+        self._resolver = resolver or aiohttp.resolver.DefaultResolver()
+
+    async def resolve(
+        self,
+        host: str,
+        port: int = 0,
+        family: socket.AddressFamily = socket.AF_INET,
+    ) -> list[ResolveResult]:
+        addresses = await self._resolver.resolve(host, port, family)
+        if not addresses or any(not _is_public_ip(item["host"]) for item in addresses):
+            raise ValueError("Private or non-public photo host is not allowed")
+        return addresses
+
+    async def close(self) -> None:
+        await self._resolver.close()
+
+
+class PublicPhotoConnector(aiohttp.TCPConnector):
+    """Marker connector whose DNS results are validated before connection."""
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("resolver", PublicPhotoResolver())
+        kwargs.setdefault("use_dns_cache", False)
+        super().__init__(**kwargs)
+
+
+def create_public_photo_session(
+    *,
+    timeout: aiohttp.ClientTimeout | None = None,
+    headers: dict[str, str] | None = None,
+) -> aiohttp.ClientSession:
+    return aiohttp.ClientSession(
+        connector=PublicPhotoConnector(),
+        timeout=timeout,
+        headers=headers,
+    )
+
+
 async def _validate_public_photo_url(url: str):
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -183,14 +235,6 @@ async def _validate_public_photo_url(url: str):
         if not literal_ip.is_global:
             raise ValueError("Private or non-public photo host is not allowed")
         return
-    loop = asyncio.get_running_loop()
-    addresses = await loop.getaddrinfo(
-        parsed.hostname,
-        parsed.port or (443 if parsed.scheme == "https" else 80),
-        type=socket.SOCK_STREAM,
-    )
-    if not addresses or any(not _is_public_ip(item[4][0]) for item in addresses):
-        raise ValueError("Private or non-public photo host is not allowed")
 
 
 async def download_photo_to_path(
@@ -207,8 +251,21 @@ async def download_photo_to_path(
     timeout = aiohttp.ClientTimeout(total=PHOTO_DOWNLOAD_TIMEOUT_SECONDS)
     headers = {"User-Agent": PHOTO_DOWNLOAD_USER_AGENT}
     current_url = url
-    close_session = session is None
-    active_session = session or aiohttp.ClientSession(timeout=timeout, headers=headers)
+    # Never trust a caller-supplied ordinary ClientSession: its connector would
+    # resolve the hostname again without the public-address invariant.
+    supplied_session_is_safe = (
+        isinstance(session, aiohttp.ClientSession)
+        and isinstance(session.connector, PublicPhotoConnector)
+    )
+    use_injected_transport = session is not None and not isinstance(
+        session, aiohttp.ClientSession
+    )
+    if supplied_session_is_safe or use_injected_transport:
+        active_session = session
+        close_session = False
+    else:
+        active_session = create_public_photo_session(timeout=timeout, headers=headers)
+        close_session = True
     limiter = semaphore or global_download_semaphore
 
     try:
@@ -403,55 +460,79 @@ async def reply_downloaded_photo(message, url: str, caption: str, reply_markup, 
         photo.close()
 
 
-async def send_media_url(bot, chat_id: int, url: str, caption: str, reply_markup, has_spoiler: bool = False):
+async def _ensure_delivery_precondition(before_send) -> None:
+    if before_send is not None and not await before_send():
+        raise DeliveryPreconditionFailed("Delivery precondition is no longer valid")
+
+
+async def send_media_url(
+    bot, chat_id: int, url: str, caption: str, reply_markup,
+    has_spoiler: bool = False, before_send=None,
+):
     url_path = media_url_path_lower(url)
     if url_path.endswith((".mp4", ".webm")):
-        await execute_telegram_request(
-            lambda: bot.send_video(
+        async def operation():
+            await _ensure_delivery_precondition(before_send)
+            return await bot.send_video(
                 chat_id=chat_id,
                 video=url,
                 caption=caption if caption else None,
                 parse_mode="Markdown",
                 reply_markup=reply_markup,
                 has_spoiler=has_spoiler,
-            ),
+            )
+
+        await execute_telegram_request(
+            operation,
             operation_name="send_video",
             chat_id=chat_id,
         )
     elif url_path.endswith(".gif"):
-        await execute_telegram_request(
-            lambda: bot.send_animation(
+        async def operation():
+            await _ensure_delivery_precondition(before_send)
+            return await bot.send_animation(
                 chat_id=chat_id,
                 animation=url,
                 caption=caption if caption else None,
                 parse_mode="Markdown",
                 reply_markup=reply_markup,
                 has_spoiler=has_spoiler,
-            ),
+            )
+
+        await execute_telegram_request(
+            operation,
             operation_name="send_animation",
             chat_id=chat_id,
         )
     else:
-        await execute_telegram_request(
-            lambda: bot.send_photo(
+        async def operation():
+            await _ensure_delivery_precondition(before_send)
+            return await bot.send_photo(
                 chat_id=chat_id,
                 photo=url,
                 caption=caption if caption else None,
                 parse_mode="Markdown",
                 reply_markup=reply_markup,
                 has_spoiler=has_spoiler,
-            ),
+            )
+
+        await execute_telegram_request(
+            operation,
             operation_name="send_photo",
             chat_id=chat_id,
         )
     return True
 
 
-async def send_downloaded_photo(bot, chat_id: int, url: str, caption: str, reply_markup, has_spoiler: bool = False):
+async def send_downloaded_photo(
+    bot, chat_id: int, url: str, caption: str, reply_markup,
+    has_spoiler: bool = False, before_send=None,
+):
     photo = await _download_photo_file(url)
     seekable = _is_seekable_upload(photo)
 
     async def upload_photo():
+        await _ensure_delivery_precondition(before_send)
         if seekable:
             photo.seek(0)
         return await bot.send_photo(
@@ -488,15 +569,19 @@ async def _reply_text(message, text: str, **kwargs) -> bool:
         return False
 
 
-async def send_text_to_chat(bot, chat_id: int, **kwargs) -> bool:
+async def send_text_to_chat(bot, chat_id: int, *, before_send=None, **kwargs) -> bool:
+    async def operation():
+        await _ensure_delivery_precondition(before_send)
+        return await bot.send_message(chat_id=chat_id, **kwargs)
+
     try:
         await execute_telegram_request(
-            lambda: bot.send_message(chat_id=chat_id, **kwargs),
+            operation,
             operation_name="send_message",
             chat_id=chat_id,
         )
         return True
-    except RetryAfter:
+    except (RetryAfter, DeliveryPreconditionFailed):
         return False
 
 
@@ -614,6 +699,7 @@ async def send_post_media_to_chat(
     retries: int = 2,
     has_spoiler: bool = False,
     raise_on_timeout: bool = False,
+    before_send=None,
 ):
     reply_markup = keyboard
     candidates = get_media_url_candidates(post)
@@ -622,6 +708,7 @@ async def send_post_media_to_chat(
         await send_text_to_chat(
             bot,
             chat_id,
+            before_send=before_send,
             text=(
                 "⚠️ У этого поста нет сохранённой ссылки на файл. "
                 "Попробуйте открыть свежий пост или найти его через `/id`."
@@ -640,7 +727,8 @@ async def send_post_media_to_chat(
         for attempt in range(1, retries + 1):
             try:
                 sent = await send_media_url(
-                    bot, chat_id, media_url, caption, reply_markup, has_spoiler
+                    bot, chat_id, media_url, caption, reply_markup, has_spoiler,
+                    before_send,
                 )
                 if not sent:
                     return False
@@ -656,6 +744,8 @@ async def send_post_media_to_chat(
                 return False
             except TimedOut:
                 raise
+            except DeliveryPreconditionFailed:
+                return False
             except Exception as exc:
                 if _is_ambiguous_network_error(exc):
                     raise
@@ -671,7 +761,8 @@ async def send_post_media_to_chat(
                 if _telegram_url_fetch_failed(exc) and _is_downloadable_photo_url(media_url):
                     try:
                         sent = await send_downloaded_photo(
-                            bot, chat_id, media_url, caption, reply_markup, has_spoiler
+                            bot, chat_id, media_url, caption, reply_markup,
+                            has_spoiler, before_send,
                         )
                         if sent:
                             logger.info(
@@ -686,6 +777,8 @@ async def send_post_media_to_chat(
                         return False
                     except TimedOut:
                         raise
+                    except DeliveryPreconditionFailed:
+                        return False
                     except Exception as fallback_exc:
                         if _is_ambiguous_network_error(fallback_exc):
                             raise
@@ -711,6 +804,7 @@ async def send_post_media_to_chat(
     sent = await send_text_to_chat(
         bot,
         chat_id,
+        before_send=before_send,
         text=fallback,
         parse_mode="Markdown",
         reply_markup=reply_markup,

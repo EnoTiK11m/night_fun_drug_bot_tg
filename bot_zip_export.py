@@ -31,6 +31,7 @@ from bot_media import (
     FileDownloadLimitExceeded,
     TotalDownloadLimitExceeded,
     download_photo_to_path,
+    create_public_photo_session,
 )
 from bot_delivery import execute_telegram_request, telegram_rate_limiter
 
@@ -283,7 +284,7 @@ class ZipExportManager:
 
     def _default_session_factory(self) -> aiohttp.ClientSession:
         timeout = aiohttp.ClientTimeout(total=self._export_timeout_seconds)
-        return aiohttp.ClientSession(
+        return create_public_photo_session(
             timeout=timeout,
             headers={"User-Agent": "night-fun-drug-bot/1.0"},
         )

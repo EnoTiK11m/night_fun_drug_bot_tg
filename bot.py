@@ -223,6 +223,7 @@ from database import (
     save_delivery_failure,
     claim_delivery_failures,
     release_delivery_failure_claim,
+    renew_delivery_failure_claim_for_post,
     delete_delivery_failure_for_post,
     clear_delivery_failure_for_post,
     get_admin_database_stats,
@@ -1281,6 +1282,17 @@ DEFAULT_CAPTION_SETTINGS = {
 }
 
 
+async def mutate_user_settings(user_id: int, mutator) -> dict:
+    """Serialize a dependent settings mutation and persist only changed fields."""
+    async with guarded_user_state(user_id):
+        settings = normalize_feature_settings(await get_user_settings(user_id))
+        patch = dict(mutator(dict(settings)) or {})
+        if patch:
+            await save_user_settings(user_id, patch)
+            settings.update(patch)
+        return normalize_feature_settings(settings)
+
+
 def build_caption_settings_text(settings: dict) -> str:
     text = "📝 *Настройки описания картинок*\n\n"
 
@@ -1394,13 +1406,12 @@ async def safe_query_answer(query, text: str | None = None):
     )
 
 
-def is_access_allowed(update: Update) -> bool:
-    user = update.effective_user
-    chat = update.effective_chat
-    user_id = user.id if user else None
-    chat_id = chat.id if chat else None
-    chat_type = getattr(chat, "type", None)
-
+def is_recipient_allowed(
+    user_id: int | None,
+    chat_id: int | None = None,
+    chat_type: str | None = "private",
+) -> bool:
+    """Apply the incoming access policy to a prospective delivery recipient."""
     if user_id in ADMIN_USER_IDS:
         return True
     if chat_id in ALLOWED_CHAT_IDS:
@@ -1410,6 +1421,16 @@ def is_access_allowed(update: Update) -> bool:
     if chat_type in {"group", "supergroup", "channel"}:
         return ALLOW_GROUP_CHATS
     return True
+
+
+def is_access_allowed(update: Update) -> bool:
+    user = update.effective_user
+    chat = update.effective_chat
+    return is_recipient_allowed(
+        user.id if user else None,
+        chat.id if chat else None,
+        getattr(chat, "type", None),
+    )
 
 
 async def send_access_denied(update: Update):
@@ -1777,9 +1798,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not preset:
             await query.message.reply_text("Сохранённый запрос не найден.")
         else:
-            settings = await get_user_settings(user_id)
-            settings.update(preset["settings"])
-            await save_user_settings(user_id, settings)
+            await save_user_settings(user_id, preset["settings"])
             schedule_background_task(
                 context,
                 send_search_gallery(
@@ -1835,11 +1854,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("rec_hide_"):
         tag = get_callback_payload("rec_hide", data)
         if tag:
-            settings = await get_user_settings(user_id)
-            excluded = set(str(settings.get("recommendation_excluded_tags", "")).split())
-            excluded.add(tag)
-            settings["recommendation_excluded_tags"] = " ".join(sorted(excluded)[:100])
-            await save_user_settings(user_id, settings)
+            def exclude_recommendation_tag(settings):
+                excluded = set(
+                    str(settings.get("recommendation_excluded_tags", "")).split()
+                )
+                excluded.add(tag)
+                return {
+                    "recommendation_excluded_tags": " ".join(
+                        sorted(excluded)[:100]
+                    )
+                }
+
+            await mutate_user_settings(user_id, exclude_recommendation_tag)
             await query.message.reply_text(f"🚫 `{md_code(tag)}` исключён из рекомендаций.", parse_mode="Markdown")
 
     elif data.startswith("similar_"):
@@ -2036,10 +2062,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "settings_spoiler":
-        settings = normalize_feature_settings(await get_user_settings(user_id))
         values = ["off", "explicit", "all"]
-        settings["spoiler_mode"] = values[(values.index(settings["spoiler_mode"]) + 1) % len(values)]
-        await save_user_settings(user_id, settings)
+        settings = await mutate_user_settings(
+            user_id,
+            lambda current: {
+                "spoiler_mode": values[
+                    (values.index(current["spoiler_mode"]) + 1) % len(values)
+                ]
+            },
+        )
         labels = {"off": "выключены", "explicit": "только explicit", "all": "для всех медиа"}
         await query.message.reply_text(
             f"🙈 Спойлеры: {labels[settings['spoiler_mode']]}",
@@ -2116,11 +2147,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sub_query:
             await show_subscription_options(query.message, user_id, sub_query)
 
-    elif data.startswith((
-        "subopt_rating_", "subopt_type_", "subopt_orientation_", "subopt_resolution_",
-        "subopt_quality_", "subopt_blacklist_", "subopt_digest_",
-    )):
-        action, token = data.split("_", 2)[1:]
+    elif data.startswith(SUBSCRIPTION_OPTION_CALLBACK_PREFIXES):
+        parsed_option = parse_subscription_option_callback(data)
+        if parsed_option is None:
+            await query.message.reply_text("Настройки подписки устарели.")
+            return
+        action, token = parsed_option
         sub_query = get_callback_payload_by_token("sub_options", token)
         if not sub_query:
             await query.message.reply_text("Настройки подписки устарели.")
@@ -2453,24 +2485,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data.startswith("gallery_cycle_") or data.startswith("gallery_size_"):
-        settings = normalize_feature_settings(await get_user_settings(user_id))
-        if data == "gallery_cycle_sort":
-            values = ["random", "new", "popular"]
-            settings["gallery_sort"] = values[(values.index(settings["gallery_sort"]) + 1) % len(values)]
-        elif data == "gallery_cycle_rating":
-            values = ["all", "s", "q", "e"]
-            settings["rating_filter"] = values[(values.index(settings["rating_filter"]) + 1) % len(values)]
-        elif data == "gallery_cycle_type":
-            values = ["all", "images", "animations", "videos"]
-            settings["media_type"] = values[(values.index(settings["media_type"]) + 1) % len(values)]
-        elif data == "gallery_cycle_orientation":
-            values = ["any", "portrait", "landscape", "square"]
-            settings["orientation"] = values[(values.index(settings["orientation"]) + 1) % len(values)]
-        elif data == "gallery_size_down":
-            settings["gallery_size"] = max(2, settings["gallery_size"] - 1)
-        elif data == "gallery_size_up":
-            settings["gallery_size"] = min(10, settings["gallery_size"] + 1)
-        await save_user_settings(user_id, settings)
+        def mutate_gallery(current):
+            if data == "gallery_cycle_sort":
+                values = ["random", "new", "popular"]
+                return {"gallery_sort": values[(values.index(current["gallery_sort"]) + 1) % len(values)]}
+            if data == "gallery_cycle_rating":
+                values = ["all", "s", "q", "e"]
+                return {"rating_filter": values[(values.index(current["rating_filter"]) + 1) % len(values)]}
+            if data == "gallery_cycle_type":
+                values = ["all", "images", "animations", "videos"]
+                return {"media_type": values[(values.index(current["media_type"]) + 1) % len(values)]}
+            if data == "gallery_cycle_orientation":
+                values = ["any", "portrait", "landscape", "square"]
+                return {"orientation": values[(values.index(current["orientation"]) + 1) % len(values)]}
+            if data == "gallery_size_down":
+                return {"gallery_size": max(2, current["gallery_size"] - 1)}
+            return {"gallery_size": min(10, current["gallery_size"] + 1)}
+
+        settings = await mutate_user_settings(user_id, mutate_gallery)
         await query.edit_message_text(
             gallery_settings_text(settings),
             reply_markup=get_gallery_settings_keyboard(settings),
@@ -2487,15 +2519,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "quality_cycle_mode" or data.startswith("quality_max_"):
-        settings = normalize_feature_settings(await get_user_settings(user_id))
-        if data == "quality_cycle_mode":
-            values = ["auto", "preview", "sample", "original"]
-            settings["quality_mode"] = values[(values.index(settings["quality_mode"]) + 1) % len(values)]
-        elif data == "quality_max_down":
-            settings["max_file_mb"] = max(1, settings["max_file_mb"] - 1)
-        elif data == "quality_max_up":
-            settings["max_file_mb"] = min(50, settings["max_file_mb"] + 1)
-        await save_user_settings(user_id, settings)
+        def mutate_quality(current):
+            if data == "quality_cycle_mode":
+                values = ["auto", "preview", "sample", "original"]
+                return {"quality_mode": values[(values.index(current["quality_mode"]) + 1) % len(values)]}
+            if data == "quality_max_down":
+                return {"max_file_mb": max(1, current["max_file_mb"] - 1)}
+            return {"max_file_mb": min(50, current["max_file_mb"] + 1)}
+
+        settings = await mutate_user_settings(user_id, mutate_quality)
         await query.edit_message_text(
             quality_settings_text(settings),
             reply_markup=get_quality_settings_keyboard(settings),
@@ -2524,11 +2556,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "settings_interface_mode":
-        settings = normalize_feature_settings(await get_user_settings(user_id))
-        settings["interface_mode"] = (
-            "advanced" if settings["interface_mode"] == "simple" else "simple"
+        settings = await mutate_user_settings(
+            user_id,
+            lambda current: {
+                "interface_mode": (
+                    "advanced"
+                    if current["interface_mode"] == "simple"
+                    else "simple"
+                )
+            },
         )
-        await save_user_settings(user_id, settings)
         label = "расширенный" if settings["interface_mode"] == "advanced" else "простой"
         await query.edit_message_text(
             f"🧭 Режим интерфейса: {label}.\n\n"
@@ -2562,18 +2599,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("toggle_"):
         setting_name = data.replace("toggle_", "")
+        if setting_name not in DEFAULT_CAPTION_SETTINGS:
+            await query.message.reply_text("Настройка устарела.")
+            return
 
-        # Получаем текущие настройки
-        settings = await get_user_settings(user_id)
-        current_value = settings.get(setting_name, True)
-
-        # Обновляем настройку
-        settings[setting_name] = not current_value
-
-        # Если отключаем описание полностью, выключаем все остальные настройки
-        if setting_name == "show_caption" and not current_value:
-            settings.update(
-                {
+        def mutate_caption(current):
+            current_value = bool(current.get(setting_name, True))
+            patch = {setting_name: not current_value}
+            if setting_name == "show_caption" and current_value:
+                patch.update({
                     "show_search_query": False,
                     "show_subscription_label": False,
                     "show_id": False,
@@ -2581,16 +2615,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "show_rating": False,
                     "show_tags": False,
                     "show_tags_button": False,
-                }
-            )
-        # Если включаем описание, включаем основные настройки
-        elif setting_name == "show_caption" and current_value:
-            settings["show_id"] = True
-            settings["show_tags"] = True
-            settings["show_tags_button"] = True
+                })
+            elif setting_name == "show_caption" and not current_value:
+                patch.update({
+                    "show_id": True,
+                    "show_tags": True,
+                    "show_tags_button": True,
+                })
+            return patch
 
-        # Обновляем сообщение
-        await save_user_settings(user_id, settings)
+        settings = await mutate_user_settings(user_id, mutate_caption)
 
         text = build_caption_settings_text(settings)
         keyboard = await get_caption_settings_keyboard(user_id)
@@ -3373,6 +3407,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def select_post_matching_preferences(
+    result: dict | None,
+    settings: dict,
+    fetch_replacement,
+    excluded_post_ids: set[int],
+    *,
+    max_replacements: int = 4,
+) -> dict | None:
+    """Return only a matching post, including after the final retry."""
+    for attempt in range(max_replacements + 1):
+        if not result or post_matches_preferences(result, settings):
+            return result
+        try:
+            excluded_post_ids.add(int(result.get("id")))
+        except (TypeError, ValueError):
+            pass
+        if attempt == max_replacements:
+            break
+        result = await fetch_replacement()
+    return None
+
+
 async def send_random_image(
     message, user_id: int, *, expected_generation: int | None = None
 ):
@@ -3398,14 +3454,12 @@ async def send_random_image(
     try:
         result = await api.get_global_random_image(blacklist, excluded_post_ids)
         filter_settings = normalize_feature_settings(settings)
-        filter_attempts = 0
-        while result and not post_matches_preferences(result, filter_settings) and filter_attempts < 4:
-            try:
-                excluded_post_ids.add(int(result.get("id")))
-            except (TypeError, ValueError):
-                pass
-            result = await api.get_global_random_image(blacklist, excluded_post_ids)
-            filter_attempts += 1
+        result = await select_post_matching_preferences(
+            result,
+            filter_settings,
+            lambda: api.get_global_random_image(blacklist, excluded_post_ids),
+            excluded_post_ids,
+        )
         logger.info(
             "Random post source=api user=%s post=%s elapsed=%.3fs",
             user_id,
@@ -3434,7 +3488,7 @@ async def send_random_image(
             time.monotonic() - started_at,
         )
         await message.reply_text(
-            "❌ Не удалось найти случайную картинку с учётом чёрного списка.",
+            "❌ Не удалось найти случайную картинку с учётом чёрного списка и фильтров.",
             reply_markup=get_main_keyboard(),
         )
         return False
@@ -3510,23 +3564,23 @@ async def send_image(
         if is_more:
             result = await api.get_next_image(user_id, tags, blacklist, excluded_post_ids)
             filter_settings = normalize_feature_settings(settings)
-            filter_attempts = 0
-            while result and not post_matches_preferences(result, filter_settings) and filter_attempts < 4:
-                result = await api.get_next_image(
+            result = await select_post_matching_preferences(
+                result,
+                filter_settings,
+                lambda: api.get_next_image(
                     user_id, tags, blacklist, excluded_post_ids
-                )
-                filter_attempts += 1
+                ),
+                excluded_post_ids,
+            )
         else:
             result = await api.get_random_image(tags, blacklist, excluded_post_ids)
             filter_settings = normalize_feature_settings(settings)
-            filter_attempts = 0
-            while result and not post_matches_preferences(result, filter_settings) and filter_attempts < 4:
-                try:
-                    excluded_post_ids.add(int(result.get("id")))
-                except (TypeError, ValueError):
-                    pass
-                result = await api.get_random_image(tags, blacklist, excluded_post_ids)
-                filter_attempts += 1
+            result = await select_post_matching_preferences(
+                result,
+                filter_settings,
+                lambda: api.get_random_image(tags, blacklist, excluded_post_ids),
+                excluded_post_ids,
+            )
             # Сохраняем историю поиска для кнопки "ещё"
             if result:
                 await api.save_search_state(user_id, tags, blacklist, result.get("id"))
@@ -3640,6 +3694,7 @@ async def send_post_media(
 async def send_post_media_to_chat(
     bot, chat_id: int, post: dict, caption: str = "", keyboard=None,
     settings: dict | None = None, raise_on_timeout: bool = False,
+    before_send=None,
 ):
     if settings:
         post = prepare_post_quality(post, normalize_feature_settings(settings))
@@ -3652,6 +3707,7 @@ async def send_post_media_to_chat(
         retries=MEDIA_SEND_RETRIES,
         has_spoiler=should_spoiler(settings, post),
         raise_on_timeout=raise_on_timeout,
+        before_send=before_send,
     )
 
 
@@ -4653,6 +4709,30 @@ def similar_query_from_post(post: dict) -> str:
     return " ".join(tags[:4])
 
 
+SUBSCRIPTION_OPTION_ACTIONS = (
+    "rating", "type", "orientation", "resolution", "quality", "blacklist", "digest",
+)
+SUBSCRIPTION_OPTION_CALLBACK_PREFIXES = tuple(
+    f"subopt_{action}_" for action in SUBSCRIPTION_OPTION_ACTIONS
+)
+
+
+def subscription_option_callback(action: str, token: str) -> str:
+    if action not in SUBSCRIPTION_OPTION_ACTIONS or not token:
+        raise ValueError("Invalid subscription option callback")
+    return f"subopt_{action}_{token}"
+
+
+def parse_subscription_option_callback(data: str) -> tuple[str, str] | None:
+    parts = data.split("_", 2)
+    if len(parts) != 3 or parts[0] != "subopt":
+        return None
+    action, token = parts[1:]
+    if action not in SUBSCRIPTION_OPTION_ACTIONS or not token:
+        return None
+    return action, token
+
+
 async def show_subscription_options(message, user_id: int, sub_query: str):
     options = await get_subscription_options(user_id, sub_query)
     rating = options.get("rating_filter", "all")
@@ -4662,22 +4742,26 @@ async def show_subscription_options(message, user_id: int, sub_query: str):
     quality = options.get("quality_mode", "auto")
     extra_blacklist = str(options.get("extra_blacklist", ""))
     digest = options.get("digest_mode", "instant")
-    token = store_callback_payload("sub_options", sub_query)
+    stored_callback = store_callback_payload("sub_options", sub_query)
+    callback_prefix = "sub_options_"
+    if not stored_callback.startswith(callback_prefix):
+        raise RuntimeError("Unexpected subscription callback payload format")
+    token = stored_callback[len(callback_prefix):]
     await message.reply_text(
         f"🎛 *Фильтры подписки* `{md_code(sub_query)}`",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"Rating: {rating}", callback_data=f"subopt_rating_{token}")],
-            [InlineKeyboardButton(f"Тип: {media_type}", callback_data=f"subopt_type_{token}")],
-            [InlineKeyboardButton(f"Ориентация: {orientation}", callback_data=f"subopt_orientation_{token}")],
-            [InlineKeyboardButton(f"Разрешение: {resolution}", callback_data=f"subopt_resolution_{token}")],
-            [InlineKeyboardButton(f"Качество: {quality}", callback_data=f"subopt_quality_{token}")],
+            [InlineKeyboardButton(f"Rating: {rating}", callback_data=subscription_option_callback("rating", token))],
+            [InlineKeyboardButton(f"Тип: {media_type}", callback_data=subscription_option_callback("type", token))],
+            [InlineKeyboardButton(f"Ориентация: {orientation}", callback_data=subscription_option_callback("orientation", token))],
+            [InlineKeyboardButton(f"Разрешение: {resolution}", callback_data=subscription_option_callback("resolution", token))],
+            [InlineKeyboardButton(f"Качество: {quality}", callback_data=subscription_option_callback("quality", token))],
             [InlineKeyboardButton(
                 f"Чёрный список: {extra_blacklist[:20] or 'общий'}",
-                callback_data=f"subopt_blacklist_{token}",
+                callback_data=subscription_option_callback("blacklist", token),
             )],
             [InlineKeyboardButton(
                 "📨 Дайджест" if digest == "digest" else "⚡ Сразу",
-                callback_data=f"subopt_digest_{token}",
+                callback_data=subscription_option_callback("digest", token),
             )],
             [InlineKeyboardButton("◀️ Подписки", callback_data="sub_manage")],
         ]),
@@ -4848,6 +4932,9 @@ async def send_digest_posts(
     if not posts:
         await message.reply_text("📨 Дайджест пока пуст.")
         return result
+    if not is_recipient_allowed(user_id, user_id, "private"):
+        result.add("failed_ids", [digest_item_key(post) for post in posts[:10]])
+        return result
     settings = normalize_feature_settings(await get_user_settings(user_id))
     album_posts, standalone_posts = partition_digest_posts(posts, settings)
     sequential_posts = list(standalone_posts)
@@ -4867,6 +4954,8 @@ async def send_digest_posts(
         try:
             async def send_album():
                 nonlocal request_started
+                if not is_recipient_allowed(user_id, user_id, "private"):
+                    return False
                 if lease is not None and not await lease.ensure_owned():
                     return False
                 request_started = True
@@ -4908,12 +4997,18 @@ async def send_digest_posts(
     try:
         for index, post in enumerate(sequential_posts):
             key = digest_item_key(post)
+            if not is_recipient_allowed(user_id, user_id, "private"):
+                result.add("failed_ids", [
+                    digest_item_key(item) for item in sequential_posts[index:]
+                ])
+                return result
             if lease is not None and not await lease.ensure_owned():
                 result.add("failed_ids", [
                     digest_item_key(item) for item in sequential_posts[index:]
                 ])
                 return result
             in_flight = [key]
+            keyboard = None
             try:
                 keyboard = get_subscription_image_keyboard(
                     post.get("id", 0),
@@ -4931,8 +5026,28 @@ async def send_digest_posts(
                 result.add("ambiguous_ids", [key])
             except NetworkError as exc:
                 if isinstance(exc, BadRequest):
-                    raise
+                    result.add("failed_ids", [
+                        digest_item_key(item) for item in sequential_posts[index:]
+                    ])
+                    if keyboard is not None:
+                        revoke_unsent_keyboard_callbacks(keyboard)
+                    logger.warning(
+                        "Digest item rejected user=%s key=%s: %s",
+                        user_id, key, exc,
+                    )
+                    return result
                 result.add("ambiguous_ids", [key])
+            except Exception as exc:
+                result.add("failed_ids", [
+                    digest_item_key(item) for item in sequential_posts[index:]
+                ])
+                if keyboard is not None:
+                    revoke_unsent_keyboard_callbacks(keyboard)
+                logger.warning(
+                    "Digest item delivery failed user=%s key=%s type=%s: %s",
+                    user_id, key, type(exc).__name__, exc,
+                )
+                return result
             else:
                 result.add("delivered_ids" if delivered else "failed_ids", [key])
                 if not delivered:
@@ -4949,6 +5064,9 @@ async def send_digest_to_chat(
 ) -> DigestDeliveryResult:
     result = DigestDeliveryResult()
     if not posts:
+        return result
+    if not is_recipient_allowed(user_id, user_id, "private"):
+        result.add("failed_ids", [digest_item_key(post) for post in posts[:10]])
         return result
     settings = normalize_feature_settings(await get_user_settings(user_id))
     album_posts, standalone_posts = partition_digest_posts(posts, settings)
@@ -4973,6 +5091,8 @@ async def send_digest_to_chat(
             in_flight = album_item_keys
             async def send_album():
                 nonlocal request_started
+                if not is_recipient_allowed(user_id, user_id, "private"):
+                    return False
                 if lease is not None and not await lease.ensure_owned():
                     return False
                 request_started = True
@@ -5017,13 +5137,24 @@ async def send_digest_to_chat(
     try:
         for index, post in enumerate(sequential_posts):
             key = digest_item_key(post)
+            if not is_recipient_allowed(user_id, user_id, "private"):
+                result.add("failed_ids", [
+                    digest_item_key(item) for item in sequential_posts[index:]
+                ])
+                return result
             if lease is not None and not await lease.ensure_owned():
                 result.add("failed_ids", [
                     digest_item_key(item) for item in sequential_posts[index:]
                 ])
                 return result
             in_flight = [key]
+            keyboard = None
             try:
+                async def digest_delivery_allowed():
+                    if not is_recipient_allowed(user_id, user_id, "private"):
+                        return False
+                    return lease is None or await lease.ensure_owned()
+
                 keyboard = get_subscription_image_keyboard(
                     post.get("id", 0),
                     side_effect_callback=subscription_callback_issuer_for(user_id),
@@ -5036,13 +5167,34 @@ async def send_digest_to_chat(
                     keyboard=keyboard,
                     settings=settings,
                     raise_on_timeout=True,
+                    before_send=digest_delivery_allowed,
                 )
             except TimedOut:
                 result.add("ambiguous_ids", [key])
             except NetworkError as exc:
                 if isinstance(exc, BadRequest):
-                    raise
+                    result.add("failed_ids", [
+                        digest_item_key(item) for item in sequential_posts[index:]
+                    ])
+                    if keyboard is not None:
+                        revoke_unsent_keyboard_callbacks(keyboard)
+                    logger.warning(
+                        "Scheduled digest item rejected user=%s key=%s: %s",
+                        user_id, key, exc,
+                    )
+                    return result
                 result.add("ambiguous_ids", [key])
+            except Exception as exc:
+                result.add("failed_ids", [
+                    digest_item_key(item) for item in sequential_posts[index:]
+                ])
+                if keyboard is not None:
+                    revoke_unsent_keyboard_callbacks(keyboard)
+                logger.warning(
+                    "Scheduled digest item delivery failed user=%s key=%s type=%s: %s",
+                    user_id, key, type(exc).__name__, exc,
+                )
+                return result
             else:
                 result.add("delivered_ids" if delivered else "failed_ids", [key])
                 if not delivered:
@@ -5303,10 +5455,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) != 2 or not all(part.isdigit() for part in parts):
             await update.message.reply_text("❌ Формат: `1920x1080`.", parse_mode="Markdown")
         else:
-            settings = await get_user_settings(user_id)
-            settings["min_width"] = min(int(parts[0]), 10000)
-            settings["min_height"] = min(int(parts[1]), 10000)
-            await save_user_settings(user_id, settings)
+            settings = await mutate_user_settings(
+                user_id,
+                lambda _current: {
+                    "min_width": min(int(parts[0]), 10000),
+                    "min_height": min(int(parts[1]), 10000),
+                },
+            )
             await update.message.reply_text(
                 gallery_settings_text(settings),
                 reply_markup=get_gallery_settings_keyboard(normalize_feature_settings(settings)),
@@ -5681,22 +5836,42 @@ async def retry_failed_command(update: Update, context: ContextTypes.DEFAULT_TYP
     delivered = 0
     try:
         for failure in failures:
+            recipient_id = failure["user_id"]
+            if not is_recipient_allowed(recipient_id, recipient_id, "private"):
+                logger.info(
+                    "Skipping failed delivery after access revocation user=%s post=%s",
+                    recipient_id,
+                    failure["post_id"],
+                )
+                continue
+
+            async def retry_precondition(failure=failure):
+                recipient_id = failure["user_id"]
+                if not is_recipient_allowed(recipient_id, recipient_id, "private"):
+                    return False
+                return await renew_delivery_failure_claim_for_post(
+                    recipient_id,
+                    failure["post_id"],
+                    claim_token,
+                )
+
             keyboard = get_subscription_image_keyboard(
                 failure["post"].get("id", 0),
                 side_effect_callback=subscription_callback_issuer_for(
-                    failure["user_id"]
+                    recipient_id
                 ),
             )
             ok = await send_post_media_to_chat(
                 context.bot,
-                failure["user_id"],
+                recipient_id,
                 failure["post"],
                 failure["caption"],
                 keyboard=keyboard,
+                before_send=retry_precondition,
             )
             if ok and claim_token:
                 acknowledged = await delete_delivery_failure_for_post(
-                    failure["user_id"], failure["post_id"], claim_token
+                    recipient_id, failure["post_id"], claim_token
                 )
                 delivered += int(acknowledged)
             elif not ok:
@@ -6043,6 +6218,15 @@ async def process_one_subscription(app, subscription):
     if not processing_token:
         return False
 
+    if not is_recipient_allowed(user_id, user_id, "private"):
+        logger.info(
+            "Skipping subscription after access revocation user=%s query=%r",
+            user_id,
+            query,
+        )
+        await release_subscription_claim(user_id, query, processing_token)
+        return False
+
     result = None
     caption = ""
     claim_completed = False
@@ -6097,8 +6281,18 @@ async def process_one_subscription(app, subscription):
                 caption = await build_caption(settings, result, query, True)
 
             delivery_started = True
+
+            async def subscription_delivery_allowed():
+                return is_recipient_allowed(user_id, user_id, "private")
+
             delivered = await send_post_media_to_chat(
-                app.bot, user_id, result, caption, keyboard, settings=settings
+                app.bot,
+                user_id,
+                result,
+                caption,
+                keyboard,
+                settings=settings,
+                before_send=subscription_delivery_allowed,
             )
             if delivered:
                 runtime_metrics.increment("subscription_delivered")
@@ -6131,9 +6325,13 @@ async def process_one_subscription(app, subscription):
             backoff_minutes,
         )
         if should_notify:
+            async def subscription_notice_allowed():
+                return is_recipient_allowed(user_id, user_id, "private")
+
             await send_text_to_chat(
                 app.bot,
                 user_id,
+                before_send=subscription_notice_allowed,
                 text=(
                     f"🕒 По подписке `{md_code(query)}` пока нет новых постов.\n\n"
                     f"Я продолжу проверять ее реже: следующая проверка примерно через {backoff_minutes} мин. "
@@ -6308,6 +6506,14 @@ async def process_subscriptions(app):
                 for subscriptions in subscriptions_by_user.values()
             ))
             for digest_user_id in await get_due_digest_users():
+                if not is_recipient_allowed(
+                    digest_user_id, digest_user_id, "private"
+                ):
+                    logger.info(
+                        "Skipping digest after access revocation user=%s",
+                        digest_user_id,
+                    )
+                    continue
                 claim_token, digest_posts = await claim_subscription_digest(
                     digest_user_id, 10
                 )

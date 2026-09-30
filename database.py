@@ -71,6 +71,9 @@ DEFAULT_USER_SETTINGS = {
     "read_later_days": 30,
     "interface_mode": "simple",
 }
+USER_SETTING_FIELDS = frozenset(DEFAULT_USER_SETTINGS) | {
+    "recommendation_excluded_tags",
+}
 
 BLACKLIST_PRESETS = {
     "animated": {"animated", "gif", "webm"},
@@ -1458,6 +1461,12 @@ async def get_user_settings(user_id: int) -> Dict[str, Any]:
 
 
 async def save_user_settings(user_id: int, settings: Dict[str, Any]):
+    """Atomically merge a whitelisted partial settings patch."""
+    unknown_fields = set(settings) - USER_SETTING_FIELDS
+    if unknown_fields:
+        raise ValueError(
+            f"Unsupported user setting fields: {', '.join(sorted(unknown_fields))}"
+        )
     async with connect_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         try:
@@ -2839,6 +2848,27 @@ async def release_delivery_failure_claim(claim_token: str) -> int:
         """, (claim_token,))
         await db.commit()
         return max(0, cursor.rowcount)
+
+
+async def renew_delivery_failure_claim_for_post(
+    user_id: int,
+    post_id: int,
+    claim_token: str,
+    lease_minutes: int = DELIVERY_FAILURE_CLAIM_MINUTES,
+) -> bool:
+    """Extend a still-owned item lease immediately before external delivery."""
+    bounded_lease = max(1, min(int(lease_minutes), 60))
+    async with connect_db() as db:
+        cursor = await db.execute("""
+            UPDATE delivery_failures
+            SET claimed_at = CURRENT_TIMESTAMP,
+                claim_until = datetime('now', '+' || ? || ' minutes')
+            WHERE user_id = ? AND post_id = ? AND claim_token = ?
+              AND claim_until IS NOT NULL
+              AND datetime(claim_until) > datetime('now')
+        """, (bounded_lease, user_id, post_id, claim_token))
+        await db.commit()
+        return cursor.rowcount == 1
 
 
 async def delete_delivery_failure_for_post(

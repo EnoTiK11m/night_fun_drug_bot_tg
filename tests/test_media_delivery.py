@@ -1,9 +1,13 @@
 import asyncio
 import io
 import logging
+import socket
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import aiohttp
 import bot
 import bot_media
 from bot_delivery import (
@@ -38,6 +42,18 @@ class NonSeekableUpload:
     def close(self):
         self.closed = True
         self._buffer.close()
+
+
+def resolved(host: str, port: int = 443):
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    return {
+        "hostname": "media.example",
+        "host": host,
+        "port": port,
+        "family": family,
+        "proto": socket.IPPROTO_TCP,
+        "flags": 0,
+    }
 
 
 class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -142,6 +158,109 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 "https://user:password@1.1.1.1/image.jpg"
             )
         await bot_media._validate_public_photo_url("https://1.1.1.1/image.jpg")
+
+    async def test_public_photo_resolver_accepts_public_dns_results(self):
+        delegate = AsyncMock()
+        delegate.resolve = AsyncMock(
+            return_value=[resolved("1.1.1.1"), resolved("2606:4700:4700::1111")]
+        )
+        delegate.close = AsyncMock()
+        resolver = bot_media.PublicPhotoResolver(delegate)
+
+        result = await resolver.resolve("media.example", 443)
+
+        self.assertEqual([item["host"] for item in result], ["1.1.1.1", "2606:4700:4700::1111"])
+        delegate.resolve.assert_awaited_once()
+
+    async def test_public_photo_resolver_rejects_every_non_public_address_class(self):
+        blocked = (
+            "127.0.0.1", "10.0.0.1", "169.254.169.254", "0.0.0.0",
+            "100.64.0.1", "::1", "fc00::1", "fe80::1",
+        )
+        for address in blocked:
+            with self.subTest(address=address):
+                delegate = AsyncMock()
+                delegate.resolve = AsyncMock(return_value=[resolved(address)])
+                delegate.close = AsyncMock()
+                with self.assertRaisesRegex(ValueError, "non-public"):
+                    await bot_media.PublicPhotoResolver(delegate).resolve(
+                        "media.example", 443
+                    )
+
+    async def test_public_photo_resolver_rejects_mixed_public_private_answers(self):
+        delegate = AsyncMock()
+        delegate.resolve = AsyncMock(
+            return_value=[resolved("1.1.1.1"), resolved("127.0.0.1")]
+        )
+        delegate.close = AsyncMock()
+        with self.assertRaisesRegex(ValueError, "non-public"):
+            await bot_media.PublicPhotoResolver(delegate).resolve("media.example", 443)
+
+    async def test_redirect_to_private_literal_is_rejected_before_second_request(self):
+        class RedirectResponse:
+            status = 302
+            headers = {"Location": "http://127.0.0.1/private.jpg"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class InjectedSession:
+            closed = False
+
+            def __init__(self):
+                self.calls = []
+
+            def get(self, url, **_kwargs):
+                self.calls.append(url)
+                return RedirectResponse()
+
+        session = InjectedSession()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "non-public"):
+                await bot_media.download_photo_to_path(
+                    "https://1.1.1.1/photo.jpg",
+                    str(Path(directory) / "download"),
+                    session=session,
+                )
+        self.assertEqual(session.calls, ["https://1.1.1.1/photo.jpg"])
+
+    async def test_download_session_uses_pinned_public_resolver_without_dns_cache(self):
+        session = bot_media.create_public_photo_session()
+        try:
+            self.assertIsInstance(session.connector, bot_media.PublicPhotoConnector)
+            self.assertIsInstance(session.connector._resolver, bot_media.PublicPhotoResolver)
+            self.assertFalse(session.connector.use_dns_cache)
+        finally:
+            await session.close()
+
+    async def test_plain_external_client_session_cannot_bypass_safe_connector(self):
+        class MarkerSession:
+            closed = False
+
+            def get(self, *_args, **_kwargs):
+                raise RuntimeError("safe connector selected")
+
+            async def close(self):
+                self.closed = True
+
+        external = aiohttp.ClientSession()
+        marker = MarkerSession()
+        try:
+            with tempfile.TemporaryDirectory() as directory, patch.object(
+                bot_media, "create_public_photo_session", return_value=marker
+            ):
+                with self.assertRaisesRegex(RuntimeError, "safe connector selected"):
+                    await bot_media.download_photo_to_path(
+                        "https://1.1.1.1/photo.jpg",
+                        str(Path(directory) / "download"),
+                        session=external,
+                    )
+            self.assertTrue(marker.closed)
+        finally:
+            await external.close()
 
     async def test_send_post_media_tries_sample_url_after_file_url_failure(self):
         message = AsyncMock()

@@ -6,8 +6,11 @@ __pycache__/
 *.py[cod]
 logs/
 data/
+backups/
 bot_data.db
 bot_data.db-*
+*.db
+*.db-*
 .pytest_cache/
 .coverage
 .venv/
@@ -18,4 +21,6 @@ env/
 *.tmp
 *.bak
 *.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
