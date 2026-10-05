@@ -214,7 +214,7 @@ API credentials are available in the service account settings.
 ### 4. Start the bot
 
 ```bash
-python bot.py
+python -m app.main
 ```
 
 The SQLite database and required tables are created automatically on first run.
@@ -229,7 +229,10 @@ All settings are read from environment variables or `.env`.
 | `API_USER_ID` | yes | — | Rule34 API user ID |
 | `API_KEY` | yes | — | Rule34 API key |
 | `SEARCH_COOLDOWN_SECONDS` | no | `3` | Delay between user searches |
-| `SUBSCRIPTION_CHECK_INTERVAL_SECONDS` | no | `120` | Subscription scan interval; minimum 30 seconds |
+| `SUBSCRIPTION_CHECK_INTERVAL_SECONDS` | No | `5` | Scheduler polling, 1-10 seconds |
+| `SUBSCRIPTION_MIN_INTERVAL_SECONDS` | No | `30` | Minimum subscription interval |
+| `RULE34_API_REQUESTS_PER_WINDOW` | No | `55` | Shared quota, hard maximum 60 |
+| `RULE34_API_WINDOW_SECONDS` | No | `60` | Rolling window, at least 60 seconds |
 | `SUBSCRIPTION_MAX_POSTS_PER_USER_PASS` | no | `45` | Maximum subscriptions processed per user pass, from 1 to 45 |
 | `SUBSCRIPTION_MAX_TOTAL` | no | `20` | Maximum subscriptions per user, including paused ones |
 | `SUBSCRIPTION_MAX_ACTIVE` | no | `10` | Maximum simultaneously active subscriptions per user |
@@ -356,22 +359,22 @@ policy, or another process manager.
 
 ## Project Structure
 
-| Path | Responsibility |
-| --- | --- |
-| [`bot.py`](bot.py) | Telegram handlers, user flows, and background tasks |
-| [`api_handler.py`](api_handler.py) | Asynchronous Rule34 API client, pagination, and autocomplete |
-| [`database.py`](database.py) | SQLite schema and migrations, settings, cache, subscriptions, and favorites |
-| [`bot_media.py`](bot_media.py) | Secure media delivery, fallback URLs, and retries |
-| [`bot_delivery.py`](bot_delivery.py) | Delivery rate limiting and Telegram cooldowns |
-| [`bot_features.py`](bot_features.py) | Gallery filters, quality selection, and runtime metrics |
-| [`bot_keyboards.py`](bot_keyboards.py) | Persistent and inline keyboards |
-| [`bot_formatting.py`](bot_formatting.py) | Captions, Markdown, and data formatting |
-| [`bot_state.py`](bot_state.py) | Temporary conversation state and callback payloads |
-| [`tag_translation.py`](tag_translation.py) | Background tag translation and translation-cache orchestration |
-| [`config.py`](config.py) | Configuration loading and validation |
-| [`scripts/backup_sqlite.py`](scripts/backup_sqlite.py) | Consistent backup of a running SQLite database |
-| [`tests/`](tests) | Unit and integration tests |
-| [`docs/PRODUCTION.en.md`](docs/PRODUCTION.en.md) | Short production runbook |
+```text
+app/                   application source
+  main.py, config.py    entrypoint and environment
+  telegram/             handlers, UI and delivery
+  services/             search, subscriptions and ZIP
+  integrations/         Rule34 and tag translation
+  storage/              SQLite facade and repositories
+  observability/        logic trace
+  infrastructure/       lifecycle, locking and updates
+tests/                  unit and integration tests
+scripts/                backup, diagnostics and checks
+docs/                   architecture and operation
+bot.py                  compatibility launcher
+```
+
+[Architecture and module boundaries](docs/ARCHITECTURE.md).
 
 ## Data, Logs, and Backups
 
@@ -419,8 +422,9 @@ python -m pip check
 Check syntax and run tests:
 
 ```bash
-python -m compileall -q bot.py api_handler.py database.py config.py bot_delivery.py bot_features.py bot_formatting.py bot_keyboards.py bot_media.py bot_zip_export.py bot_state.py tag_translation.py
-python -m unittest discover -s tests -v
+python -m compileall -q app bot.py scripts tests
+python scripts/check_imports.py
+python tests/run_isolated_suite.py
 ```
 
 GitHub Actions runs the same checks on pushes and pull requests.
@@ -447,6 +451,17 @@ GitHub Actions runs the same checks on pushes and pull requests.
 
 Report bugs and feature requests through
 [GitHub Issues](https://github.com/EnoTiK11m/night_fun_drug_bot_tg/issues).
+
+## Diagnostics
+
+Logs are local in `logs/`. Optional decision tracing is disabled by default.
+Set `LOGIC_TRACE_ENABLED=true` and `LOGIC_TRACE_LEVEL=normal`, then restart the bot.
+Read a trace with `python scripts/read_trace.py --trace TRACE_ID --summary`.
+Secrets are redacted and user IDs hashed; queries may still appear in diagnostics.
+
+Rule34 uses a shared rolling quota of 55 HTTP attempts / 60 seconds, including retries.
+Subscriptions support a 30-second minimum; polling defaults to 5 seconds.
+See [architecture](docs/ARCHITECTURE.md) for package boundaries and runtime details.
 
 ## License
 

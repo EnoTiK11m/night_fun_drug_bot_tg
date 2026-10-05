@@ -3,8 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import bot
-from database import CacheCleanupResult
+import app.telegram.application as bot
+from app.storage.database import CacheCleanupResult
 
 
 class FakeClock:

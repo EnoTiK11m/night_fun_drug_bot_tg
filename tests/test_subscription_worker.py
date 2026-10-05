@@ -4,9 +4,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from telegram.error import NetworkError
 
-import bot
-from api_handler import APITemporaryError
-from bot_delivery import telegram_rate_limiter
+import app.telegram.application as bot
+from app.integrations.rule34.client import APITemporaryError
+from app.telegram.delivery import telegram_rate_limiter
 
 
 class SubscriptionWorkerTests(unittest.IsolatedAsyncioTestCase):

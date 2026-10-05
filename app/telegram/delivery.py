@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from app.observability.logic_trace import trace_event, trace_error, current_trace
 import time
 from collections import deque
 from contextvars import ContextVar
@@ -7,10 +8,10 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Awaitable, Callable, Literal
 
-from telegram.error import BadRequest, RetryAfter, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import BaseRateLimiter
 
-from config import (
+from app.config import (
     TELEGRAM_GLOBAL_REQUESTS_PER_SECOND,
     TELEGRAM_MAX_RETRY_AFTER_ATTEMPTS,
     TELEGRAM_PER_CHAT_REQUESTS_PER_SECOND,
@@ -352,13 +353,20 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
         retry_after_attempts = 0
         attempt = 0
         while True:
+            queued_at = time.monotonic()
             await self.wait_for_slot(chat_id)
             attempt += 1
+            trace_event("telegram.queue.admitted", level="verbose", queue_wait_ms=(time.monotonic()-queued_at)*1000)
             self.metrics.telegram_requests_total += 1
             token = _limiter_active.set(True)
             try:
-                return await operation()
+                started = time.monotonic()
+                trace_event("telegram.send.start", operation=operation_name, attempt=attempt)
+                result = await operation()
+                trace_event("telegram.send.success", operation=operation_name, attempt=attempt, duration_ms=(time.monotonic()-started)*1000)
+                return result
             except RetryAfter as exc:
+                trace_event("telegram.send.retry_after", operation=operation_name, attempt=attempt, wait_seconds=retry_after_seconds(exc))
                 self.metrics.telegram_retry_after_count += 1
                 wait_seconds = self.apply_retry_after(chat_id, exc)
                 if retry_after_attempts >= retry_limit:
@@ -372,6 +380,9 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
                     attempt,
                     wait_seconds,
                 )
+            except Exception as trace_exc:
+                trace_error(trace_exc, stage=operation_name, event="telegram.send.failed")
+                raise
             finally:
                 _limiter_active.reset(token)
 
@@ -395,7 +406,8 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
                     chat_id=chat_id,
                     max_retry_after_attempts=max_retry_after_attempts,
                 )
-            except TimedOut:
+            except TimedOut as trace_exc:
+                trace_error(trace_exc, stage=operation_name, event="telegram.send.timeout")
                 ambiguous_timeout = True
                 if safe_to_retry_timeout and timeout_attempts < SAFE_TIMEOUT_RETRIES:
                     timeout_attempts += 1
@@ -411,6 +423,7 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
                 self.metrics.telegram_request_failures += 1
                 raise
             except BadRequest as exc:
+                trace_error(exc, stage=operation_name, event="telegram.send.bad_request")
                 if ambiguous_timeout and is_ambiguous_bad_request_success(
                     exc, ambiguous_bad_request_policy
                 ):
@@ -419,7 +432,9 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
                 raise
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as trace_exc:
+                error_kind = "forbidden" if type(trace_exc).__name__ == "Forbidden" else "network_error" if isinstance(trace_exc, NetworkError) else "failed"
+                trace_error(trace_exc, stage=operation_name, event="telegram.send." + error_kind)
                 self.metrics.telegram_request_failures += 1
                 raise
 

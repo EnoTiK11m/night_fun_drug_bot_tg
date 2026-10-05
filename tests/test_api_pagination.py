@@ -1,6 +1,7 @@
 import unittest
+from unittest import mock
 
-from api_handler import rule34API
+from app.integrations.rule34.client import rule34API
 
 
 class FakeRule34API(rule34API):
@@ -19,6 +20,11 @@ class FakeRule34API(rule34API):
 
 
 class ApiPaginationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_api_search_can_reach_page_six(self):
+        pages = {pid: [{'id': pid + 1, 'file_url': ''}] for pid in range(6)}
+        pages[6] = [{'id': 42, 'file_url': 'https://example.test/a.jpg'}]
+        api = FakeRule34API(pages)
+        self.assertEqual((await api.get_random_image('tag', set()))['id'], 42)
     async def test_random_search_stops_after_interactive_page_limit(self):
         pages = {
             pid: [{"id": str(pid), "file_url": ""}]
@@ -30,7 +36,7 @@ class ApiPaginationTests(unittest.IsolatedAsyncioTestCase):
         result = await api.get_random_image("tag", set())
 
         self.assertIsNone(result)
-        self.assertEqual(api.requested_pids, list(range(5)))
+        self.assertEqual(api.requested_pids, list(range(12)))
 
     async def test_next_search_stops_after_interactive_page_limit(self):
         pages = {
@@ -44,8 +50,8 @@ class ApiPaginationTests(unittest.IsolatedAsyncioTestCase):
         result = await api.get_next_image(1, "tag", set(), excluded)
 
         self.assertIsNone(result)
-        self.assertEqual(api.requested_pids, list(range(5)))
-        self.assertEqual(api.user_search_states[1]["current_pid"], 5)
+        self.assertEqual(api.requested_pids, list(range(12)))
+        self.assertEqual(api.user_search_states[1]["current_pid"], 12)
 
     async def test_random_without_tags_uses_blacklist_only_search(self):
         pages = {
@@ -64,7 +70,7 @@ class ApiPaginationTests(unittest.IsolatedAsyncioTestCase):
         }
         api = FakeRule34API(pages)
 
-        with unittest.mock.patch("api_handler.random.randint", return_value=17):
+        with unittest.mock.patch('app.integrations.rule34.client.random.randint', return_value=17):
             result = await api.get_global_random_image({"blocked"})
 
         self.assertEqual(result["id"], "777")

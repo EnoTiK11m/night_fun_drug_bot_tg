@@ -5,8 +5,8 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-import bot
-import bot_state
+import app.telegram.application as bot
+import app.telegram.state as bot_state
 
 
 def make_callback_update(data: str, user_id: int = 1):
@@ -37,6 +37,9 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         bot_state.callback_payloads.clear()
         bot.recent_posts.clear()
         bot.issued_one_shot_callbacks.clear()
+
+    async def asyncTearDown(self):
+        await bot_state.flush_callback_payloads()
 
     def tearDown(self):
         bot.telegram_rate_limiter.reset()
@@ -164,7 +167,7 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.button_handler(confirm_update, SimpleNamespace())
 
-        add_subscription.assert_awaited_once_with(1, "tag", 10)
+        add_subscription.assert_awaited_once_with(1, "tag", interval_seconds=600)
         confirm_query.edit_message_text.assert_awaited_once()
 
     async def test_post_tags_button_replies_with_full_tags(self):
@@ -498,7 +501,7 @@ class FavoritesFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         callback_data = keyboard.inline_keyboard[0][0].callback_data
 
-        self.assertEqual(bot.resolved_callback_data(callback_data), "sub_fav_123")
+        self.assertEqual(bot_state.get_callback_payload('sub_fav', callback_data), '123\ntag')
         self.assertIn(callback_data, bot.issued_one_shot_callbacks)
 
     async def test_subscription_favorite_uses_cache_queries_from_database(self):

@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 
-from bot_user_gate import (
+from app.infrastructure.user_gate import (
     NestedUserGateAcquire,
     UserGateClosed,
     UserGateLifecycleError,

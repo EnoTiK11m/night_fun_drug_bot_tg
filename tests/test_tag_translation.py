@@ -4,8 +4,8 @@ import unittest
 import uuid
 from unittest.mock import AsyncMock, patch
 
-import database
-from tag_translation import TagTranslationService
+import app.storage.database as database
+from app.integrations.tag_translation import TagTranslationService
 
 
 class TagTranslationServiceTests(unittest.IsolatedAsyncioTestCase):

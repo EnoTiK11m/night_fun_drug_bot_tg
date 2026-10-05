@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+from app.observability.logic_trace import traced_flow, annotate
 import os
 import shutil
 import tempfile
@@ -14,7 +15,7 @@ from typing import Any, Awaitable, Callable, Literal, Protocol
 import aiohttp
 from telegram.error import RetryAfter, TimedOut
 
-from config import (
+from app.config import (
     ZIP_EXPORT_MAX_FILE_BYTES,
     ZIP_EXPORT_MAX_FILES,
     ZIP_EXPORT_MAX_PARTS,
@@ -26,14 +27,14 @@ from config import (
     ZIP_EXPORT_TIMEOUT_SECONDS,
     ZIP_EXPORT_WORKERS,
 )
-from bot_media import (
+from app.telegram.media import (
     DownloadByteBudget,
     FileDownloadLimitExceeded,
     TotalDownloadLimitExceeded,
     download_photo_to_path,
     create_public_photo_session,
 )
-from bot_delivery import execute_telegram_request, telegram_rate_limiter
+from app.telegram.delivery import execute_telegram_request, telegram_rate_limiter
 
 logger = logging.getLogger(__name__)
 ZIP_ENTRY_OVERHEAD_BYTES = 512
@@ -627,6 +628,7 @@ class ZipExportManager:
         except asyncio.CancelledError:
             raise
 
+    @traced_flow("zip", metadata=lambda b: {"user_id": b["job"].user_id, "job_id": b["job"].job_id})
     async def _execute_job(
         self, job: ZipExportJob, reporter: JobStatusReporter
     ) -> ZipExportResult:

@@ -7,8 +7,8 @@ from typing import Iterable
 
 import aiohttp
 
-from config import TAG_TRANSLATION_ENABLED
-from database import (
+from app.config import TAG_TRANSLATION_ENABLED
+from app.storage.database import (
     get_pending_tag_translations,
     get_tag_translation_states,
     get_tag_translations,

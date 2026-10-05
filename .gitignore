@@ -1,18 +1,50 @@
+# Secrets
 .env
 .env.*
 !.env.example
+# Python
 __pycache__/
 *.py[cod]
+htmlcov/
+# Runtime data
 logs/
 data/
 backups/
 *.log
-bot_data.db
-bot_data.db-*
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
 .pytest_cache/
 .coverage
+# Generated diagnostics
+audit/
+*test-output*.txt
+trace-examples.jsonl
+logic_trace.jsonl*
+# Codex / local tooling
 .codex/
 skills-lock.json
+# Virtual environments
 .venv/
 venv/
 env/
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+# Temporary
+*.tmp
+*.temp
+*.bak
+*.old
+# Interrupted test runs
+test_db_*/
+test_features_*/
+test_sub_migration_*/
+test_migration_*/
+test_payloads_*/
+test_translations_*/

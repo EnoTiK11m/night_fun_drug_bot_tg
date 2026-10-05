@@ -17,4 +17,4 @@ RUN mkdir -p /app/data /app/logs && chown -R appuser:appuser /app
 
 USER appuser
 
-CMD ["python", "bot.py"]
+CMD ["python", "-m", "app.main"]

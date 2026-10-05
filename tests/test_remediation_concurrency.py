@@ -5,10 +5,10 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
-import bot
-import bot_delivery
-import bot_media
-import database
+import app.telegram.application as bot
+import app.telegram.delivery as bot_delivery
+import app.telegram.media as bot_media
+import app.storage.database as database
 from telegram.error import Forbidden, NetworkError
 
 

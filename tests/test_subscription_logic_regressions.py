@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, patch
 
 from telegram.error import NetworkError, RetryAfter
 
-import bot
-import database
+import app.telegram.application as bot
+import app.storage.database as database
 
 
 class SubscriptionCachedBlacklistRegressionTests(unittest.IsolatedAsyncioTestCase):
@@ -35,7 +35,7 @@ class SubscriptionCachedBlacklistRegressionTests(unittest.IsolatedAsyncioTestCas
                 bot, "is_subscription_cache_stale", AsyncMock(return_value=False)
             ),
             patch.object(
-                bot.api, "search_subscription_cache", AsyncMock(return_value=[])
+                bot.api, "search_subscription_cache", AsyncMock(return_value=[blocked, allowed])
             ) as search,
             patch.object(bot.random, "choice", side_effect=lambda posts: posts[0]),
         ):

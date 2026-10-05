@@ -6,9 +6,9 @@ import time
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-import bot
-import bot_state
-import database
+import app.telegram.application as bot
+import app.telegram.state as bot_state
+import app.storage.database as database
 
 
 def post(post_id=1, **overrides):
@@ -50,6 +50,7 @@ class SearchFilterInvariantTests(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(
                     patch.object(bot.api, name, AsyncMock(return_value=rejected))
                 )
+            stack.enter_context(patch.object(bot.api, "search", AsyncMock(side_effect=[[rejected], []])))
             stack.enter_context(patch.object(bot.api, "save_search_state", AsyncMock()))
             if mode == "random":
                 delivered = await bot.send_random_image(message, 1)

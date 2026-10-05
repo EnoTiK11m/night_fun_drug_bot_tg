@@ -1,5 +1,6 @@
 import random
 import time
+from app.observability.logic_trace import trace_event
 from collections import Counter, deque
 from typing import Any, Iterable
 from urllib.parse import urlparse
@@ -108,6 +109,9 @@ def prepare_post_quality(post: dict, settings: dict) -> dict:
     for url in order:
         if url and url not in unique:
             unique.append(url)
+    selected = unique[0] if unique else ""
+    source = "original" if selected == original else "sample" if selected == sample else "preview" if selected == preview else "missing"
+    trace_event("media.quality.selected", level="normal", post_id=post.get("id"), quality_mode=mode, file_size=post.get("file_size"), max_file_mb=settings.get("max_file_mb"), selected_source=source)
     prepared["file_url"] = unique[0] if unique else ""
     prepared["sample_url"] = unique[1] if len(unique) > 1 else ""
     prepared["preview_url"] = unique[2] if len(unique) > 2 else ""

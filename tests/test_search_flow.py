@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import bot
+import app.telegram.application as bot
 
 
 class SearchFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -51,7 +51,7 @@ class SearchFlowTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "get_user_settings", AsyncMock(return_value={"show_caption": False})),
             patch.object(bot, "is_rate_limited", return_value=False),
             patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
-            patch.object(bot.api, "get_random_image", AsyncMock(return_value=result)),
+            patch.object(bot.search_service, "select", AsyncMock(return_value=result)),
             patch.object(bot.api, "save_search_state", AsyncMock()),
             patch.object(bot, "save_user_query", AsyncMock()),
             patch.object(bot, "remember_and_cache_post", AsyncMock()),
@@ -74,7 +74,7 @@ class SearchFlowTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "get_user_settings", AsyncMock(return_value={"show_caption": False})),
             patch.object(bot, "is_rate_limited", return_value=False),
             patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
-            patch.object(bot.api, "get_random_image", AsyncMock(return_value=result)),
+            patch.object(bot.search_service, "select", AsyncMock(return_value=result)),
             patch.object(bot.api, "save_search_state", AsyncMock()),
             patch.object(bot, "save_user_query", AsyncMock()),
             patch.object(bot, "remember_and_cache_post", AsyncMock()),
@@ -96,7 +96,7 @@ class SearchFlowTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "get_user_settings", AsyncMock(return_value={"show_caption": False})),
             patch.object(bot, "is_rate_limited", return_value=False),
             patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
-            patch.object(bot.api, "get_random_image", AsyncMock(side_effect=bot.APITemporaryError("timeout"))),
+            patch.object(bot.search_service, "select", AsyncMock(side_effect=bot.APITemporaryError("timeout"))),
             patch.object(bot, "mark_post_sent", AsyncMock()) as mark_sent,
         ):
             delivered = await bot.send_image(message, 1, "tag")

@@ -4,7 +4,7 @@ import shutil
 import unittest
 import uuid
 
-import database
+import app.storage.database as database
 
 
 class TempDatabaseTestCase(unittest.IsolatedAsyncioTestCase):
@@ -115,7 +115,7 @@ class SubscriptionClaimTests(TempDatabaseTestCase):
         self.assertTrue(await database.defer_subscription_after_transient_failure(
             1, "tag", token, 120
         ))
-        self.assertNotIn((1, "tag", 10, 0), await database.get_due_subscriptions())
+        self.assertNotIn((1, "tag", 600, 0), await database.get_due_subscriptions())
         self.assertIsNone(await database.claim_due_subscription(1, "tag"))
 
     async def test_claim_revalidation_observes_disable_and_global_pause(self):
@@ -220,9 +220,9 @@ class SubscriptionClaimTests(TempDatabaseTestCase):
 
         self.assertEqual(paused, 2)
         due = await database.get_due_subscriptions()
-        self.assertNotIn((1, "tag-a", 10, 0), due)
-        self.assertNotIn((1, "tag-b", 10, 0), due)
-        self.assertIn((2, "other-user", 10, 0), due)
+        self.assertNotIn((1, "tag-a", 600, 0), due)
+        self.assertNotIn((1, "tag-b", 600, 0), due)
+        self.assertIn((2, "other-user", 600, 0), due)
 
     async def test_new_subscription_inherits_active_pause_until_resume(self):
         paused = await database.pause_all_active_subscriptions(1, 60)
@@ -231,13 +231,13 @@ class SubscriptionClaimTests(TempDatabaseTestCase):
 
         self.assertTrue(await database.add_subscription(1, "paused-new", 10))
         due = await database.get_due_subscriptions()
-        self.assertNotIn((1, "paused-new", 10, 0), due)
+        self.assertNotIn((1, "paused-new", 600, 0), due)
 
         resumed = await database.resume_all_active_subscriptions(1)
         self.assertEqual(resumed, 1)
         self.assertIsNone(await database.get_subscription_pause_until(1))
         due = await database.get_due_subscriptions()
-        self.assertIn((1, "paused-new", 10, 0), due)
+        self.assertIn((1, "paused-new", 600, 0), due)
 
 
 class DigestClaimTests(TempDatabaseTestCase):

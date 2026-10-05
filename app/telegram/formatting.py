@@ -1,5 +1,8 @@
 from datetime import UTC, datetime
 from html import unescape
+import math
+import re
+from app.config import SUBSCRIPTION_MIN_INTERVAL_SECONDS
 
 from telegram.helpers import escape_markdown
 
@@ -12,25 +15,58 @@ SQLITE_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 def md_code(value) -> str:
-    return unescape(str(value)).replace("`", "'")
+    # Bound raw components before formatting; never cut an open code span.
+    return unescape(str(value))[:256].replace("`", "'").replace("\\", "\\\\")
 
 
 def md_text(value) -> str:
-    return escape_markdown(unescape(str(value)), version=1)
+    return escape_markdown(unescape(str(value))[:128], version=1)
 
 
 def clamp_caption(caption: str) -> str:
     if len(caption) <= MAX_CAPTION_LENGTH:
         return caption
-    return caption[: MAX_CAPTION_LENGTH - 3] + "..."
+    lines = []
+    for line in caption.splitlines():
+        if len("\n".join(lines + [line])) > MAX_CAPTION_LENGTH - 4:
+            break
+        lines.append(line)
+    return "\n".join(lines) + "\n..."
+
+
+def split_markdown_lines(text: str, limit: int = 3500) -> list[str]:
+    """Split complete formatted lines; callers bound each raw component first."""
+    chunks, current = [], []
+    for line in text.splitlines():
+        if len(line) > limit:
+            raise ValueError('Formatted line exceeds Telegram text budget')
+        if len('\n'.join(current + [line])) > limit:
+            chunks.append('\n'.join(current))
+            current = []
+        current.append(line)
+    if current:
+        chunks.append('\n'.join(current))
+    return chunks or ['']
 
 
 def parse_subscription_interval(value: str) -> int:
-    if not value.isdigit():
-        return SUBSCRIPTION_DEFAULT_INTERVAL
+    """Seconds internally; a bare number remains minutes for the existing UX."""
+    match = re.fullmatch(r"\s*(\d+)\s*(s|sec|seconds?|с|сек|секунд(?:а|ы)?|m|min|minutes?|м|мин|минут(?:а|ы)?|h|ч|час(?:а|ов)?)?\s*", value.lower())
+    if not match:
+        raise ValueError('Укажите интервал: 30 сек, 1 мин или 1 ч.')
+    amount, unit = int(match[1]), match[2] or 'm'
+    seconds = amount * (1 if unit in {'s', 'sec', 'second', 'seconds', 'с', 'сек', 'секунд', 'секунда', 'секунды'} else 3600 if unit.startswith(('h', 'ч')) else 60)
+    if not SUBSCRIPTION_MIN_INTERVAL_SECONDS <= seconds <= SUBSCRIPTION_MAX_INTERVAL * 60:
+        raise ValueError(f'Интервал: от {SUBSCRIPTION_MIN_INTERVAL_SECONDS} сек до 120 мин.')
+    return seconds
 
-    interval = int(value)
-    return max(SUBSCRIPTION_MIN_INTERVAL, min(interval, SUBSCRIPTION_MAX_INTERVAL))
+
+def format_subscription_interval(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        return f'{seconds // 3600} ч'
+    if seconds % 60 == 0:
+        return f'{seconds // 60} мин'
+    return f'{seconds} сек'
 
 
 def parse_pause_minutes(value: str) -> int:
@@ -70,6 +106,8 @@ def parse_pause_minutes(value: str) -> int:
             multiplier = candidate
             break
 
+    if not math.isfinite(amount) or not math.isfinite(amount * multiplier):
+        raise ValueError("Duration must be finite")
     pause_minutes = round(amount * multiplier)
     return max(1, min(pause_minutes, 10080))
 

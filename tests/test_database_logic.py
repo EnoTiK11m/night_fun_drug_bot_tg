@@ -1,6 +1,6 @@
 import unittest
 
-from database import get_empty_backoff_minutes
+from app.storage.database import get_empty_backoff_minutes
 
 
 class SubscriptionBackoffTests(unittest.TestCase):

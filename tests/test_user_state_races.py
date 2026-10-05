@@ -4,8 +4,8 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import bot
-from api_handler import APITemporaryError
+import app.telegram.application as bot
+from app.integrations.rule34.client import APITemporaryError
 
 
 def callback_update(data: str, user_id: int = 1):
@@ -167,7 +167,7 @@ class UserStateRaceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "get_user_blacklist", AsyncMock(return_value=set())),
             patch.object(bot, "get_user_settings", AsyncMock(return_value={})),
             patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
-            patch.object(bot.api, "get_random_image", side_effect=api_call),
+            patch.object(bot.search_service, "select", side_effect=api_call),
         ):
             self.assertFalse(await bot.send_image(message, 1, "tag"))
 
@@ -466,7 +466,7 @@ class UserStateRaceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "get_user_blacklist", AsyncMock(return_value=set())),
             patch.object(bot, "get_user_settings", AsyncMock(return_value={"show_caption": False})),
             patch.object(bot, "get_sent_post_ids", AsyncMock(return_value=set())),
-            patch.object(bot.api, "get_random_image", side_effect=delayed_search),
+            patch.object(bot.search_service, "select", side_effect=delayed_search),
             patch.object(bot.api, "save_search_state", AsyncMock()),
             patch.object(bot, "remember_and_cache_post", AsyncMock()),
             patch.object(bot, "save_user_query", AsyncMock()),
@@ -571,8 +571,14 @@ class UserStateRaceTests(unittest.IsolatedAsyncioTestCase):
                 for button in row:
                     data = button.callback_data
                     if data in bot.issued_one_shot_callbacks:
-                        self.assertTrue(data.startswith("act_"))
-                        found.add(bot.resolved_callback_data(data))
+                        self.assertTrue(data.startswith(("act_", "sub_fav_")))
+                        entry = bot.issued_one_shot_callbacks[data]
+                        self.assertEqual(entry.owner_id, 1)
+                        if data.startswith('sub_fav_'):
+                            self.assertEqual(bot.bot_state.get_callback_payload('sub_fav', data), '42\ntag')
+                            found.add('sub_fav_42')
+                        else:
+                            found.add(bot.resolved_callback_data(data))
         self.assertTrue(logical_side_effects.issubset(found))
 
     def test_one_shot_callback_data_stays_within_telegram_limit(self):

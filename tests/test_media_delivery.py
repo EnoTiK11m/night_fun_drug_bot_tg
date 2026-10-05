@@ -8,9 +8,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import aiohttp
-import bot
-import bot_media
-from bot_delivery import (
+import app.telegram.application as bot
+import app.telegram.media as bot_media
+from app.telegram.delivery import (
     TELEGRAM_MESSAGES_PER_CHAT_MINUTE,
     TelegramRateLimiter,
     telegram_rate_limiter,
@@ -90,8 +90,8 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 raise RetryAfter(0)
 
         message.reply_photo.side_effect = reply_photo
-        with patch("bot_media._download_photo_file", AsyncMock(return_value=upload)), patch(
-            "bot_media.execute_telegram_request", side_effect=self._run_explicit_limiter
+        with patch('app.telegram.media._download_photo_file', AsyncMock(return_value=upload)), patch(
+            'app.telegram.media.execute_telegram_request', side_effect=self._run_explicit_limiter
         ):
             self.assertTrue(await bot_media.reply_downloaded_photo(message, "u", "", None))
         self.assertEqual(received, [b"complete-image", b"complete-image"])
@@ -101,8 +101,8 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         upload = CloseCountingBytesIO(b"image")
         message = AsyncMock()
         message.reply_photo.side_effect = TimedOut()
-        with patch("bot_media._download_photo_file", AsyncMock(return_value=upload)), patch(
-            "bot_media.execute_telegram_request", side_effect=self._run_explicit_limiter
+        with patch('app.telegram.media._download_photo_file', AsyncMock(return_value=upload)), patch(
+            'app.telegram.media.execute_telegram_request', side_effect=self._run_explicit_limiter
         ):
             with self.assertRaises(TimedOut):
                 await bot_media.reply_downloaded_photo(message, "u", "", None)
@@ -113,8 +113,8 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         upload = CloseCountingBytesIO(b"image")
         telegram_bot = AsyncMock()
         telegram_bot.send_photo.side_effect = asyncio.CancelledError()
-        with patch("bot_media._download_photo_file", AsyncMock(return_value=upload)), patch(
-            "bot_media.execute_telegram_request", side_effect=self._run_explicit_limiter
+        with patch('app.telegram.media._download_photo_file', AsyncMock(return_value=upload)), patch(
+            'app.telegram.media.execute_telegram_request', side_effect=self._run_explicit_limiter
         ):
             with self.assertRaises(asyncio.CancelledError):
                 await bot_media.send_downloaded_photo(telegram_bot, 1, "u", "", None)
@@ -130,8 +130,8 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
             raise RetryAfter(0)
 
         message.reply_photo.side_effect = reply_photo
-        with patch("bot_media._download_photo_file", AsyncMock(return_value=upload)), patch(
-            "bot_media.execute_telegram_request", side_effect=self._run_explicit_limiter
+        with patch('app.telegram.media._download_photo_file', AsyncMock(return_value=upload)), patch(
+            'app.telegram.media.execute_telegram_request', side_effect=self._run_explicit_limiter
         ):
             with self.assertRaises(RetryAfter):
                 await bot_media.reply_downloaded_photo(message, "u", "", None)
@@ -391,7 +391,7 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(bot, "MEDIA_SEND_RETRIES", 1),
-            patch("bot_media._download_photo_file", AsyncMock(return_value=downloaded)),
+            patch('app.telegram.media._download_photo_file', AsyncMock(return_value=downloaded)),
         ):
             delivered = await bot.send_post_media(message, post, keyboard=object())
 
@@ -419,7 +419,7 @@ class MediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(bot, "MEDIA_SEND_RETRIES", 1),
-            patch("bot_media._download_photo_file", AsyncMock(return_value=downloaded)),
+            patch('app.telegram.media._download_photo_file', AsyncMock(return_value=downloaded)),
         ):
             delivered = await bot.send_post_media_to_chat(
                 telegram_bot, 123, post, keyboard=object()

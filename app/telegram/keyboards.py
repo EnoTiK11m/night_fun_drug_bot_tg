@@ -6,8 +6,8 @@ from telegram import (
 )
 from collections.abc import Callable
 
-from bot_state import store_callback_payload
-from database import get_user_settings
+from app.telegram.state import store_callback_payload
+from app.storage.database import get_user_settings
 
 
 PERSISTENT_SEARCH = "🔎 Найти"
@@ -81,7 +81,13 @@ def get_favorite_button(
     *,
     side_effect_callback: Callable[[str], str],
 ) -> InlineKeyboardButton:
-    favorite_callback = f"sub_fav_{post_id}" if sub_query else f"fav_{post_id}"
+    if sub_query:
+        if hasattr(side_effect_callback, 'payload'):
+            callback = side_effect_callback.payload('sub_fav', f'{post_id}\n{sub_query}')
+        else:
+            callback = _side_effect_data(store_callback_payload('sub_fav', f'{post_id}\n{sub_query}'), side_effect_callback)
+        return InlineKeyboardButton("⭐ В избранное", callback_data=callback)
+    favorite_callback = f"fav_{post_id}"
     return InlineKeyboardButton(
         "⭐ В избранное",
         callback_data=_side_effect_data(favorite_callback, side_effect_callback),

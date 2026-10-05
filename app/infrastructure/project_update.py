@@ -12,7 +12,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from config import (
+from app.config import (
     DB_PATH,
     GIT_UPDATE_BRANCH,
     GIT_UPDATE_COMMAND_TIMEOUT_SECONDS,
@@ -23,7 +23,7 @@ from scripts.backup_sqlite import backup_database
 
 
 logger = logging.getLogger(__name__)
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_MARKER_PATH = PROJECT_ROOT / "logs" / "update_restart.json"
 COMMAND_OUTPUT_LIMIT = 8 * 1024
 DEPENDENCY_FILES = (
@@ -339,18 +339,14 @@ async def perform_update() -> UpdateResult:
             "compileall",
             "-q",
             "bot.py",
-            "bot_media.py",
-            "database.py",
-            "api_handler.py",
-            "config.py",
-            "project_update.py",
+            "app",
         )
         stage = "imports"
         await _checked_command(
             stage,
             sys.executable,
             "-c",
-            "import bot, bot_media, database, api_handler, config, project_update",
+            'import app.telegram.application as bot, app.telegram.media as bot_media, app.storage.database as database, app.integrations.rule34.client as api_handler, app.config as config, app.infrastructure.project_update as project_update',
         )
         logger.warning(
             "Project update completed old=%s new=%s elapsed=%.2fs",

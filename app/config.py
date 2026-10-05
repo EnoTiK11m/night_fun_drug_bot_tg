@@ -79,13 +79,30 @@ AUTOCOMPLETE_URL = "https://api.rule34.xxx/autocomplete.php"
 API_USER_ID = os.getenv("API_USER_ID")
 API_KEY = os.getenv("API_KEY")
 SEARCH_COOLDOWN_SECONDS = _get_int_env("SEARCH_COOLDOWN_SECONDS", 3)
-SUBSCRIPTION_CHECK_INTERVAL_SECONDS = max(
-    30, _get_int_env("SUBSCRIPTION_CHECK_INTERVAL_SECONDS", 120)
-)
+def _get_bounded_int_env(name, default, minimum, maximum):
+    value = _get_int_env(name, default)
+    if not minimum <= value <= maximum:
+        _CONFIG_ERRORS.append(f"{name} must be between {minimum} and {maximum}")
+        return default
+    return value
+
+
+RULE34_API_REQUESTS_PER_WINDOW = _get_bounded_int_env("RULE34_API_REQUESTS_PER_WINDOW", 55, 1, 60)
+RULE34_API_WINDOW_SECONDS = _get_bounded_float_env("RULE34_API_WINDOW_SECONDS", 60, 60, 3600)
+SUBSCRIPTION_MIN_INTERVAL_SECONDS = _get_bounded_int_env("SUBSCRIPTION_MIN_INTERVAL_SECONDS", 30, 30, 7200)
+SUBSCRIPTION_CHECK_INTERVAL_SECONDS = _get_bounded_int_env("SUBSCRIPTION_CHECK_INTERVAL_SECONDS", 5, 1, 10)
 SUBSCRIPTION_MAX_POSTS_PER_USER_PASS = max(
     1, min(45, _get_int_env("SUBSCRIPTION_MAX_POSTS_PER_USER_PASS", 45))
 )
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LOGIC_TRACE_ENABLED = _get_bool_env('LOGIC_TRACE_ENABLED', False)
+LOGIC_TRACE_LEVEL = os.getenv('LOGIC_TRACE_LEVEL', 'normal').strip().lower()
+if LOGIC_TRACE_LEVEL not in {'minimal', 'normal', 'verbose'}:
+    _CONFIG_ERRORS.append('LOGIC_TRACE_LEVEL must be minimal, normal or verbose')
+    LOGIC_TRACE_LEVEL = 'normal'
+LOGIC_TRACE_RETENTION_DAYS = max(1, _get_int_env('LOGIC_TRACE_RETENTION_DAYS', 7))
+LOGIC_TRACE_MAX_BYTES = max(128, _get_int_env('LOGIC_TRACE_MAX_BYTES', 52428800))
+LOGIC_TRACE_BACKUP_COUNT = max(1, _get_int_env('LOGIC_TRACE_BACKUP_COUNT', 7))
 _configured_db_path = Path(os.getenv("DB_PATH", "bot_data.db")).expanduser()
 DB_PATH = str(
     _configured_db_path.resolve()

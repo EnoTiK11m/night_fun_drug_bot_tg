@@ -6,9 +6,9 @@ from unittest.mock import AsyncMock, patch
 
 from telegram.error import BadRequest, RetryAfter, TimedOut
 
-import bot
-import bot_media
-from bot_delivery import (
+import app.telegram.application as bot
+import app.telegram.media as bot_media
+from app.telegram.delivery import (
     TelegramRateLimiter,
     TelegramRateLimiterClosed,
     TelegramRateLimiterLifecycleError,
@@ -544,7 +544,7 @@ class TelegramLimiterIntegrationTests(unittest.IsolatedAsyncioTestCase):
             from_user=SimpleNamespace(id=777),
             answer=AsyncMock(),
         )
-        with patch("bot.execute_telegram_request", new=AsyncMock()) as execute:
+        with patch('app.telegram.application.execute_telegram_request', new=AsyncMock()) as execute:
             await bot.safe_query_answer(query, "ok")
         self.assertEqual(execute.await_args.kwargs["chat_id"], 777)
         self.assertTrue(execute.await_args.kwargs["safe_to_retry_timeout"])

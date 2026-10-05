@@ -10,10 +10,10 @@ from unittest.mock import AsyncMock, patch
 import aiohttp
 from telegram.error import RetryAfter, TimedOut
 
-import bot_media
-import bot_zip_export
-from bot_media import DownloadedPhotoMeta
-from bot_zip_export import (
+import app.telegram.media as bot_media
+import app.services.zip_export as bot_zip_export
+from app.telegram.media import DownloadedPhotoMeta
+from app.services.zip_export import (
     JobStatusReporter,
     ZipExportJob,
     ZipExportManager,
@@ -367,7 +367,7 @@ class ZipExportManagerTests(unittest.IsolatedAsyncioTestCase):
 
         await manager.start()
         try:
-            with patch("bot_zip_export.download_photo_to_path", side_effect=download):
+            with patch('app.services.zip_export.download_photo_to_path', side_effect=download):
                 queued = await manager.enqueue_favorites(message(1), 1)
                 self.assertEqual(queued.status, "queued")
                 await eventually(lambda: manager.stats()["tracked_users"] == 0)
@@ -434,7 +434,7 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
             Path(path).write_bytes(payload)
             return DownloadedPhotoMeta("https://cdn/x", "image/png", extension, len(payload), "x")
 
-        with patch("bot_zip_export.download_photo_to_path", side_effect=download):
+        with patch('app.services.zip_export.download_photo_to_path', side_effect=download):
             result = await manager._run_job(job, reporter)
         return manager, job, result
 
@@ -483,7 +483,7 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["max_bytes"], 8)
             raise ValueError("actual stream exceeded max")
 
-        with patch("bot_zip_export.download_photo_to_path", side_effect=oversize):
+        with patch('app.services.zip_export.download_photo_to_path', side_effect=oversize):
             per_file = await manager._run_job(job, reporter)
         self.assertEqual(per_file.status, "download_error")
 
@@ -506,7 +506,7 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
             kwargs["byte_budget"].consume(6)
             raise ValueError("invalid signature")
 
-        with patch("bot_zip_export.download_photo_to_path", side_effect=invalid):
+        with patch('app.services.zip_export.download_photo_to_path', side_effect=invalid):
             result = await manager._run_job(job, reporter)
         self.assertEqual(calls, 2)
         self.assertEqual(
@@ -523,7 +523,7 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
             Path(path).write_bytes(b"part")
             raise aiohttp.ClientError("connection lost")
 
-        with patch("bot_zip_export.download_photo_to_path", side_effect=partial):
+        with patch('app.services.zip_export.download_photo_to_path', side_effect=partial):
             partial_result = await manager._run_job(job, reporter)
         self.assertEqual(partial_result.status, "download_error")
         self.assertEqual(partial_result.downloaded_bytes, 4)
@@ -538,7 +538,7 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
             kwargs["byte_budget"].consume(6)
             raise bot_media.FileDownloadLimitExceeded("file")
 
-        with patch("bot_zip_export.download_photo_to_path", side_effect=file_too_large):
+        with patch('app.services.zip_export.download_photo_to_path', side_effect=file_too_large):
             file_result = await manager._run_job(job, reporter)
         self.assertEqual(
             (file_result.status, file_result.limit_reason, file_result.downloaded_bytes),
@@ -554,7 +554,7 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
             Path(path).write_bytes(b"123456")
             return DownloadedPhotoMeta("u", "image/png", ".png", 6, "x")
 
-        with patch("bot_zip_export.download_photo_to_path", side_effect=exact):
+        with patch('app.services.zip_export.download_photo_to_path', side_effect=exact):
             exact_result = await manager._run_job(job, reporter)
         self.assertEqual((exact_result.status, exact_result.downloaded_bytes), ("success", 6))
 
@@ -567,7 +567,7 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
             Path(path).write_bytes(b"part")
             raise asyncio.CancelledError
 
-        with patch("bot_zip_export.download_photo_to_path", side_effect=cancelled):
+        with patch('app.services.zip_export.download_photo_to_path', side_effect=cancelled):
             with self.assertRaises(asyncio.CancelledError):
                 await manager._run_job(job, reporter)
         self.assertEqual(job.progress.downloaded_bytes, 4)
@@ -608,7 +608,7 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
             Path(path).write_bytes(PNG)
             return DownloadedPhotoMeta("u", "image/png", ".png", len(PNG), "x")
 
-        with patch("bot_zip_export.download_photo_to_path", side_effect=download):
+        with patch('app.services.zip_export.download_photo_to_path', side_effect=download):
             result = await manager._run_job(job, reporter)
         self.assertEqual(result.status, "partial")
         self.assertEqual((result.exported_files, result.skipped_files), (2, 1))
@@ -623,7 +623,7 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
             Path(path).write_bytes(b"partial")
             raise asyncio.CancelledError
 
-        with patch("bot_zip_export.download_photo_to_path", side_effect=cancelled):
+        with patch('app.services.zip_export.download_photo_to_path', side_effect=cancelled):
             with self.assertRaises(asyncio.CancelledError):
                 await manager._run_job(job, reporter)
         self.assertIsNone(job.tempdir)
@@ -633,7 +633,7 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
         manager, job, _reporter = self.make_manager([])
         reporter = JobStatusReporter(manager, job, progress_interval_seconds=10)
         job.status_message_id = 5
-        with patch("bot_zip_export.time.monotonic", side_effect=[100.0, 101.0, 102.0]):
+        with patch('app.services.zip_export.time.monotonic', side_effect=[100.0, 101.0, 102.0]):
             await reporter.progress()
             job.progress.exported_files = 1
             await reporter.progress()
@@ -659,7 +659,7 @@ class ZipExportJobTests(unittest.IsolatedAsyncioTestCase):
             Path(path).write_bytes(PNG)
             return DownloadedPhotoMeta("u", "image/png", ".png", len(PNG), "x")
 
-        with patch("bot_zip_export.download_photo_to_path", side_effect=download):
+        with patch('app.services.zip_export.download_photo_to_path', side_effect=download):
             result = await manager._run_job(job, reporter)
 
         self.assertEqual(result.status, "success")
@@ -756,19 +756,19 @@ class ZipExportStreamingBoundaryTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "download.bin")
             session = HttpSession(FakeResponse([PNG], **{"Content-Type": "image/jpeg"}))
-            with patch("bot_media._validate_public_photo_url", AsyncMock()):
+            with patch('app.telegram.media._validate_public_photo_url', AsyncMock()):
                 meta = await bot_media.download_photo_to_path("https://cdn/x.jpg", path, session=session)
             self.assertEqual(meta.extension, ".png")
 
             session = HttpSession(FakeResponse([PNG]))
-            with patch("bot_media._validate_public_photo_url", AsyncMock()):
+            with patch('app.telegram.media._validate_public_photo_url', AsyncMock()):
                 with self.assertRaisesRegex(ValueError, "size limit"):
                     await bot_media.download_photo_to_path("https://cdn/x", path, session=session, max_bytes=4)
             self.assertFalse(os.path.exists(path))
 
     async def test_stream_budget_counts_invalid_partial_exact_and_file_limit_bytes(self):
         with tempfile.TemporaryDirectory() as directory, patch(
-            "bot_media._validate_public_photo_url", AsyncMock()
+            'app.telegram.media._validate_public_photo_url', AsyncMock()
         ):
             invalid_budget = bot_media.DownloadByteBudget(100)
             invalid_path = os.path.join(directory, "invalid")
@@ -828,8 +828,8 @@ class ZipExportStreamingBoundaryTests(unittest.IsolatedAsyncioTestCase):
         semaphore = asyncio.Semaphore(1)
 
         with tempfile.TemporaryDirectory() as directory, patch(
-            "bot_media._validate_public_photo_url", AsyncMock()
-        ), patch("bot_media.global_download_semaphore", semaphore):
+            'app.telegram.media._validate_public_photo_url', AsyncMock()
+        ), patch('app.telegram.media.global_download_semaphore', semaphore):
             first = asyncio.create_task(bot_media.download_photo_to_path(
                 "https://cdn/1", os.path.join(directory, "one"), session=HttpSession(first_response)
             ))

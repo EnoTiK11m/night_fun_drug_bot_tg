@@ -196,7 +196,7 @@ API_KEY=your_rule34_api_key
 ### 4. Запустите бота
 
 ```bash
-python bot.py
+python -m app.main
 ```
 
 SQLite-база и необходимые таблицы создаются автоматически при первом запуске.
@@ -211,7 +211,10 @@ SQLite-база и необходимые таблицы создаются ав
 | `API_USER_ID` | да | — | ID пользователя Rule34 API |
 | `API_KEY` | да | — | Ключ Rule34 API |
 | `SEARCH_COOLDOWN_SECONDS` | нет | `3` | Пауза между пользовательскими поисками |
-| `SUBSCRIPTION_CHECK_INTERVAL_SECONDS` | нет | `120` | Частота проверки подписок; минимум 30 секунд |
+| `SUBSCRIPTION_CHECK_INTERVAL_SECONDS` | нет | `5` | Polling scheduler, 1–10 секунд; не интервал отдельной подписки |
+| `SUBSCRIPTION_MIN_INTERVAL_SECONDS` | нет | `30` | Минимальный интервал подписки; нельзя ниже 30 секунд |
+| `RULE34_API_REQUESTS_PER_WINDOW` | нет | `55` | Общая квота процесса; допустимо 1–60 attempts |
+| `RULE34_API_WINDOW_SECONDS` | нет | `60` | Скользящее окно в секундах; минимум 60 |
 | `SUBSCRIPTION_MAX_POSTS_PER_USER_PASS` | нет | `45` | Максимум обрабатываемых подписок пользователя за проход, от 1 до 45 |
 | `SUBSCRIPTION_MAX_TOTAL` | нет | `20` | Максимум подписок пользователя, включая приостановленные |
 | `SUBSCRIPTION_MAX_ACTIVE` | нет | `10` | Максимум одновременно активных подписок пользователя |
@@ -339,22 +342,22 @@ docker compose down
 
 ## Структура проекта
 
-| Путь | Ответственность |
-| --- | --- |
-| [`bot.py`](bot.py) | Telegram handlers, пользовательские сценарии и фоновые задачи |
-| [`api_handler.py`](api_handler.py) | Асинхронный клиент Rule34 API, пагинация и autocomplete |
-| [`database.py`](database.py) | Схема и миграции SQLite, настройки, кэш, подписки и избранное |
-| [`bot_media.py`](bot_media.py) | Безопасная доставка медиа, fallback URL и retries |
-| [`bot_delivery.py`](bot_delivery.py) | Ограничение скорости отправки и Telegram cooldown |
-| [`bot_features.py`](bot_features.py) | Фильтры галереи, выбор качества и runtime-метрики |
-| [`bot_keyboards.py`](bot_keyboards.py) | Постоянная и inline-клавиатуры |
-| [`bot_formatting.py`](bot_formatting.py) | Подписи, Markdown и форматирование данных |
-| [`bot_state.py`](bot_state.py) | Временное состояние диалогов и callback payload |
-| [`tag_translation.py`](tag_translation.py) | Фоновый перевод тегов и работа с кэшем переводов |
-| [`config.py`](config.py) | Чтение и валидация конфигурации |
-| [`scripts/backup_sqlite.py`](scripts/backup_sqlite.py) | Согласованная резервная копия работающей SQLite-базы |
-| [`tests/`](tests) | Модульные и интеграционные тесты |
-| [`docs/PRODUCTION.md`](docs/PRODUCTION.md) | Краткое руководство по эксплуатации |
+```text
+app/                   application source
+  main.py, config.py    entrypoint and environment
+  telegram/             handlers, UI and delivery
+  services/             search, subscriptions and ZIP
+  integrations/         Rule34 and tag translation
+  storage/              SQLite facade and repositories
+  observability/        logic trace
+  infrastructure/       lifecycle, locking and updates
+tests/                  unit and integration tests
+scripts/                backup, diagnostics and checks
+docs/                   architecture and operation
+bot.py                  compatibility launcher
+```
+
+[Architecture and module boundaries](docs/ARCHITECTURE.md).
 
 ## Данные, логи и резервное копирование
 
@@ -398,8 +401,9 @@ python -m pip check
 Проверка синтаксиса и запуск тестов:
 
 ```bash
-python -m compileall -q bot.py api_handler.py database.py config.py bot_delivery.py bot_features.py bot_formatting.py bot_keyboards.py bot_media.py bot_zip_export.py bot_state.py tag_translation.py
-python -m unittest discover -s tests -v
+python -m compileall -q app bot.py scripts tests
+python scripts/check_imports.py
+python tests/run_isolated_suite.py
 ```
 
 Эти проверки также выполняются в GitHub Actions при push и pull request.
@@ -421,6 +425,31 @@ python -m unittest discover -s tests -v
 4. Откройте pull request с описанием поведения и способа проверки.
 
 Сообщения об ошибках и предложения принимаются через [GitHub Issues](https://github.com/EnoTiK11m/night_fun_drug_bot_tg/issues).
+
+## Diagnostics
+
+Обычные логи находятся в `logs/`. Дополнительная трассировка решений выключена по
+умолчанию; для включения задайте в `.env` и перезапустите бот:
+
+```env
+LOGIC_TRACE_ENABLED=true
+LOGIC_TRACE_LEVEL=normal
+```
+
+```bash
+python scripts/read_trace.py --last 100 --summary
+python scripts/read_trace.py --trace TRACE_ID --summary
+```
+
+Trace записывается отдельно в `logs/logic_trace.jsonl`, маскирует секреты и хеширует
+user ID. Verbose используйте временно; запросы пользователей могут попадать в лог.
+Очередь ограничена: при перегрузке часть событий может теряться.
+
+Rule34 использует общую квоту 55 физических attempts за rolling 60 секунд, включая
+retries; Telegram limiter работает отдельно. Подписки поддерживают минимум 30 секунд,
+scheduler polling — 5 секунд. Настройки и ограничения описаны в
+[архитектуре](docs/ARCHITECTURE.md).
+
 
 ## Лицензия
 

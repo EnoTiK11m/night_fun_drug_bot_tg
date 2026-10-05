@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import bot
+import app.telegram.application as bot
 
 
 def make_update(user_id=1):

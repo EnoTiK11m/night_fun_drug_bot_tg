@@ -5,8 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-import bot
-import project_update
+import app.telegram.application as bot
+import app.infrastructure.project_update as project_update
 
 
 OLD_COMMIT = "a" * 40
@@ -59,7 +59,7 @@ class FakeGit:
             return project_update.CommandResult(0, "", "")
         if args[-2:] == (
             "-c",
-            "import bot, bot_media, database, api_handler, config, project_update",
+            'import app.telegram.application as bot, app.telegram.media as bot_media, app.storage.database as database, app.integrations.rule34.client as api_handler, app.config as config, app.infrastructure.project_update as project_update',
         ):
             if self.fail_stage == "imports":
                 return project_update.CommandResult(1, "", "import failed")

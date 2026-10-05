@@ -6,7 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 
-import database
+import app.storage.database as database
 
 
 class CacheRetentionTests(unittest.IsolatedAsyncioTestCase):

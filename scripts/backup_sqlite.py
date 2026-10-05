@@ -11,7 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 load_dotenv()
 
-from config import DB_PATH  # noqa: E402
+from app.config import DB_PATH  # noqa: E402
 
 
 def backup_database(source_path: Path, output_dir: Path) -> Path:

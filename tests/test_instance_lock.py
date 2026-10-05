@@ -10,9 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-import bot
-import bot_instance_lock
-from bot_instance_lock import (
+import app.telegram.application as bot
+import app.infrastructure.instance_lock as bot_instance_lock
+from app.infrastructure.instance_lock import (
     BotInstanceLifecycle,
     InstanceLock,
     InstanceLockBusy,
@@ -311,7 +311,7 @@ class StartupChecksAndCleanupTests(unittest.TestCase):
             blocker.write_text("not a directory", encoding="utf-8")
             result = run_startup_checks(
                 working_directory=root,
-                database_path=blocker / "bot.db",
+                database_path=blocker / 'app.telegram.application.db',
                 callback_database_path=blocker / "callbacks.db",
                 zip_temp_root=root,
                 backup_directory=root / "backups",
@@ -393,17 +393,7 @@ class InstanceLockSubprocessTests(unittest.TestCase):
 
     def _command(self, lock_path: Path, hold_seconds: float, crash: bool = False):
         source = (
-            "import asyncio, os, sys, time\n"
-            "from bot_instance_lock import InstanceLock, InstanceLockBusy\n"
-            "p = sys.argv[1]\n"
-            "hold = float(sys.argv[2])\n"
-            "async def go():\n"
-            " l=InstanceLock(p)\n"
-            " try:\n"
-            "  await l.acquire(wait_seconds=0)\n"
-            " except InstanceLockBusy:\n"
-            "  print('BUSY',flush=True);return\n"
-            " print('OWNED',flush=True)\n"
+            "import asyncio, os, sys, time\nfrom app.infrastructure.instance_lock import InstanceLock, InstanceLockBusy\np = sys.argv[1]\nhold = float(sys.argv[2])\nasync def go():\n l=InstanceLock(p)\n try:\n  await l.acquire(wait_seconds=0)\n except InstanceLockBusy:\n  print('BUSY',flush=True);return\n print('OWNED',flush=True)\n"
             + (" os._exit(17)\n" if crash else " time.sleep(hold);l.release()\n")
             + "asyncio.run(go())"
         )

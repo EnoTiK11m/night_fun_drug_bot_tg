@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import dataclass
 import io
 import logging
+from app.observability.logic_trace import trace_event, annotate
 import ipaddress
 import os
 import socket
@@ -12,10 +13,10 @@ import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
-from bot_delivery import execute_telegram_request
-from bot_features import runtime_metrics
-from bot_formatting import md_text
-from config import GLOBAL_DOWNLOAD_CONCURRENCY
+from app.telegram.delivery import execute_telegram_request
+from app.services.media_preferences import runtime_metrics
+from app.telegram.formatting import md_text
+from app.config import GLOBAL_DOWNLOAD_CONCURRENCY
 
 logger = logging.getLogger(__name__)
 
@@ -462,7 +463,9 @@ async def reply_downloaded_photo(message, url: str, caption: str, reply_markup, 
 
 async def _ensure_delivery_precondition(before_send) -> None:
     if before_send is not None and not await before_send():
+        trace_event("telegram.send.skipped", reason="delivery_precondition_failed")
         raise DeliveryPreconditionFailed("Delivery precondition is no longer valid")
+    trace_event('telegram.request.start', precondition_passed=True)
 
 
 async def send_media_url(
@@ -608,7 +611,11 @@ async def send_post_media(
         logger.warning("Media fallback missing url post=%s", post.get("id"))
         return False
 
-    for url_kind, media_url in candidates:
+    for source_index, (url_kind, media_url) in enumerate(candidates):
+        trace_event("media.source.attempt", level="normal", post_id=post.get("id"), url_kind=url_kind)
+        if source_index:
+            trace_event("telegram.send.fallback", post_id=post.get("id"), fallback_source=url_kind, reason="previous_source_rejected")
+        annotate(post_id=post.get("id"), media_type="video" if media_url_path_lower(media_url).endswith((".mp4", ".webm")) else "animation" if media_url_path_lower(media_url).endswith(".gif") else "photo")
         for attempt in range(1, retries + 1):
             try:
                 sent = await reply_media_url(
@@ -639,6 +646,7 @@ async def send_post_media(
                     exc,
                 )
                 if _telegram_url_fetch_failed(exc) and _is_downloadable_photo_url(media_url):
+                    trace_event("telegram.send.fallback", post_id=post.get("id"), fallback_source="download_upload")
                     try:
                         sent = await reply_downloaded_photo(
                             message, media_url, caption, reply_markup, has_spoiler
@@ -723,7 +731,11 @@ async def send_post_media_to_chat(
         )
         return False
 
-    for url_kind, media_url in candidates:
+    for source_index, (url_kind, media_url) in enumerate(candidates):
+        trace_event("media.source.attempt", level="normal", post_id=post.get("id"), url_kind=url_kind)
+        if source_index:
+            trace_event("telegram.send.fallback", post_id=post.get("id"), fallback_source=url_kind, reason="previous_source_rejected")
+        annotate(post_id=post.get("id"), media_type="video" if media_url_path_lower(media_url).endswith((".mp4", ".webm")) else "animation" if media_url_path_lower(media_url).endswith(".gif") else "photo")
         for attempt in range(1, retries + 1):
             try:
                 sent = await send_media_url(
@@ -759,6 +771,7 @@ async def send_post_media_to_chat(
                     exc,
                 )
                 if _telegram_url_fetch_failed(exc) and _is_downloadable_photo_url(media_url):
+                    trace_event("telegram.send.fallback", post_id=post.get("id"), fallback_source="download_upload")
                     try:
                         sent = await send_downloaded_photo(
                             bot, chat_id, media_url, caption, reply_markup,

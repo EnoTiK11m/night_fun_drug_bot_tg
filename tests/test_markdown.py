@@ -1,6 +1,6 @@
 import unittest
 
-from bot import build_full_tags_messages, md_code, md_text
+from app.telegram.application import build_full_tags_messages, md_code, md_text
 
 
 class MarkdownEscapingTests(unittest.TestCase):

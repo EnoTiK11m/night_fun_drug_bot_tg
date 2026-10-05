@@ -4,8 +4,8 @@ import unittest
 import uuid
 import sqlite3
 
-import database
-from bot_features import (
+import app.storage.database as database
+from app.services.media_preferences import (
     filter_and_sort_posts,
     media_group_compatible_url,
     normalize_feature_settings,

@@ -21,7 +21,7 @@ from typing import Callable, Iterable
 
 
 logger = logging.getLogger(__name__)
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ORPHAN_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_ORPHAN_CLEANUP_BATCH = 100
 

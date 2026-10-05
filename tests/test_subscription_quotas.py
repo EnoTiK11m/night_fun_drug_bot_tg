@@ -5,8 +5,8 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
-import bot
-import database
+import app.telegram.application as bot
+import app.storage.database as database
 
 
 class SubscriptionQuotaTests(unittest.IsolatedAsyncioTestCase):
