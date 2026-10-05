@@ -3,6 +3,7 @@ import asyncio
 import random
 import json
 import logging
+from app.services.media_preferences import post_matches_preferences, media_kind
 from app.observability.logic_trace import trace_event, trace_error, traced_flow, increment
 import time
 from app.integrations.rule34.rate_limiter import rule34_limiter, QuotaQueueFull
@@ -292,7 +293,8 @@ class rule34API:
     async def get_global_random_image(
         self,
         blacklist: Set[str],
-        excluded_post_ids: Optional[Set[int]] = None
+        excluded_post_ids: Optional[Set[int]] = None,
+        settings: Optional[Dict] = None
     ) -> Optional[Dict]:
         """Получить лёгкий случайный пост без поисковых тегов."""
         logger.debug("get_global_random_image called")
@@ -319,12 +321,36 @@ class rule34API:
                 logger.debug("No global random posts found on page %s", pid)
                 continue
 
-            valid_posts = [
-                post for post in posts
-                if post.get("file_url") and self._post_id(post) not in excluded_post_ids
-            ]
+            counts = dict.fromkeys(('invalid_id', 'missing_url', 'already_sent', 'blacklist',
+                                    'rating', 'media_type', 'orientation', 'resolution'), 0)
+            valid_posts = []
+            filters = settings or {}
+            blocked = {str(tag).lower().lstrip('-') for tag in blacklist | DEFAULT_BLACKLIST}
+            for post in posts:
+                reason = None
+                try:
+                    post_id = int(post['id']) if isinstance(post, dict) else 0
+                except (KeyError, TypeError, ValueError):
+                    post_id = 0
+                if post_id <= 0: reason = 'invalid_id'
+                elif not post.get('file_url'): reason = 'missing_url'
+                elif post_id in excluded_post_ids: reason = 'already_sent'
+                elif blocked.intersection(str(post.get('tags', '')).lower().split()): reason = 'blacklist'
+                elif not post_matches_preferences(post, filters):
+                    if filters.get('rating_filter', 'all') != 'all' and post.get('rating') != filters['rating_filter']: reason = 'rating'
+                    elif filters.get('media_type', 'all') != 'all' and media_kind(post) != filters['media_type']: reason = 'media_type'
+                    elif not post_matches_preferences(post, dict(filters, orientation='any')): reason = 'resolution'
+                    else: reason = 'orientation'
+                if reason:
+                    counts[reason] += 1
+                else:
+                    valid_posts.append(post)
+            trace_event('filter.summary', level='normal', source='global_random', pid=pid,
+                        received=len(posts), accepted=len(valid_posts), **counts)
             if valid_posts:
                 selected_post = random.choice(valid_posts)
+                trace_event('post.selected', post_id=selected_post['id'], pid=pid,
+                            candidate_count=len(valid_posts), selection_mode='global_random')
                 logger.debug(
                     "Selected global random post ID %s from page %s attempt %s/%s",
                     selected_post.get("id"),

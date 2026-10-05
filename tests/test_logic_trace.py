@@ -24,7 +24,7 @@ from scripts.read_trace import read_events, summary
 class TraceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory()
-        self.path = Path(self.directory.name) / 'app.observability.logic_trace.jsonl'
+        self.path = Path(self.directory.name) / 'logic_trace.jsonl'
 
     async def asyncTearDown(self):
         await trace.shutdown_trace()

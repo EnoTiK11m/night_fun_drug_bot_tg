@@ -1,6 +1,26 @@
 """Domain implementation. Dependencies are supplied by the public facade."""
 
+import asyncio
+
+# Ref-counted locks cover selection, send and acknowledgement for one user's
+# subscriptions. The single-instance guard already excludes a second bot process.
+_delivery_locks = {}
+
+
 async def process_one_subscription(runtime, app, subscription):
+    user = subscription[0]
+    entry = _delivery_locks.setdefault(user, [asyncio.Lock(), 0])
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            return await _process_one_subscription(runtime, app, subscription)
+    finally:
+        entry[1] -= 1
+        if not entry[1]:
+            del _delivery_locks[user]
+
+
+async def _process_one_subscription(runtime, app, subscription):
     """Process one due subscription after atomically claiming it."""
     user_id, query, interval, empty_count = subscription
     runtime.trace_event("subscription.claim.request", level="normal")
@@ -49,7 +69,7 @@ async def process_one_subscription(runtime, app, subscription):
                 updated = await runtime.update_subscription_time(user_id, query, processing_token)
                 claim_completed = bool(updated)
                 if updated and post_id:
-                    await runtime.search_service.delivered(user_id, query, result, subscription=True)
+                    await runtime.search_service.delivered(user_id, query, result, subscription=True, user_delivery=False)
                     await runtime.mark_post_sent(user_id, int(post_id))
                 runtime.runtime_metrics.increment("subscription_digest_queued", int(queued))
                 return bool(updated)
@@ -98,10 +118,13 @@ async def process_one_subscription(runtime, app, subscription):
             runtime.trace_outcome("success" if delivered else "telegram_error", post_id=post_id)
             if delivered:
                 runtime.runtime_metrics.increment("subscription_delivered")
+                if post_id:
+                    await runtime._cancellation_safe_db_call(
+                        runtime.search_service.delivered(user_id, query, result, subscription=True)
+                    )
                 updated = await runtime.update_subscription_time(user_id, query, processing_token)
                 claim_completed = bool(updated)
                 if updated and post_id:
-                    await runtime.search_service.delivered(user_id, query, result, subscription=True)
                     await runtime.mark_post_sent(user_id, int(post_id))
                     await runtime.clear_delivery_failure_for_post(user_id, int(post_id))
                 elif not updated:

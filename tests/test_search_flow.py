@@ -126,7 +126,7 @@ class SearchFlowTests(unittest.IsolatedAsyncioTestCase):
             delivered = await bot.send_random_image(message, 1)
 
         self.assertTrue(delivered)
-        get_global_random_image.assert_awaited_once_with({"blocked"}, {456})
+        get_global_random_image.assert_awaited_once_with({"blocked"}, {456}, settings=bot.normalize_feature_settings({"show_caption": False}))
         save_user_query.assert_not_awaited()
         mark_sent.assert_awaited_once_with(1, 123)
 

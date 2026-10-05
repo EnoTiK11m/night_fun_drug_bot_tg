@@ -258,6 +258,23 @@ async def apply_versioned_migrations(runtime, db):
             WHEN NEW.interval_minutes IS NOT OLD.interval_minutes AND NEW.interval_seconds IS OLD.interval_seconds
             BEGIN UPDATE subscriptions SET interval_seconds = NEW.interval_minutes * 60
             WHERE user_id = NEW.user_id AND query = NEW.query; END""")
+        recorded_history = await (await db.execute('SELECT 1 FROM schema_migrations WHERE version=8')).fetchone()
+        if not recorded_history:
+            await db.execute("""CREATE TABLE IF NOT EXISTS subscription_user_delivery_history (
+                user_id INTEGER NOT NULL, post_id INTEGER NOT NULL,
+                sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, post_id))""")
+            await db.execute("""CREATE INDEX IF NOT EXISTS idx_subscription_user_history_sent
+                ON subscription_user_delivery_history(user_id, sent_at)""")
+        columns = await (await db.execute('PRAGMA table_info(subscription_user_delivery_history)')).fetchall()
+        schema = {row[1]: row for row in columns}
+        index = await (await db.execute('PRAGMA index_info(idx_subscription_user_history_sent)')).fetchall()
+        if (not {'user_id', 'post_id', 'sent_at'} <= schema.keys()
+                or tuple(row[2] for row in index) != ('user_id', 'sent_at')
+                or [(row[1], row[5]) for row in columns if row[5]] != [('user_id', 1), ('post_id', 2)]
+                or any(not schema[name][3] for name in ('user_id', 'post_id', 'sent_at'))):
+            raise RuntimeError('Migration 8 subscription user history schema is invalid')
+        await db.execute('INSERT OR IGNORE INTO schema_migrations(version) VALUES (8)')
         await db.commit()
     except BaseException:
         await db.rollback()

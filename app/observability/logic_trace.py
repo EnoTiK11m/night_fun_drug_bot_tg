@@ -123,7 +123,7 @@ def configure_trace(*, enabled=None, path=None, level=None, max_bytes=None, back
         return
     _level = LEVELS.get(level or config.LOGIC_TRACE_LEVEL, 1)
     _secrets = tuple(sorted({str(s) for s in (secrets if secrets is not None else (config.BOT_TOKEN, config.API_KEY, config.API_USER_ID)) if s}, key=len, reverse=True))
-    _writer = TraceWriter(path or config.PROJECT_ROOT / 'logs' / 'app.observability.logic_trace.jsonl',
+    _writer = TraceWriter(path or config.PROJECT_ROOT / 'logs' / 'logic_trace.jsonl',
         max(128, max_bytes or config.LOGIC_TRACE_MAX_BYTES),
         max(1, backup_count if backup_count is not None else config.LOGIC_TRACE_BACKUP_COUNT),
         max(1, retention_days or config.LOGIC_TRACE_RETENTION_DAYS), queue_size)

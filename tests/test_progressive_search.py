@@ -94,7 +94,7 @@ class ProgressiveTests(TempDatabaseTestCase):
         fresh = await service.select(1, 'tag', set(), {}, subscription=True)
         self.assertEqual(fresh['id'], 10001)
 
-    async def test_subscription_dedup_is_independent_and_delete_resets(self):
+    async def test_subscription_progress_resets_but_user_delivery_survives_delete(self):
         api = Pages()
         service = ProgressiveSearch(api)
         for query in ('a', 'b'):
@@ -105,11 +105,11 @@ class ProgressiveTests(TempDatabaseTestCase):
             second = await service.select(1, 'a', set(), {}, subscription=True)
             other = await service.select(1, 'b', set(), {}, subscription=True)
             self.assertNotEqual(first['id'], second['id'])
-            self.assertEqual(first['id'], other['id'])
+            self.assertNotEqual(first['id'], other['id'])
             await database.remove_subscription(1, 'a')
             await database.add_subscription(1, 'a', 60)
             reset = await service.select(1, 'a', set(), {}, subscription=True)
-            self.assertEqual(first['id'], reset['id'])
+            self.assertNotEqual(first['id'], reset['id'])
 
     async def test_budget_exhaustion_preserves_cursor_and_is_not_empty(self):
         service = ProgressiveSearch(Pages(), request_budget=2)

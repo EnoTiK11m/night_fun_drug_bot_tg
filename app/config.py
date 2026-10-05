@@ -212,11 +212,7 @@ GIT_UPDATE_PIP_TIMEOUT_SECONDS = max(
     30, _get_int_env("GIT_UPDATE_PIP_TIMEOUT_SECONDS", 300)
 )
 
-# Temporarily simplified blacklist for testing
-DEFAULT_BLACKLIST = {
-    "none",
-
-}
+DEFAULT_BLACKLIST = set()
 
 # Лимиты
 MAX_POSTS_PER_REQUEST = 1000

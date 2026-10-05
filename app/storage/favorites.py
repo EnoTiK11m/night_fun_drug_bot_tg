@@ -481,6 +481,7 @@ async def cleanup_user_storage(runtime, user_id, days):
         for name, table, column in (
             ("history", "search_history", "searched_at"),
             ("viewed", "sent_posts", "sent_at"),
+            ("subscription_viewed", "subscription_user_delivery_history", "sent_at"),
             ("events", "bot_events", "created_at"),
         ):
             cursor = await db.execute(f"""

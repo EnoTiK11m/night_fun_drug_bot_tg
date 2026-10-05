@@ -1542,28 +1542,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await callbacks.button_handler(sys.modules[__name__], update, context)
 
 
-async def select_post_matching_preferences(
-    result: dict | None,
-    settings: dict,
-    fetch_replacement,
-    excluded_post_ids: set[int],
-    *,
-    max_replacements: int = 4,
-) -> dict | None:
-    """Return only a matching post, including after the final retry."""
-    for attempt in range(max_replacements + 1):
-        if not result or post_matches_preferences(result, settings):
-            return result
-        try:
-            excluded_post_ids.add(int(result.get("id")))
-        except (TypeError, ValueError):
-            pass
-        if attempt == max_replacements:
-            break
-        result = await fetch_replacement()
-    return None
-
-
 @traced_flow("search", user_arg="user_id")
 @admitted_search
 async def send_random_image(
@@ -1589,14 +1567,11 @@ async def send_random_image(
 
     started_at = time.monotonic()
     try:
-        result = await api.get_global_random_image(blacklist, excluded_post_ids)
         filter_settings = normalize_feature_settings(settings)
-        result = await select_post_matching_preferences(
-            result,
-            filter_settings,
-            lambda: api.get_global_random_image(blacklist, excluded_post_ids),
-            excluded_post_ids,
-        )
+        result = await api.get_global_random_image(blacklist, excluded_post_ids, settings=filter_settings)
+        # Keep the delivery boundary strict without issuing replacement requests.
+        if result and not post_matches_preferences(result, filter_settings):
+            result = None
         logger.info(
             "Random post source=api user=%s post=%s elapsed=%.3fs",
             user_id,

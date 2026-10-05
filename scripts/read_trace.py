@@ -58,12 +58,19 @@ def summary(events):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--file', type=Path, default=Path(__file__).resolve().parent.parent / 'logs' / 'app.observability.logic_trace.jsonl')
+    canonical = Path(__file__).resolve().parent.parent / 'logs' / 'logic_trace.jsonl'
+    parser.add_argument('--file', type=Path)
     for name in ('trace', 'flow', 'user', 'event'):
         parser.add_argument('--' + name)
     parser.add_argument('--last', type=int)
     parser.add_argument('--summary', action='store_true')
     args = parser.parse_args()
+    if args.file is None:
+        args.file = canonical
+        legacy = canonical.with_name('app.observability.logic_trace.jsonl')
+        if not canonical.exists() and legacy.exists():
+            args.file = legacy
+            print(f'Canonical trace missing; reading legacy file: {legacy}', file=sys.stderr)
     if args.last is not None and not 1 <= args.last <= 10000:
         parser.error('--last must be between 1 and 10000')
     events, invalid = read_events(args.file, trace=args.trace, flow=args.flow, user=args.user,

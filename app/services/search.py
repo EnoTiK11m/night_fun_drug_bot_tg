@@ -94,6 +94,13 @@ class ProgressiveSearch:
             if subscription:
                 cursor = await db.execute('''SELECT post_id FROM subscription_delivery_history
                     WHERE user_id=? AND query=? AND post_id IN (SELECT value FROM json_each(?))''', (user, query, json.dumps(ids)))
+                local = {row[0] for row in await cursor.fetchall()}
+                cursor = await db.execute('''SELECT post_id FROM subscription_user_delivery_history
+                    WHERE user_id=? AND post_id IN (SELECT value FROM json_each(?))''', (user, json.dumps(ids)))
+                global_seen = {row[0] for row in await cursor.fetchall()}
+                trace_event('subscription.dedup.filtered', level='normal',
+                    subscription_query_dedup=len(local), subscription_global_dedup=len(global_seen - local))
+                return local | global_seen
             else:
                 cursor = await db.execute('''SELECT post_id FROM sent_posts
                     WHERE user_id=? AND post_id IN (SELECT value FROM json_each(?))''', (user, json.dumps(ids)))
@@ -271,10 +278,19 @@ class ProgressiveSearch:
             state.update(pid=state['pid'] + 1, page=[], used=[])
             await self._save(kind, user, query, state)
 
-    async def delivered(self, user, query, post, *, subscription=False):
+    async def delivered(self, user, query, post, *, subscription=False, user_delivery=True):
         kind = 'subscription' if subscription else 'search'
         async with database.connect_db() as db:
             await db.execute('BEGIN IMMEDIATE')
+            if subscription and user_delivery:
+                inserted_global = await db.execute('INSERT OR IGNORE INTO subscription_user_delivery_history(user_id,post_id) VALUES (?,?)', (user, int(post['id'])))
+                if inserted_global.rowcount:
+                    await db.execute("""DELETE FROM subscription_user_delivery_history
+                        WHERE user_id=? AND post_id IN (
+                            SELECT post_id FROM subscription_user_delivery_history WHERE user_id=?
+                            ORDER BY sent_at DESC, rowid DESC LIMIT 1000 OFFSET ?)""",
+                        (user, user, database.SUBSCRIPTION_USER_HISTORY_RETENTION_PER_USER))
+                trace_event('subscription.user_history.saved', level='normal', post_id=post['id'], inserted=bool(inserted_global.rowcount))
             row = await (await db.execute('SELECT used_json,high_water FROM query_progress WHERE kind=? AND user_id=? AND query=?', (kind, user, query))).fetchone()
             if row:
                 used = json.loads(row[0])
