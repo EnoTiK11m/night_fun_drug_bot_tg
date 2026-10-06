@@ -5,6 +5,84 @@ import asyncio
 # Ref-counted locks cover selection, send and acknowledgement for one user's
 # subscriptions. The single-instance guard already excludes a second bot process.
 _delivery_locks = {}
+CLAIM_RENEWAL_INTERVAL_SECONDS = 60.0
+
+
+class _SubscriptionClaimLease:
+    """Keep one worker's lease alive; fail closed if renewal loses ownership."""
+
+    def __init__(self, runtime, user_id, query, token, *, sleep=None):
+        self.runtime = runtime
+        self.user_id, self.query, self.token = user_id, query, token
+        self.sleep = sleep or asyncio.sleep
+        self.lost = False
+        self.stopped = False
+        self.worker_started = False
+        self.task = None
+
+    def trace(self, event, *, level="normal", **fields):
+        self.runtime.trace_event(
+            event, level=level, user_id_hash=self.runtime.safe_hash(self.user_id, 'u_'),
+            query=self.query, query_hash=self.runtime.safe_hash(self.query, 'q_'),
+            claim_token_hash=self.runtime.safe_hash(self.token),
+            lease_minutes=self.runtime.SUBSCRIPTION_CLAIM_MINUTES, **fields,
+        )
+
+    async def _renew(self, worker):
+        while not self.stopped:
+            await self.sleep(CLAIM_RENEWAL_INTERVAL_SECONDS)
+            if self.stopped:
+                return
+            try:
+                renewed = await self.runtime.renew_subscription_claim(
+                    self.user_id, self.query, self.token
+                )
+            except Exception as exc:
+                self.runtime.logger.warning(
+                    "Subscription claim renewal failed user=%s query=%r type=%s",
+                    self.user_id, self.query, type(exc).__name__,
+                )
+                renewed = False
+            if self.stopped:
+                return
+            if renewed:
+                self.trace("claim.renewed", level="verbose", result=True,
+                           lease_remaining_seconds=self.runtime.SUBSCRIPTION_CLAIM_MINUTES * 60)
+            else:
+                self.lost = True
+                self.trace("claim.renewal_failed", result=False)
+                self.runtime.logger.warning(
+                    "Subscription claim lost during active flow user=%s query=%r",
+                    self.user_id, self.query,
+                )
+                worker.cancel()
+                return
+
+    async def stop(self):
+        if self.stopped:
+            return
+        self.stopped = True
+        if self.task is not None:
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+        self.trace("claim.renewal_stopped", level="verbose", result=not self.lost)
+
+    async def run(self, coroutine):
+        worker = asyncio.create_task(coroutine, name="subscription-claim-worker")
+        self.task = asyncio.create_task(self._renew(worker), name="subscription-claim-renewal")
+        try:
+            result = await worker
+            # A simultaneous external cancellation must still reach the caller,
+            # even if the worker consumed our internal claim-loss cancellation.
+            if asyncio.current_task().cancelling():
+                raise asyncio.CancelledError
+            return result
+        finally:
+            await self.runtime._cancellation_safe_db_call(self.stop())
+            if not self.worker_started:
+                await self.runtime._cancellation_safe_db_call(
+                    self.runtime.release_subscription_claim(self.user_id, self.query, self.token)
+                )
 
 
 async def process_one_subscription(runtime, app, subscription):
@@ -38,6 +116,15 @@ async def _process_one_subscription(runtime, app, subscription):
         await runtime.release_subscription_claim(user_id, query, processing_token)
         return False
 
+    lease = _SubscriptionClaimLease(runtime, user_id, query, processing_token)
+    return await lease.run(_process_claimed_subscription(
+        runtime, app, subscription, processing_token, lease
+    ))
+
+
+async def _process_claimed_subscription(runtime, app, subscription, processing_token, lease):
+    lease.worker_started = True
+    user_id, query, interval, empty_count = subscription
     result = None
     caption = ""
     claim_completed = False
@@ -66,6 +153,7 @@ async def _process_one_subscription(runtime, app, subscription):
             post_id = result.get("id", 0)
             if subscription_options.get("digest_mode") == "digest":
                 queued = await runtime.enqueue_subscription_digest(user_id, query, result)
+                await lease.stop()
                 updated = await runtime.update_subscription_time(user_id, query, processing_token)
                 claim_completed = bool(updated)
                 if updated and post_id:
@@ -97,7 +185,7 @@ async def _process_one_subscription(runtime, app, subscription):
 
             async def subscription_delivery_allowed():
                 allowed = runtime.is_recipient_allowed(user_id, user_id, "private")
-                valid = await runtime.is_subscription_claim_active(user_id, query, processing_token) if allowed else False
+                valid = await runtime.is_subscription_claim_active(user_id, query, processing_token) if allowed and not lease.lost else False
                 ctx = runtime.current_trace()
                 runtime.trace_event("subscription.before_send.revalidate", level="normal", recipient_allowed=allowed, claim_valid=valid, active=ctx.fields.get('claim_active') if ctx and allowed else None, paused=ctx.fields.get('claim_paused') if ctx and allowed else None)
                 if not valid:
@@ -114,6 +202,9 @@ async def _process_one_subscription(runtime, app, subscription):
                 settings=settings,
                 before_send=subscription_delivery_allowed,
             )
+            if lease.lost:
+                runtime.trace_outcome("stale")
+                return False
             runtime.trace_event("subscription.delivery.success" if delivered else "subscription.delivery.failed", post_id=post_id)
             runtime.trace_outcome("success" if delivered else "telegram_error", post_id=post_id)
             if delivered:
@@ -122,6 +213,9 @@ async def _process_one_subscription(runtime, app, subscription):
                     await runtime._cancellation_safe_db_call(
                         runtime.search_service.delivered(user_id, query, result, subscription=True)
                     )
+                # Stop before our own terminal UPDATE clears the token: a
+                # concurrent renewal must not mistake completion for claim loss.
+                await lease.stop()
                 updated = await runtime.update_subscription_time(user_id, query, processing_token)
                 claim_completed = bool(updated)
                 if updated and post_id:
@@ -139,6 +233,7 @@ async def _process_one_subscription(runtime, app, subscription):
                 await runtime.save_delivery_failure(user_id, result, caption)
             return bool(delivered)
 
+        await lease.stop()
         empty_count, backoff_minutes, should_notify = await runtime.mark_subscription_empty(
             user_id, query, processing_token
         )
@@ -178,6 +273,10 @@ async def _process_one_subscription(runtime, app, subscription):
         return False
 
     except runtime.asyncio.CancelledError:
+        await runtime._cancellation_safe_db_call(lease.stop())
+        if lease.lost:
+            runtime.trace_outcome("stale")
+            return False
         if delivery_started:
             claim_completed = await runtime._cancellation_safe_db_call(
                 runtime.defer_subscription_after_transient_failure(
@@ -186,6 +285,7 @@ async def _process_one_subscription(runtime, app, subscription):
             )
         raise
     except runtime.TimedOut as trace_exc:
+        await lease.stop()
         runtime.trace_outcome("telegram_error")
         runtime.trace_error(trace_exc, stage="subscription.delivery", event="subscription.error")
         claim_completed = await runtime.defer_subscription_after_transient_failure(
@@ -198,6 +298,7 @@ async def _process_one_subscription(runtime, app, subscription):
         )
         return False
     except runtime.NetworkError as exc:
+        await lease.stop()
         runtime.trace_outcome("telegram_error")
         runtime.trace_error(exc, stage="subscription.delivery", event="subscription.error")
         if isinstance(exc, runtime.BadRequest):
@@ -220,12 +321,14 @@ async def _process_one_subscription(runtime, app, subscription):
         )
         return False
     except runtime.SearchBudgetExceeded:
+        await lease.stop()
         trace_ctx = runtime.current_trace()
         deadline_hit = bool(trace_ctx and trace_ctx.outcome == 'deadline')
         runtime.trace_event('subscription.defer.deadline' if deadline_hit else 'subscription.defer.budget', reason='deadline' if deadline_hit else 'request_budget_exhausted')
         claim_completed = await runtime.defer_subscription_after_transient_failure(user_id, query, processing_token)
         return False
     except runtime.APITemporaryError as e:
+        await lease.stop()
         runtime.trace_outcome("api_error")
         runtime.trace_event("subscription.defer.api_error", reason="api_error")
         runtime.trace_error(e, stage="rule34")
@@ -241,6 +344,7 @@ async def _process_one_subscription(runtime, app, subscription):
         )
         return False
     except Exception as exc:
+        await lease.stop()
         runtime.trace_outcome("error")
         runtime.trace_error(exc, stage="subscription", event="subscription.error")
         if result:
@@ -253,6 +357,7 @@ async def _process_one_subscription(runtime, app, subscription):
         )
         return False
     finally:
+        await runtime._cancellation_safe_db_call(lease.stop())
         if not claim_completed:
             await runtime._cancellation_safe_db_call(
                 runtime.release_subscription_claim(user_id, query, processing_token)

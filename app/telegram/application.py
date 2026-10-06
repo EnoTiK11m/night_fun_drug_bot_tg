@@ -182,6 +182,8 @@ from app.storage.database import (
     get_subscription_usage,
     get_due_subscriptions,
     claim_due_subscription,
+    renew_subscription_claim,
+    SUBSCRIPTION_CLAIM_MINUTES,
     is_subscription_claim_active,
     defer_subscription_after_transient_failure,
     release_subscription_claim,
@@ -587,6 +589,7 @@ FAVORITES_EXPORT_COOLDOWN_SECONDS = 5 * 60
 POST_TAGS_PAGE_SIZE = 8
 FAVORITES_GALLERY_PAGE_SIZE = 10
 RESTART_EXIT_CODE = 42
+ADMIN_SHUTDOWN_NOTIFICATION_TIMEOUT_SECONDS = 3.0
 restart_requested = False
 RESTART_TEXT_COMMANDS = {"restart", "рестарт"}
 upstream_failure_streak = 0
@@ -4028,6 +4031,15 @@ async def retry_failed_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+async def _best_effort_admin_notification(update, text):
+    """Bound only the admin notification, without bypassing the TG limiter."""
+    try:
+        async with asyncio.timeout(ADMIN_SHUTDOWN_NOTIFICATION_TIMEOUT_SECONDS):
+            await update.message.reply_text(text)
+    except Exception as exc:
+        logger.warning("Admin notification failed or timed out type=%s", type(exc).__name__)
+
+
 async def request_restart(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -4041,11 +4053,15 @@ async def request_restart(
         logger.warning("Unauthorized restart attempt user=%s", user_id)
         return
 
+    if restart_requested:
+        return
     restart_requested = True
-    if response_text:
-        await update.message.reply_text(response_text)
-    logger.warning("Restart requested by admin user=%s", user_id)
-    context.application.stop_running()
+    try:
+        if response_text:
+            await _best_effort_admin_notification(update, response_text)
+    finally:
+        logger.warning("Restart requested by admin user=%s", user_id)
+        context.application.stop_running()
 
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4213,19 +4229,21 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         write_update_marker(admin_id, result.new_commit)
-        await update.message.reply_text(
-            "✅ Обновление установлено.\n"
-            f"Было: {result.old_commit[:12]}\n"
-            f"Стало: {result.new_commit[:12]}\n"
-            "Перезапускаюсь…"
-        )
-        await request_restart(update, context, response_text=None)
+        try:
+            await _best_effort_admin_notification(update,
+                "✅ Обновление установлено.\n"
+                f"Было: {result.old_commit[:12]}\n"
+                f"Стало: {result.new_commit[:12]}\n"
+                "Перезапускаюсь…"
+            )
+        finally:
+            await request_restart(update, context, response_text=None)
     except asyncio.CancelledError:
         logger.warning("Project update cancelled admin=%s", admin_id)
         raise
     except Exception:
         logger.exception("Project update handler failed admin=%s", admin_id)
-        await update.message.reply_text("❌ Не удалось завершить обновление.")
+        await _best_effort_admin_notification(update, "❌ Не удалось завершить обновление.")
     finally:
         update_operation_lock.release()
         logger.warning(

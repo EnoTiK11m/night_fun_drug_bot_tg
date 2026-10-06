@@ -429,6 +429,29 @@ async def claim_due_subscription(runtime, user_id, query):
         return token if cursor.rowcount == 1 else None
 
 
+async def renew_subscription_claim(runtime, user_id, query, processing_token):
+    """Extend only the still-live, unpaused lease owned by this worker."""
+    async with runtime.connect_db() as db:
+        cursor = await db.execute("""
+            UPDATE subscriptions
+            SET processing_until = datetime('now', '+' || ? || ' minutes')
+            WHERE user_id = ? AND query = ? AND processing_token = ?
+              AND is_active = 1
+              AND datetime(processing_until) > datetime('now')
+              AND NOT EXISTS (
+                  SELECT 1 FROM user_settings us
+                  WHERE us.user_id = subscriptions.user_id
+                    AND datetime(json_extract(
+                        CASE WHEN json_valid(COALESCE(us.settings_json, '{}'))
+                             THEN us.settings_json ELSE '{}' END,
+                        '$.subscription_pause_until'
+                    )) > datetime('now')
+              )
+        """, (runtime.SUBSCRIPTION_CLAIM_MINUTES, user_id, query.strip(), processing_token))
+        await db.commit()
+        return cursor.rowcount == 1
+
+
 async def defer_subscription_after_transient_failure(runtime, user_id, query, processing_token, backoff_seconds):
     """Persist a short retry delay and release only the caller's live claim."""
     bounded_backoff = max(1, min(int(backoff_seconds), 3600))

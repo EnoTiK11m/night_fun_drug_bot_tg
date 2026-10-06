@@ -432,6 +432,10 @@ async def claim_due_subscription(user_id: int, query: str) -> Optional[str]:
     return await subscriptions_repository.claim_due_subscription(sys.modules[__name__], user_id, query)
 
 
+async def renew_subscription_claim(user_id: int, query: str, processing_token: str) -> bool:
+    return await subscriptions_repository.renew_subscription_claim(sys.modules[__name__], user_id, query, processing_token)
+
+
 async def defer_subscription_after_transient_failure(user_id: int, query: str, processing_token: str, backoff_seconds: int=60) -> bool:
     """Persist a short retry delay and release only the caller's live claim."""
     return await subscriptions_repository.defer_subscription_after_transient_failure(sys.modules[__name__], user_id, query, processing_token, backoff_seconds)
