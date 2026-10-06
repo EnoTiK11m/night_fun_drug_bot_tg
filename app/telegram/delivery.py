@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 from app.observability.logic_trace import trace_event, trace_error, current_trace
 import time
 from collections import deque
@@ -22,7 +23,6 @@ from app.config import (
 logger = logging.getLogger(__name__)
 
 TELEGRAM_MESSAGES_PER_CHAT_MINUTE = 45  # Backward-compatible public constant.
-MAX_RETRY_AFTER_SECONDS = 300.0
 MAX_CHAT_BUCKETS = 4096
 SAFE_TIMEOUT_RETRIES = 1
 AmbiguousBadRequestPolicy = Literal[
@@ -72,18 +72,23 @@ class _Waiter:
     wait_counted: bool = False
 
 
-def retry_after_seconds(value: RetryAfter | timedelta | float | int | Any) -> float:
-    raw_value = getattr(value, "retry_after", value)
+def _raw_retry_after_seconds(value: Any) -> float | None:
+    """Return finite numeric seconds without logging arbitrary objects or secrets."""
     try:
-        if isinstance(raw_value, timedelta):
-            seconds = raw_value.total_seconds()
-        elif hasattr(raw_value, "total_seconds"):
-            seconds = raw_value.total_seconds()
-        else:
-            seconds = float(raw_value)
-    except (TypeError, ValueError, OverflowError):
-        seconds = 1.0
-    return min(MAX_RETRY_AFTER_SECONDS, max(0.0, float(seconds)))
+        raw_value = getattr(value, "retry_after", value)
+        if hasattr(raw_value, "total_seconds"):
+            raw_value = raw_value.total_seconds()
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+            return None
+        seconds = float(raw_value)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    return seconds if math.isfinite(seconds) else None
+
+
+def retry_after_seconds(value: RetryAfter | timedelta | float | int | Any) -> float:
+    seconds = _raw_retry_after_seconds(value)
+    return seconds if seconds is not None and seconds >= 0 else 1.0
 
 
 def is_ambiguous_bad_request_success(
@@ -366,20 +371,27 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
                 trace_event("telegram.send.success", operation=operation_name, attempt=attempt, duration_ms=(time.monotonic()-started)*1000)
                 return result
             except RetryAfter as exc:
-                trace_event("telegram.send.retry_after", operation=operation_name, attempt=attempt, wait_seconds=retry_after_seconds(exc))
+                raw_seconds = _raw_retry_after_seconds(exc)
                 self.metrics.telegram_retry_after_count += 1
-                wait_seconds = self.apply_retry_after(chat_id, exc)
+                wait_seconds = self.apply_retry_after(chat_id, raw_seconds)
+                remaining_seconds = max(0.0, self._global_cooldown_until - self._clock())
+                trace_event("telegram.send.retry_after", operation=operation_name, attempt=attempt,
+                            raw_retry_after_seconds=raw_seconds, applied_wait_seconds=wait_seconds,
+                            wait_seconds=wait_seconds, cooldown_remaining_seconds=remaining_seconds)
+                logger.warning(
+                    "Telegram RetryAfter operation=%s chat_id=%s attempt=%s "
+                    "raw_retry_after_seconds=%s applied_wait_seconds=%s cooldown_remaining_seconds=%s",
+                    operation_name,
+                    chat_id,
+                    attempt,
+                    raw_seconds,
+                    wait_seconds,
+                    remaining_seconds,
+                )
                 if retry_after_attempts >= retry_limit:
                     raise
                 retry_after_attempts += 1
                 self.metrics.telegram_retry_attempts += 1
-                logger.warning(
-                    "Telegram RetryAfter operation=%s chat=%s attempt=%s wait=%.1fs",
-                    operation_name,
-                    chat_id,
-                    attempt,
-                    wait_seconds,
-                )
             except Exception as trace_exc:
                 trace_error(trace_exc, stage=operation_name, event="telegram.send.failed")
                 raise

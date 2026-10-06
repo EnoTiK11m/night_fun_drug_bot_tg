@@ -192,7 +192,7 @@ class TelegramRateLimiterTests(unittest.IsolatedAsyncioTestCase):
     def test_retry_after_number_and_timedelta_are_normalized(self):
         self.assertEqual(retry_after_seconds(7), 7.0)
         self.assertEqual(retry_after_seconds(timedelta(seconds=9)), 9.0)
-        self.assertEqual(retry_after_seconds(1000), 300.0)
+        self.assertEqual(retry_after_seconds(1000), 1000.0)
 
     async def test_retry_attempts_are_limited(self):
         limiter = TelegramRateLimiter(
