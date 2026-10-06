@@ -1,4 +1,5 @@
 """Domain implementation. Dependencies are supplied by the public facade."""
+from app.observability.db_diagnostics import db_operation, query as diagnostic_query
 
 async def get_subscription_pause_until(runtime, user_id):
     async with runtime.connect_db() as db:
@@ -229,6 +230,7 @@ async def get_all_user_subscriptions(runtime, user_id):
         return [(row[0], row[1], bool(row[2]), row[3] or 0, row[4]) for row in rows]
 
 
+@db_operation("subscription.schedule.update")
 async def update_subscription_time(runtime, user_id, query, processing_token):
     async with runtime.connect_db() as db:
         params: tuple[runtime.Any, ...]
@@ -399,10 +401,11 @@ async def get_due_subscriptions(runtime):
         return await cursor.fetchall()
 
 
+@db_operation("subscription.claim.acquire")
 async def claim_due_subscription(runtime, user_id, query):
     token = runtime.uuid.uuid4().hex
     async with runtime.connect_db() as db:
-        cursor = await db.execute("""
+        cursor = await diagnostic_query(db, "claim.acquire.update").execute("""
             UPDATE subscriptions
             SET processing_until = datetime('now', '+' || ? || ' minutes'),
                 processing_token = ?
@@ -429,10 +432,11 @@ async def claim_due_subscription(runtime, user_id, query):
         return token if cursor.rowcount == 1 else None
 
 
+@db_operation("subscription.claim.renew")
 async def renew_subscription_claim(runtime, user_id, query, processing_token):
     """Extend only the still-live, unpaused lease owned by this worker."""
     async with runtime.connect_db() as db:
-        cursor = await db.execute("""
+        cursor = await diagnostic_query(db, "claim.renew.update").execute("""
             UPDATE subscriptions
             SET processing_until = datetime('now', '+' || ? || ' minutes')
             WHERE user_id = ? AND query = ? AND processing_token = ?
@@ -507,9 +511,10 @@ async def is_subscription_claim_active(runtime, user_id, query, processing_token
         return await cursor.fetchone() is not None
 
 
+@db_operation("subscription.claim.release")
 async def release_subscription_claim(runtime, user_id, query, processing_token):
     async with runtime.connect_db() as db:
-        await db.execute("""
+        await diagnostic_query(db, "claim.release.update").execute("""
             UPDATE subscriptions
             SET processing_until = NULL,
                 processing_token = NULL

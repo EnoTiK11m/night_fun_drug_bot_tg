@@ -1,4 +1,5 @@
 """Domain implementation. Dependencies are supplied by the public facade."""
+from app.observability.db_diagnostics import db_operation, query as diagnostic_query, metadata
 
 def _deleted_row_count(runtime, cursor):
     return max(0, int(cursor.rowcount or 0))
@@ -132,6 +133,7 @@ async def _cleanup_expired_caches_in_connection(runtime, db, *, subscription_ttl
     )
 
 
+@db_operation("cache.cleanup")
 async def cleanup_expired_caches(runtime, *, subscription_ttl_minutes, subscription_max_per_query, subscription_max_rows, post_ttl_hours, post_max_rows, batch_size, db):
     """Delete a bounded cache batch in one short transaction."""
     normalized_batch = max(1, int(batch_size))
@@ -161,6 +163,7 @@ async def get_cache_storage_stats(runtime):
     }
 
 
+@db_operation("cache.post")
 async def cache_post(runtime, post):
     normalized = runtime._normalize_post(post)
     if normalized is None:
@@ -195,6 +198,7 @@ async def get_cached_post(runtime, post_id):
         return runtime._post_from_row(row) if row else None
 
 
+@db_operation("subscription.cache.lookup")
 async def get_subscription_cache(runtime, user_id, query):
     async with runtime.connect_db() as db:
         cursor = await db.execute("""
@@ -228,11 +232,14 @@ async def is_subscription_cache_stale(runtime, user_id, query):
         return await cursor.fetchone() is None
 
 
+@db_operation("subscription.cache.replace")
 async def replace_subscription_cache(runtime, user_id, query, posts):
     query = query.strip()
     seen_post_ids: set[int] = set()
     rows = []
+    posts_count = 0
     for post in posts:
+        posts_count += 1
         try:
             post_id = int(post.get("id"))
         except (TypeError, ValueError):
@@ -258,9 +265,10 @@ async def replace_subscription_cache(runtime, user_id, query, posts):
         ))
 
     async with runtime.connect_db() as db:
+        metadata(db, posts_count=posts_count, batch_count=len(rows))
         existing_ids: set[int] = set()
         if rows:
-            cursor = await db.execute("""
+            cursor = await diagnostic_query(db, "cache.exists").execute("""
                 SELECT post_id
                 FROM subscription_cache
                 WHERE user_id = ? AND query = ?
@@ -269,13 +277,13 @@ async def replace_subscription_cache(runtime, user_id, query, posts):
             existing_ids = {int(row[0]) for row in await cursor.fetchall()}
 
         if rows:
-            await db.executemany("""
+            await diagnostic_query(db, "cache.subscription.upsert.batch").executemany("""
                 INSERT OR REPLACE INTO subscription_cache
                 (user_id, query, post_id, file_url, sample_url, preview_url, tags, rating, score,
                  width, height)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
-            await db.executemany("""
+            await diagnostic_query(db, "cache.post.upsert.batch").executemany("""
                 INSERT INTO post_cache
                 (post_id, file_url, sample_url, preview_url, tags, rating, score, cached_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -303,7 +311,7 @@ async def replace_subscription_cache(runtime, user_id, query, posts):
                     _height,
                 ) in rows
             ])
-        cursor = await db.execute("""
+        cursor = await diagnostic_query(db, "cache.count").execute("""
             SELECT COUNT(*)
             FROM subscription_cache
             WHERE user_id = ? AND query = ?

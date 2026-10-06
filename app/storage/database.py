@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiosqlite
+from app.observability.db_diagnostics import Diagnostics, count
 from app.observability.logic_trace import trace_event, trace_error, enabled as trace_enabled, safe_hash, add_timing, annotate
 
 from app.config import (
@@ -160,27 +161,58 @@ def validate_subscription_query(query: Any) -> tuple[str, str]:
 
 
 @asynccontextmanager
-async def connect_db():
-    started = time.monotonic() if trace_enabled() else 0
+async def connect_db(operation=None):
+    diagnostic = Diagnostics(operation)
     db = None
+    phase_started = diagnostic.clock()
+    body_started = None
     try:
-        db = await aiosqlite.connect(DB_PATH, timeout=30)
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("PRAGMA busy_timeout=30000")
-        await db.execute("PRAGMA foreign_keys=ON")
-        yield db
+        try:
+            db = await aiosqlite.connect(DB_PATH, timeout=30)
+        finally:
+            diagnostic.record("connect", phase_started)
+        count("connections", 1)
+        phase_started = diagnostic.clock()
+        try:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=30000")
+            await db.execute("PRAGMA foreign_keys=ON")
+        finally:
+            diagnostic.record("init", phase_started)
+        diagnostic.instrument(db)
+        diagnostic.emit("db.connection.open")
+        body_started = diagnostic.clock()
+        try:
+            yield db
+        finally:
+            diagnostic.record("context_body", body_started)
     except Exception as exc:
+        diagnostic.error_type = type(exc).__name__
         trace_error(exc, stage='sqlite', event='db.error')
         if 'locked' in str(exc).lower():
             trace_event('db.lock_wait', type=type(exc).__name__)
         raise
+    except BaseException as exc:
+        diagnostic.error_type = type(exc).__name__
+        raise
     finally:
-        if db is not None:
-            await db.close()
-        if started:
-            duration = (time.monotonic() - started) * 1000
-            add_timing('db', duration)
-            trace_event('db.slow_operation' if duration > 250 else 'db.operation', level='normal' if duration > 250 else 'verbose', duration_ms=duration)
+        try:
+            if db is not None:
+                phase_started = diagnostic.clock()
+                close_error = None
+                try:
+                    await db.close()
+                except BaseException as exc:
+                    close_error = type(exc).__name__
+                    raise
+                finally:
+                    diagnostic.record("close", phase_started, error=close_error)
+                    count("connections", -1)
+                    diagnostic.emit("db.connection.close")
+        finally:
+            duration = diagnostic.finished()
+            if trace_enabled():
+                add_timing('db', duration)
 
 
 async def ensure_subscription_columns(db):

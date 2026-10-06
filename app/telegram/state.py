@@ -1,3 +1,4 @@
+from app.observability.db_diagnostics import (Diagnostics, callback_operation, callback_phase, callback_close, callback_connection_opened, callback_job)
 import hashlib
 import logging
 from app.observability.logic_trace import trace_event
@@ -42,9 +43,11 @@ def _database_job(function, *args):
         _worker_loop, _worker_lock = loop, asyncio.Lock()
     lock = _worker_lock
     path = DB_PATH
+    queued_at = time.monotonic()
+    diagnostic = Diagnostics({"_store_callback_payload_db": "callback.persist", "_cleanup_callback_payloads_db": "callback.cleanup"}.get(getattr(function, "__name__", ""), "callback.lookup"))
     async def job():
         async with lock:
-            await asyncio.to_thread(function, *args, db_path=path)
+            await asyncio.to_thread(callback_job, diagnostic, queued_at, function, *args, db_path=path)
     task = loop.create_task(job())
     _pending_payload_tasks.add(task)
     task.add_done_callback(_pending_payload_tasks.discard)
@@ -63,7 +66,7 @@ async def get_callback_payload_by_token_async(action, token):
         trace_event("callback.payload.loaded", level="normal", action=action, payload_size=len(stored[0]), source="ram")
         return stored[0]
     await flush_callback_payloads()
-    payload = await asyncio.to_thread(_get_callback_payload_db, action, token, db_path=DB_PATH)
+    payload = await asyncio.to_thread(callback_job, Diagnostics("callback.lookup"), time.monotonic(), _get_callback_payload_db, action, token, db_path=DB_PATH)
     trace_event("callback.payload.loaded" if payload else "callback.payload.missing", level="normal", action=action, payload_size=len(payload), source="sqlite")
     return payload
 
@@ -90,14 +93,15 @@ def _connect_payload_db(db_path=None):
     # 50 ms writer timeout made otherwise valid buttons memory-only during
     # ordinary WAL contention, so use the same bounded wait policy as the
     # asynchronous database layer.
-    conn = sqlite3.connect(db_path, timeout=1.0)
-    conn.execute("PRAGMA busy_timeout=1000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn = callback_phase("connect", sqlite3.connect, db_path, timeout=1.0)
+    callback_phase("init", conn.execute, "PRAGMA busy_timeout=1000")
+    callback_phase("init", conn.execute, "PRAGMA journal_mode=WAL")
+    callback_connection_opened()
     return conn
 
 
 def _ensure_payload_table(conn):
-    conn.execute(f"""
+    callback_phase("schema", conn.execute, f"""
         CREATE TABLE IF NOT EXISTS {CALLBACK_PAYLOAD_TABLE} (
             action TEXT NOT NULL,
             token TEXT NOT NULL,
@@ -108,45 +112,47 @@ def _ensure_payload_table(conn):
     """)
 
 
+@callback_operation("callback.persist")
 def _store_callback_payload_db(action: str, token: str, payload: str, created_at: float, *, db_path=None):
     conn = None
     try:
         conn = _connect_payload_db(db_path)
         _ensure_payload_table(conn)
-        conn.execute(f"""
+        callback_phase("execute", conn.execute, f"""
             INSERT OR REPLACE INTO {CALLBACK_PAYLOAD_TABLE}
             (action, token, payload, created_at)
             VALUES (?, ?, ?, ?)
         """, (action, token, payload, created_at))
-        conn.commit()
+        callback_phase("commit", conn.commit)
     except sqlite3.Error as exc:
         _log_payload_db_error("persist", exc)
     finally:
         if conn is not None:
-            conn.close()
+            callback_close(conn)
 
 
+@callback_operation("callback.lookup")
 def _get_callback_payload_db(action: str, token: str, *, db_path=None) -> str:
     conn = None
     try:
         conn = _connect_payload_db(db_path)
         _ensure_payload_table(conn)
-        cursor = conn.execute(f"""
+        cursor = callback_phase("execute", conn.execute, f"""
             SELECT payload, created_at
             FROM {CALLBACK_PAYLOAD_TABLE}
             WHERE action = ? AND token = ?
         """, (action, token))
-        row = cursor.fetchone()
+        row = callback_phase("fetchone", cursor.fetchone)
         if not row:
             return ""
 
         payload, created_at = row
         if time.time() - float(created_at) > CALLBACK_TTL_SECONDS:
-            conn.execute(f"""
+            callback_phase("execute", conn.execute, f"""
                 DELETE FROM {CALLBACK_PAYLOAD_TABLE}
                 WHERE action = ? AND token = ?
             """, (action, token))
-            conn.commit()
+            callback_phase("commit", conn.commit)
             return ""
 
         callback_payloads[(action, token)] = (payload, time.monotonic())
@@ -156,24 +162,25 @@ def _get_callback_payload_db(action: str, token: str, *, db_path=None) -> str:
         return ""
     finally:
         if conn is not None:
-            conn.close()
+            callback_close(conn)
 
 
+@callback_operation("callback.cleanup")
 def _cleanup_callback_payloads_db(now: float, *, db_path=None):
     conn = None
     try:
         conn = _connect_payload_db(db_path)
         _ensure_payload_table(conn)
-        conn.execute(f"""
+        callback_phase("execute", conn.execute, f"""
             DELETE FROM {CALLBACK_PAYLOAD_TABLE}
             WHERE ? - created_at > ?
         """, (now, CALLBACK_TTL_SECONDS))
-        conn.commit()
+        callback_phase("commit", conn.commit)
     except sqlite3.Error as exc:
         _log_payload_db_error("cleanup", exc)
     finally:
         if conn is not None:
-            conn.close()
+            callback_close(conn)
 
 
 def store_callback_payload(

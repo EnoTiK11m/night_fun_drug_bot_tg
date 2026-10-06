@@ -1,4 +1,5 @@
 """Domain implementation. Dependencies are supplied by the public facade."""
+from app.observability.db_diagnostics import db_operation
 
 async def get_user_blacklist(runtime, user_id):
     async with runtime.connect_db() as db:
@@ -162,6 +163,7 @@ async def get_sent_post_ids(runtime, user_id):
         return {row[0] for row in rows}
 
 
+@db_operation("subscription.sent_history")
 async def mark_post_sent(runtime, user_id, post_id):
     async with runtime.connect_db() as db:
         cursor = await db.execute("""
@@ -237,6 +239,7 @@ async def get_search_history(runtime, user_id, limit):
         return [row[0] for row in rows]
 
 
+@db_operation("user.settings")
 async def get_user_settings(runtime, user_id):
     async with runtime.connect_db() as db:
         cursor = await db.execute(
@@ -271,6 +274,7 @@ async def get_user_settings(runtime, user_id):
     return await runtime.get_user_settings(user_id)
 
 
+@db_operation("user.settings")
 async def save_user_settings(runtime, user_id, settings):
     """Atomically merge a whitelisted partial settings patch."""
     unknown_fields = set(settings) - runtime.USER_SETTING_FIELDS

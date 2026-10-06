@@ -1,4 +1,5 @@
 """Domain implementation. Dependencies are supplied by the public facade."""
+from app.observability.db_diagnostics import db_operation
 
 def _normalize_translation_tags(runtime, tags):
     if isinstance(tags, str):
@@ -10,6 +11,7 @@ def _normalize_translation_tags(runtime, tags):
     })
 
 
+@db_operation("translations.queue")
 async def queue_tag_translations(runtime, tags, source):
     normalized = runtime._normalize_translation_tags(tags)
     if not normalized:
@@ -87,6 +89,7 @@ async def get_pending_tag_translations(runtime, limit):
         return [row[0] for row in await cursor.fetchall()]
 
 
+@db_operation("translations.save")
 async def save_tag_translations_bulk(runtime, translations, source):
     rows = []
     for tag, translation in translations.items():
@@ -117,6 +120,7 @@ async def save_tag_translations_bulk(runtime, translations, source):
         await db.commit()
 
 
+@db_operation("translations.failure")
 async def mark_tag_translations_failed(runtime, tags):
     normalized = runtime._normalize_translation_tags(tags)
     if not normalized:
@@ -138,6 +142,7 @@ async def mark_tag_translations_failed(runtime, tags):
         await db.commit()
 
 
+@db_operation("translations.seed")
 async def seed_tag_translation_queue(runtime):
     """Collect known tags without delaying database initialization."""
     inserted = 0

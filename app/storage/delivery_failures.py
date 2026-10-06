@@ -1,5 +1,7 @@
 """Domain implementation. Dependencies are supplied by the public facade."""
+from app.observability.db_diagnostics import db_operation
 
+@db_operation("delivery.failure")
 async def save_delivery_failure(runtime, user_id, post, caption, error):
     normalized = runtime._normalize_post(post)
     if normalized is None:
@@ -50,6 +52,7 @@ async def get_delivery_failures(runtime, limit):
         return result
 
 
+@db_operation("delivery.failure.claim")
 async def claim_delivery_failures(runtime, limit, lease_minutes):
     """Atomically lease delivery failures for one retry worker."""
     token = runtime.uuid.uuid4().hex
@@ -142,6 +145,7 @@ async def delete_delivery_failure_for_post(runtime, user_id, post_id, claim_toke
         return cursor.rowcount == 1
 
 
+@db_operation("subscription.failure.clear")
 async def clear_delivery_failure_for_post(runtime, user_id, post_id):
     """Remove stale failure bookkeeping after any independently confirmed send."""
     async with runtime.connect_db() as db:

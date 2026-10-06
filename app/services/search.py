@@ -1,4 +1,5 @@
 """Bounded page selection with SQLite progress and per-subscription history."""
+from app.observability.db_diagnostics import db_operation, query as diagnostic_query
 import asyncio
 import hashlib
 import json
@@ -65,6 +66,7 @@ class ProgressiveSearch:
         self.request_budget = request_budget
         self.cache_page = None
 
+    @db_operation(lambda self, kind, *args, **kwargs: kind + ".progress.save")
     async def _save(self, kind, user, query, state):
         async with database.connect_db() as db:
             # A deleted subscription must never resurrect progress.
@@ -278,28 +280,29 @@ class ProgressiveSearch:
             state.update(pid=state['pid'] + 1, page=[], used=[])
             await self._save(kind, user, query, state)
 
+    @db_operation(lambda self, *args, subscription=False, **kwargs: "subscription.history.ack" if subscription else "search.history.ack")
     async def delivered(self, user, query, post, *, subscription=False, user_delivery=True):
         kind = 'subscription' if subscription else 'search'
         async with database.connect_db() as db:
-            await db.execute('BEGIN IMMEDIATE')
+            await diagnostic_query(db, "history.begin").execute('BEGIN IMMEDIATE')
             if subscription and user_delivery:
-                inserted_global = await db.execute('INSERT OR IGNORE INTO subscription_user_delivery_history(user_id,post_id) VALUES (?,?)', (user, int(post['id'])))
+                inserted_global = await diagnostic_query(db, "subscription.global_history.insert").execute('INSERT OR IGNORE INTO subscription_user_delivery_history(user_id,post_id) VALUES (?,?)', (user, int(post['id'])))
                 if inserted_global.rowcount:
-                    await db.execute("""DELETE FROM subscription_user_delivery_history
+                    await diagnostic_query(db, "subscription.global_history.retention").execute("""DELETE FROM subscription_user_delivery_history
                         WHERE user_id=? AND post_id IN (
                             SELECT post_id FROM subscription_user_delivery_history WHERE user_id=?
                             ORDER BY sent_at DESC, rowid DESC LIMIT 1000 OFFSET ?)""",
                         (user, user, database.SUBSCRIPTION_USER_HISTORY_RETENTION_PER_USER))
                 trace_event('subscription.user_history.saved', level='normal', post_id=post['id'], inserted=bool(inserted_global.rowcount))
-            row = await (await db.execute('SELECT used_json,high_water FROM query_progress WHERE kind=? AND user_id=? AND query=?', (kind, user, query))).fetchone()
+            row = await (await diagnostic_query(db, "progress.lookup").execute('SELECT used_json,high_water FROM query_progress WHERE kind=? AND user_id=? AND query=?', (kind, user, query))).fetchone()
             if row:
                 used = json.loads(row[0])
                 post_id = int(post['id'])
                 if post_id not in used:
                     used.append(post_id)
-                await db.execute('UPDATE query_progress SET used_json=?,high_water=? WHERE kind=? AND user_id=? AND query=?', (json.dumps(used[-PAGE_SIZE:]), max(row[1], post_id), kind, user, query))
+                await diagnostic_query(db, "progress.update").execute('UPDATE query_progress SET used_json=?,high_water=? WHERE kind=? AND user_id=? AND query=?', (json.dumps(used[-PAGE_SIZE:]), max(row[1], post_id), kind, user, query))
                 if subscription:
-                    inserted = await db.execute('INSERT OR IGNORE INTO subscription_delivery_history(user_id,query,post_id) SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM subscriptions WHERE user_id=? AND query=?)', (user, query, post_id, user, query))
+                    inserted = await diagnostic_query(db, "history.insert.query").execute('INSERT OR IGNORE INTO subscription_delivery_history(user_id,query,post_id) SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM subscriptions WHERE user_id=? AND query=?)', (user, query, post_id, user, query))
             await db.commit()
             trace_event('db.history.duplicate' if row and subscription and inserted.rowcount == 0 else 'db.history.insert' if row else 'db.history.skipped', level='normal', kind=kind, post_id=post.get('id'), acknowledged=bool(row))
             if subscription and row:
