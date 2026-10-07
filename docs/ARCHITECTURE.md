@@ -1,7 +1,9 @@
 # Архитектура проекта
 
-`app/main.py` — точка входа. Корневой `bot.py` оставлен как совместимый launcher для
-существующих Windows-скриптов. Он не содержит обработчиков или бизнес-логики.
+`app/main.py` — точка входа (`python -m app.main`) для Windows launcher и Docker.
+Корневой `bot.py` оставлен как совместимый entrypoint; он не содержит обработчиков или бизнес-логики.
+
+[README](../README.md) · [Configuration](CONFIGURATION.md) · [Production](PRODUCTION.md) · [Development](DEVELOPMENT.md)
 
 ```text
 app/
@@ -18,7 +20,7 @@ app/
     media_preferences.py фильтры и качество медиа, runtime metrics
     zip_export.py        очередь и сборка ZIP
   integrations/
-    rule34/client.py, rule34/rate_limiter.py
+    rule34/client.py, rule34/rate_limiter.py, rule34/outage.py
     tag_translation.py
   storage/
     database.py          публичный DB facade, connection, модели и настройки
@@ -26,15 +28,24 @@ app/
     subscriptions.py     подписки, claims, history и digest queue
     favorites.py         избранное, коллекции, read-later и storage cleanup
     cache.py, users.py, translations.py, delivery_failures.py
-  observability/logic_trace.py
+  observability/
+    logic_trace.py       correlation, bounded JSONL writer
+    health.py            process-local registry и incidents
+    errors.py, diagnostics.py, db_diagnostics.py, logging_filters.py
   infrastructure/instance_lock.py, user_gate.py, project_update.py
 ```
 
 Telegram handlers вызывают services и существующий delivery layer. Search service
 обращается к Rule34 integration и storage; обе integrations и delivery используют
 самостоятельные лимитеры. Observability не зависит от Telegram handlers. ENV parsing
-централизован в `app/config.py`; PROJECT_ROOT означает корень checkout, поэтому пути
-к `.env`, SQLite, locks, logs и backup не зависят от перемещения Python-модулей.
+централизован в `app/config.py`; PROJECT_ROOT означает корень checkout.
+Относительный DB_PATH разрешается от этого корня; locks связаны с базой,
+logs и backups используют пути проекта. `.env` загружается через `load_dotenv`;
+launcher задаёт рабочий каталог проекта.
+
+Infrastructure обеспечивает instance lock, startup/shutdown, административное
+Git-обновление и per-user operation gate. Gate сериализует пользовательские
+операции; lifecycle останавливает фоновые задачи и освобождает lock после shutdown.
 
 Большой callback-handler перенесён целиком, без изменения порядка ветвей. Остальные
 команды и UI helpers пока остаются в application.py: дальнейшее разделение допустимо
@@ -68,8 +79,28 @@ Facade imports имеют отдельные repository aliases, чтобы им
 Rule34 default — 55 физических attempts за rolling 60 секунд. Interactive имеет
 приоритет с background grant после пяти contended interactive grants. Все retries
 считаются; HTTP 429 включает общий cooldown. Telegram quota остаётся отдельной.
+HTTP 403 открывает shared circuit breaker; после backoff допускается только одна
+half-open probe. Подавленные запросы не тратят Rule34 quota. Только валидный
+authenticated post response текущего поколения закрывает breaker: cache,
+autocomplete и stale success не восстанавливают API health.
+Backoff и HTTP diagnostics: [Observability](observability.md#rule34).
+
 Подписка может иметь interval_seconds=30, polling default=5; занятые очереди могут
 увеличить задержку. Deadline сохраняет progress и вызывает defer, а не empty backoff.
+
+Активная подписка продлевает claim каждые 60 секунд. Утрата lease останавливает
+worker; перед send повторно проверяются ownership, активность и право получателя.
+Per-user сериализация selection/send/ack вместе с общей DB history поддерживает
+cross-subscription dedup. Telegram send и SQLite commit не атомарны:
+неопределённая доставка не превращается в гарантию exactly-once.
+Digest хранит элементы в SQLite, claim выделяет batch; подтверждённые элементы
+удаляются, failed остаются, ambiguous откладываются. ZIP queue и временные
+user states process-local, с ограниченными ресурсами и cleanup.
+
+Telegram limiter имеет отдельные общую/per-chat очереди и cooldown, учитывает
+полный RetryAfter без верхнего усечения. Media layer использует URL, sample,
+local download/upload и text-link fallback; успешная ссылка не означает
+успешную доставку изображения.
 
 Tracing выключен по умолчанию. `LOGIC_TRACE_ENABLED=true`, уровень normal — отдельный
 `logs/logic_trace.jsonl`, bounded queue, rotation, redaction и hash user ID. Verbose
@@ -80,15 +111,16 @@ python scripts/read_trace.py --last 100 --summary
 python scripts/read_trace.py --trace TRACE_ID --summary
 ```
 
-## Проверка
+Observability v2 связывает trace/flow/request/attempt/connection, различает
+intermediate failures и terminal outcome, хранит process-local runtime health.
+Registry не управляет scheduling, retries или claims. SQLite instrumentation
+измеряет connect, execute/fetch, commit/rollback, close и другие фазы без SQL/binds;
+await time включает queue, engine/busy wait и async resume, а не только lock wait.
+Heartbeat каждые пять минут показывает stages, external health, subscriptions,
+DB и writer. `/diag` читает локальное состояние и ограниченный read-only snapshot;
+`/health` дополнительно выполняет API request. Подробности: [Observability](observability.md).
 
-```bash
-python -m compileall -q app bot.py scripts tests
-python scripts/check_imports.py
-python tests/run_isolated_suite.py
-python -m pip check
-git diff --check
-```
+## Проверка и ограничения
 
-Suite устанавливает DB_PATH на временную SQLite; рабочая БД в тестах не используется.
-Import smoke загружает все package modules без polling и без DB initialization.
+Syntax/import checks, isolated SQLite suite и CI: [Development](DEVELOPMENT.md).
+Эксплуатационные ограничения, backup и recovery: [Production](PRODUCTION.md#ограничения).

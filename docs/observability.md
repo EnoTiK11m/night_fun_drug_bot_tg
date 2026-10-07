@@ -1,19 +1,41 @@
 # Observability / Logging v2
 
-## Audit findings
+[README](../README.md) · [Configuration](CONFIGURATION.md#observability) · [Production](PRODUCTION.md#логи-и-архивирование)
 
-Аудит выполнен поверх локального working tree с новым Rule34 breaker. Baseline:
-592 tests passed. Production не перезапускался и продолжает выполнять старый код.
-Проверены observability, DB phases, Rule34, Telegram limiter, media, subscriptions,
-search, callbacks, admin, instance lifecycle и updater, а также текущие и rotated logs.
+## Включение и чтение
 
-В `logic_trace.jsonl.1` за 06–07 октября обнаружены 6394 события HTTP error и
-6394 request.failed, 4209 общих API errors, 93 Telegram failures и 94 fallback events.
-В текущем rotated окне: 187 успешных Telegram send, 11 failures и 10 fallback.
-Это разные наблюдения, не количество потерянных пользовательских результатов.
-Старый trace не связывал wrapper error с причиной отдельным request ID, повторял
-traceback и не отличал успешный fallback от конечной потери результата. DB phase
-instrumentation уже была полезной и сохранена.
+Runtime health и `/diag` доступны независимо от JSONL writer. Дополнительный
+trace выключен по умолчанию (`LOGIC_TRACE_ENABLED=false` в config и example).
+Для включения задайте в своей конфигурации и запустите новый процесс:
+
+```env
+LOGIC_TRACE_ENABLED=true
+LOGIC_TRACE_LEVEL=normal
+```
+
+Canonical путь — `logs/logic_trace.jsonl`; rotated files — `logic_trace.jsonl.1`, `.2`, ….
+`minimal`, `normal`, `verbose` задают детализацию, не severity. Verbose используйте временно.
+
+```bash
+python scripts/read_trace.py --last 100 --summary
+python scripts/read_trace.py --trace TRACE_ID --summary
+python scripts/read_trace.py --file path/to/copied_trace.jsonl --last 100 --summary
+```
+
+`path/to/copied_trace.jsonl` — условный путь к вашей копии, не файл репозитория.
+Без `--file` reader использует canonical trace; при его отсутствии поддерживает
+legacy-файл `logs/app.observability.logic_trace.jsonl`. Reader также принимает
+фильтры `--flow`, `--user`, `--event`; `--last` допускает 1–10000 записей.
+Текст запросов может попадать в
+trace на любом уровне, если выбранное событие его содержит; hash не заменяет этот текст.
+
+## Интерпретация
+
+HTTP errors, failed attempts, logical requests, fallback и terminal flows
+описывают разные наблюдения; их нельзя складывать как число потерянных результатов.
+V2 связывает wrapper error с причиной через request ID, агрегирует повторные
+traceback и отличает успешный fallback от конечной потери результата.
+DB phase instrumentation сохраняет отдельные измерения стадий операции.
 
 ## Architecture and correlation
 
@@ -81,19 +103,30 @@ Timeout на outgoing send сохраняет unknown_delivery: сервер м�
 ## Rule34
 
 request.started → http.attempt → HTTP/validation evidence → retry или breaker
-opened/extended/suppressed/probe/closed → request.finished. Search retry теперь
-виден на normal level с прежней задержкой 1/2s. Без изменений request policy,
-403 backoff 60/120/300/600/900s, quota, одиночный probe и generation validation.
+opened/extended/suppressed/probe/closed → request.finished. Search retry виден
+на normal level с задержкой 1/2s. HTTP 403 не повторяется внутри этого search retry.
+403 backoff: 60 → 120 → 300 → 600 → 900s, затем максимум 900s; после cooldown
+одна shared half-open probe. Запросы во время open подавляются до расходования
+limiter quota. Generation validation не даёт устаревшему in-flight success
+закрыть новый breaker; cancelled/failed probe освобождается с новым cooldown.
 Safe 403 diagnostics сохраняют bounded classification/hash и allowlisted headers,
 без body snippet и credentials. Authenticated valid post response восстанавливает
 API health; autocomplete, cache delivery и stale HTTP result этого не делают.
+Валидный post response — JSON list, включая пустой список. Только 403 открывает
+этот circuit; 429 использует limiter cooldown, другие ошибки не становятся 403 outage.
+Body evidence ограничен sample до 8192 bytes и коротким ожиданием, записываются
+только classification (empty/json_error/auth_like/cloudflare_challenge/html_forbidden/
+unknown_text) и hash. Header allowlist допускает проверенные content type/length,
+Retry-After, server и cf-ray, а также ограниченные cf-mitigated/cf-cache-status,
+без произвольного текста, cookies или credentials.
 
 ## Telegram
 
 Logical request объединяет RetryAfter и разрешённый safe timeout retry. Physical
 attempt не сбрасывается после timeout. Queue wait измеряет совокупное ожидание
-FIFO/limiter, не разделяет каждый внутренний источник задержки. RetryAfter events
-сохраняют raw/applied wait и remaining. Cooldown opened/extended фиксируются без
+FIFO/limiter, не разделяет каждый внутренний источник задержки. Полный валидный
+RetryAfter применяется без верхнего усечения. RetryAfter events сохраняют
+raw/applied wait и remaining. Cooldown opened/extended фиксируются без
 нового API вызова; recovered — один раз после успешного outgoing request, когда
 deadline действительно прошёл. Network health восстанавливается по реальной
 успешной отправке. BadRequest/Forbidden для конкретного payload не объявляются
@@ -103,17 +136,18 @@ deadline действительно прошёл. Network health восстан�
 
 subscription.started → claim request/created/acquired → options/filter/dedup/
 post selection → revalidation → media delivery → history/DB acknowledgement →
-schedule update → claim release → subscription.finished. Claim renewal имеет
-тот же context и normal event. API/budget/deadline deferral имеет delayed.
+schedule update → claim release → subscription.finished. Claim renewal каждые
+60 секунд имеет тот же context и normal event. API/budget/deadline deferral имеет delayed.
 Cache fallback имеет normal cache.decision и не меняет API health.
-Existing schedule/claim/dedup/dispatch/acknowledgement semantics сохранены.
+Перед send проверяются доступ и claim; cross-subscription dedup использует
+сериализацию пользователя и общую историю доставок. Утрата lease останавливает worker.
 
 Media: source.attempt → source.failed → source.fallback/telegram.send.fallback →
 delivery.success → media.delivery.finished. Download/upload, sample URL и text
 link fallback явно обозначаются. Text link delivery означает доставку ссылки,
-не подтверждение доставки изображения. Новые events не содержат media URL.
+не подтверждение доставки изображения. Media events не содержат media URL.
 Pause opened/closed отражают явные pause/resume actions; expiry не порождает
-отдельного timer event. Расписание и таймеры не менялись.
+отдельного timer event.
 
 ## SQLite
 
@@ -143,7 +177,7 @@ suppressed=...`. Recovery: `Rule34 API восстановился после ...
 
 ## Heartbeat v2 and /diag
 
-Heartbeat: PID, cached HEAD/version, uptime, lock/stage; Telegram ages/category/
+Heartbeat каждые пять минут: PID, cached HEAD/version, uptime, lock/stage; Telegram ages/category/
 retry/cooldown/queue; Rule34 health/status/outage/backoff/attempts/suppressed/probes;
 subscriptions active/due/active+expired claims/delivery/failure/deferral;
 SQLite counters/last/slow; trace writer drops/queue/error; gate/stale/duplicates.
@@ -159,22 +193,28 @@ probe; поэтому для пассивного чтения состояни�
 `/diag errors`: последние 10 incident из памяти; без чтения rotated trace.
 Human timezone — системная local timezone, поддерживается injection для tests.
 
-Пример synthetic state (не live production `/diag`):
+Нейтральный шаблон полей `/diag` (значения заменяются runtime):
 
 ```text
-Diag 2026-10-07 05:00:00 UTC+03:00
-Process pid=4040 version=101a2dee uptime=39600s stage=polling_ready lock=True
-Telegram success_age=3s error_age=1080s category=telegram_timeout_ambiguous degraded=False cooldown=0s retry_after=2 queue=0 ambiguous=1 retries=2
-Rule34 success_age=2880s error_age=30s breaker=True status=403 category=http_403_unknown cooldown=540s outage=2820s backoff=600s attempts=19 failures=19 suppressed=292 probes=18 recoveries=0
-Subscriptions active=11 due=0 claims=0/0 last_delivery_age=16s failed=0 delivered=120 deferred=10 snapshot_error=none
-SQLite connections=0/5 operations=0/3 last=subscription.schedule.update duration=5ms slow=2 last_slow=cache.replace:8830ms category=none
-Trace ok=True queue=0 drops=0 errors=0 malformed=0 last_error=none
-App active_incidents=1 gate=1 waiters=0 stale=0 duplicate=0
+Diag <local timestamp>
+Process pid=<pid> version=<version> uptime=<seconds> stage=<stage> lock=<bool>
+Telegram success_age=<age> error_age=<age> category=<category> degraded=<bool> cooldown=<seconds> retry_after=<count> queue=<count> ambiguous=<count> retries=<count>
+Rule34 success_age=<age> error_age=<age> breaker=<bool> status=<status> category=<category> cooldown=<seconds> outage=<seconds> backoff=<seconds> attempts=<count> failures=<count> suppressed=<count> probes=<count> recoveries=<count>
+Subscriptions active=<count> due=<count> claims=<active>/<expired> last_delivery_age=<age> failed=<count> delivered=<count> deferred=<count> snapshot_error=<error>
+SQLite connections=<active>/<peak> operations=<active>/<peak> last=<label> duration=<ms> slow=<count> last_slow=<label>:<ms> category=<category>
+Trace ok=<bool> queue=<count> drops=<count> errors=<count> malformed=<count> last_error=<error>
+App active_incidents=<count> gate=<count> waiters=<count> stale=<count> duplicate=<count>
 ```
 
 ## Trace writer, security and lifecycle
 
-Existing queue/rotation/retention/flush retained. Writer snapshot tracks queue,
+Очередь writer ограничена 2048 событиями. Default active file limit — 52428800 bytes
+(50 MiB), backup count — 7, retention — 7 дней. Возрастная очистка numeric rotated
+files выполняется при старте writer, а не непрерывным ежедневным timer.
+Операционные и launcher logs имеют отдельные правила:
+[Production](PRODUCTION.md#логи-и-архивирование).
+
+Writer snapshot tracks queue,
 drops, malformed events, I/O errors (including handler.handleError), last successful
 write, flush result. I/O failure is represented by exception type, not sensitive
 path/error payload. Shutdown is bounded; remaining queue can be lost at timeout.
@@ -187,39 +227,34 @@ formatter also sanitizes and retains legacy known-secret placeholders.
 No raw HTTP payload/headers/params/env/locals added. Arbitrary unlabelled secrets
 cannot be inferred: callers must not place unstructured private content in events.
 
-Stages: configuration_loaded → instance_lock_waiting/acquired → startup checks /
+Stages: process_started → configuration_loaded → instance_lock_waiting/acquired → startup checks /
 cleanup → local_startup_complete → application_constructed → telegram_bootstrap →
 database_initializing/initialized → background_tasks_started → polling_ready.
 Ready appears only after successful Application.start with running Updater.
 Shutdown draining → flush → complete → lock released; existing order and budgets
 unchanged. Updater checked-command stages have request/attempt/error evidence
-without logging command args/stdout/stderr. Launcher files не изменены.
+without logging command args/stdout/stderr. Windows launcher использует `python -m app.main`; lifecycle-коды описаны в [Production](PRODUCTION.md#windows).
 
-## Tests and limits
+## Проверки и ограничения
 
-Новые tests: fake HTTP/clock, retries, suppressed/real recovery/stale success,
+Regression coverage: fake HTTP/clock, retries, suppressed/real recovery/stale success,
 cross-component request IDs, media fallback, ambiguous outcome, 100-repeat
 aggregation/new roots/recovery/new incident, redaction, writer malformed/I/O,
 read-only real temp SQLite and exclusive lock, auth/no probe/startup stages.
-Legacy assertions обновлены только для новой distinct connection ID и поиска
-event по имени вместо позиции, а также допуска нового recovery event при проверке
-фильтрации быстрых DB phases. Rotation/overflow/concurrency tests сохранены.
+Также покрыты distinct connection IDs, recovery events, фильтрация быстрых DB
+phases, rotation, overflow и concurrency.
 
-Проверено 2026-10-07: baseline 592; добавлено 38; полный isolated suite —
-630 tests, 0 failures/errors (105.726s). Wrapped Telegram timeout и admin update
-failure включены в regression coverage.
-`compileall -q app bot.py scripts tests`, import smoke (42 modules, без polling),
-`pip check`, `git diff --check` — OK. Последний даёт только обычные LF/CRLF warnings.
+Команды проверки и CI: [Development](DEVELOPMENT.md#локальные-проверки).
+Счётчик tests не является эксплуатационной гарантией и не фиксируется здесь.
 
 Registry reset при restart; состояние unknown до наблюдений. Сообщения доставлены
 на уровне успешного API response, не прочитаны пользователем. Нет гарантии
 наблюдения каждого incident при queue overflow, abrupt kill или trace disabled.
 Read-only SELECT кратко берёт read lock, но не DB write lock. Heartbeat/diag не
 проверяют HTTP доступность. Версия HEAD не идентифицирует dirty patch как commit.
-Дополнительные IDs/flow events/incident bookkeeping имеют overhead; production
-latency benchmark не выполнялся. По read-only выборке текущего trace (20425 events,
-6.58MB) грубая оценка дополнительного healthy traffic: 1.21x records / 1.72x bytes
-(новые event pairs, correlation fields, 500 bytes на добавленный event). Это оценка,
-не replay или гарантия объёма; повторные traceback при outage сокращаются.
-Production process остаётся на старом коде до
-отдельного разрешённого пользователем запуска.
+IDs/flow events/incident bookkeeping имеют overhead; production latency benchmark
+не выполнялся. Дополнительные flow events и correlation fields увеличивают healthy traffic;
+относительный объём зависит от количества операций, выбранного уровня и ошибок.
+Оценка размера строится по числу добавленных events и размеру записи, а не
+по числу пользователей. Это не replay, benchmark или гарантия объёма;
+агрегация повторных traceback уменьшает шум при outage.

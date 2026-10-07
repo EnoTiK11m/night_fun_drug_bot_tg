@@ -5,202 +5,99 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![RU](https://img.shields.io/badge/lang-RU-0078D4?logo=googletranslate&logoColor=white)](README.md)
 
-A Telegram bot for finding, viewing, and organizing media from
-[Rule34](https://rule34.xxx/) by tags. It combines single-post results and
-galleries with a personal library, collections, a blacklist, recommendations,
-and automatic subscriptions. The interface adapts to the user: simple mode
-keeps only primary actions, while advanced mode exposes every tool directly.
+A Telegram bot for finding, viewing, and organizing media from [Rule34](https://rule34.xxx/) by tags.
+Single posts and galleries share a personal library, filters, and subscriptions.
+Simple interface mode keeps primary actions visible; advanced mode exposes more tools.
 
 > [!WARNING]
-> This project is intended for adults only (18+). Content is provided by a
-> third-party service and is not stored in this repository. Each deployment
-> operator is responsible for access restrictions and compliance with all
-> applicable rules.
-
-## Table of Contents
-
-- [Features](#features)
-- [Interface and Navigation](#interface-and-navigation)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [Docker](#docker)
-- [Bot Commands](#bot-commands)
-- [Project Structure](#project-structure)
-- [Data, Logs, and Backups](#data-logs-and-backups)
-- [Development and Verification](#development-and-verification)
-- [Limitations](#limitations)
-- [Contributing](#contributing)
-- [License](#license)
+> Adults only (18+). Content comes from an external service and is not stored in this repository.
+> There is no built-in age verification. Operators are responsible for access restrictions and applicable rules.
 
 ## Features
 
-### Search and Galleries
+- Tag and post-ID search, random posts, galleries of up to 10 items.
+- Filters, sorting, media quality selection, and exclusion of viewed posts.
+- Favorites, collections, notes, read-later queue, and ZIP export.
+- Blacklist, autocomplete, saved queries, and recommendations based on favorites.
+- Subscriptions with individual filters, pauses, digests, and delivery deduplication.
+- Alternative media URLs, local download/upload, and link delivery when media is unavailable.
+- Shared Rule34 and Telegram limiters, plus a Rule34 HTTP 403 circuit breaker.
+- Administrator diagnostics, heartbeat, and Observability v2.
 
-- search by tags or post ID, plus random results;
-- galleries of up to 10 items with page navigation;
-- newest, most popular, and random sorting modes;
-- filters for rating, media type, orientation, and minimum resolution;
-- `auto`, `preview`, `sample`, and `original` quality modes;
-- exclusion of posts the user has already viewed;
-- tag autocomplete;
-- a query builder with required and excluded tags;
-- saved queries with their own filters;
-- similar-result searches and paginated quick actions for every post tag;
-- resilient Telegram albums: GIFs use static previews and an unavailable
-  original is replaced with its sample without splitting the gallery into
-  separate messages.
-
-### Personalization
-
-- a compact persistent keyboard for primary actions;
-- simple and advanced interface modes;
-- a quick-start screen for first-time users;
-- breadcrumbs, contextual help, and consistent back navigation;
-- cancellation of any multi-step input with a button or `/cancel`;
-- configurable image captions;
-- configurable maximum download size;
-- spoilers for all media or only posts rated `explicit`;
-- search history and personal statistics;
-- English and Russian labels when viewing post tags and the blacklist;
-- an explanation of which blacklist tag blocked a post.
-
-### Favorites and Collections
-
-- saving posts to favorites;
-- list view or persistent Telegram albums with 10 favorites per page;
-- custom collections;
-- notes attached to saved posts;
-- a separate “Read later” queue with automatic expiration;
-- search by tags and note text;
-- ZIP export for all favorites or a single collection.
-
-### Blacklist
-
-- permanent and temporary exclusions;
-- adding or removing multiple tags with one command;
-- ready-to-use presets;
-- list import and export;
-- similar-tag lookup through autocomplete.
-
-### Subscriptions and Reliability
-
-- periodic delivery of new posts for saved queries;
-- a query and interval preview before subscription creation;
-- per-subscription filters for rating, type, orientation, resolution, quality,
-  and blacklist;
-- accumulated digests sent after five posts or at least once every six hours;
-- configurable intervals and temporary subscription pauses;
-- result caching and duplicate-delivery prevention;
-- backoff when no new posts are available;
-- a failed-delivery queue with manual administrator retries;
-- Telegram rate-limit handling and fallback media URLs;
-- local download and upload when Telegram cannot fetch a URL;
-- MIME, signature, and image-size validation, plus protection from unsafe
-  addresses and redirects.
-
-### Recommendations and Bulk Actions
-
-- recommendations based on frequent favorite tags without sending the profile
-  to an external AI service;
-- exclusion of unwanted tags from future recommendations;
-- saving an entire search gallery to favorites or a new collection;
-- creating a saved query or subscription directly from gallery results;
-- storage usage statistics and cleanup of old history.
-
-### Safe Interaction Flows
-
-- confirmation before deleting subscriptions, collections, favorites, or user data;
-- informative empty states that suggest the next useful action;
-- compact notifications for quick actions instead of extra chat messages;
-- automatic cancellation of unfinished input when entering another primary section;
-- a dedicated “My data” section for statistics, storage, and exports.
-
-## Interface and Navigation
-
-After `/start`, the bot displays a short onboarding screen and installs the
-persistent keyboard. New users begin in simple mode with four primary buttons.
-The mode can be changed under `Settings → Interface`.
-
-```text
-Main menu
-├── 🔎 Search
-│   ├── Tag search
-│   ├── Random posts and galleries
-│   ├── Query builder
-│   └── History and saved queries
-├── ⭐ Library
-│   ├── Favorites and collections
-│   ├── Read later
-│   └── Search and recommendations
-├── 🔔 Subscriptions
-│   ├── Creation preview
-│   ├── Per-subscription filters
-│   └── Global pause and digest
-├── 🚫 Blacklist
-├── ⚙️ Settings
-└── 👤 My data (advanced mode)
-```
-
-Every multi-step input screen includes a `❌ Cancel` button. The `/cancel`
-command performs the same action. Contextual `ℹ️` buttons explain the current
-section, while the full guide is available through `❓ Help`.
-
-## Technology
-
-- Python 3.11+
-- [python-telegram-bot](https://python-telegram-bot.org/)
-- [aiohttp](https://docs.aiohttp.org/)
-- [aiosqlite](https://aiosqlite.omnilib.dev/)
-- SQLite with WAL
-- optional Docker Compose deployment
-
-Exact Python dependency versions are pinned in
-[`requirements.txt`](requirements.txt).
+See the [command and feature reference](docs/COMMANDS.md) for interface details.
 
 ## Quick Start
 
-### 1. Get the source code
+Python 3.11+ is required. Dependencies are pinned in [requirements.txt](requirements.txt).
+
+### 1. Get the project
 
 ```bash
 git clone https://github.com/EnoTiK11m/night_fun_drug_bot_tg.git
 cd night_fun_drug_bot_tg
 ```
 
-### 2. Create a virtual environment
+### 2. Prepare the environment
 
 Windows PowerShell:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-Linux and macOS:
+Linux/macOS:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-```
-
-### 3. Configure the environment
-
-Copy the example configuration:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-On Linux and macOS:
-
-```bash
 cp .env.example .env
 ```
 
-Set at least the three required variables:
+### 3. Fill in `.env` and start the bot
+
+After configuring the variables below:
+
+```bash
+python -m app.main
+```
+
+The SQLite database and tables are created automatically on first run.
+Run one bot process per database.
+
+### Windows Launcher
+
+The watchdog uses Python from `.venv` when available:
+
+```powershell
+.\rule34.bat
+```
+
+For a single run without automatic restart:
+
+```powershell
+.\rule34.bat once
+```
+
+Hidden startup, exit codes, and logs: [Production](docs/PRODUCTION.en.md#windows).
+
+### Docker
+
+After creating `.env`:
+
+```bash
+docker compose up -d --build
+```
+
+The database is stored in `./data`, logs in `./logs`.
+[Docker deployment and maintenance](docs/PRODUCTION.en.md#docker).
+
+## Minimal Configuration
+
+Three required variables from [.env.example](.env.example):
 
 ```env
 BOT_TOKEN=your_telegram_bot_token
@@ -208,218 +105,56 @@ API_USER_ID=your_rule34_api_user_id
 API_KEY=your_rule34_api_key
 ```
 
-Create the Telegram token through [@BotFather](https://t.me/BotFather). Rule34
-API credentials are available in the service account settings.
+Create the Telegram token through [@BotFather](https://t.me/BotFather); Rule34 API credentials are in the service account settings.
+`ADMIN_USER_IDS` is optional: set your IDs to enable administrator commands or leave it empty.
+Replace the demonstration administrator value from `.env.example` before starting.
+Private chats are open to everyone by default; groups are disabled.
+All settings, validation, and access rules: [Configuration](docs/CONFIGURATION.md).
+`.env`, databases, logs, and backups are excluded by [.gitignore](.gitignore).
 
-### 4. Start the bot
-
-```bash
-python -m app.main
-```
-
-The SQLite database and required tables are created automatically on first run.
-
-## Configuration
-
-All settings are read from environment variables or `.env`.
-
-| Variable | Required | Default | Purpose |
-| --- | :---: | --- | --- |
-| `BOT_TOKEN` | yes | — | Telegram bot token |
-| `API_USER_ID` | yes | — | Rule34 API user ID |
-| `API_KEY` | yes | — | Rule34 API key |
-| `SEARCH_COOLDOWN_SECONDS` | no | `3` | Delay between user searches |
-| `SUBSCRIPTION_CHECK_INTERVAL_SECONDS` | No | `5` | Scheduler polling, 1-10 seconds |
-| `SUBSCRIPTION_MIN_INTERVAL_SECONDS` | No | `30` | Minimum subscription interval |
-| `RULE34_API_REQUESTS_PER_WINDOW` | No | `55` | Shared quota, hard maximum 60 |
-| `RULE34_API_WINDOW_SECONDS` | No | `60` | Rolling window, at least 60 seconds |
-| `SUBSCRIPTION_MAX_POSTS_PER_USER_PASS` | no | `45` | Maximum subscriptions processed per user pass, from 1 to 45 |
-| `SUBSCRIPTION_MAX_TOTAL` | no | `20` | Maximum subscriptions per user, including paused ones |
-| `SUBSCRIPTION_MAX_ACTIVE` | no | `10` | Maximum simultaneously active subscriptions per user |
-| `SUBSCRIPTION_QUERY_MAX_LENGTH` | no | `256` | Maximum normalized subscription query length |
-| `SUBSCRIPTION_QUERY_MAX_TAGS` | no | `20` | Maximum tags in a subscription query |
-| `SUBSCRIPTION_CREATE_COOLDOWN_SECONDS` | no | `30` | Delay between new subscriptions; updating an existing one is exempt |
-| `SUBSCRIPTION_CACHE_MAX_PER_QUERY` | no | `250` | Maximum cache rows per user/query pair |
-| `SUBSCRIPTION_CACHE_MAX_ROWS` | no | `100000` | Hard global subscription-cache row limit |
-| `SUBSCRIPTION_CACHE_CLEANUP_BATCH_SIZE` | no | `500` | Maximum deletions from each SQLite cache per pass |
-| `SUBSCRIPTION_CACHE_CLEANUP_INTERVAL_SECONDS` | no | `900` | Background SQLite cache-cleanup interval |
-| `POST_CACHE_TTL_HOURS` | no | `168` | Shared post-cache retention time in hours |
-| `POST_CACHE_MAX_ROWS` | no | `100000` | Hard shared post-cache row limit |
-| `USER_STATE_TTL_MINUTES` | no | `30` | TTL for process-local per-user temporary state |
-| `USER_STATE_CLEANUP_INTERVAL_SECONDS` | no | `300` | Temporary user-state cleanup interval |
-| `TELEGRAM_GLOBAL_REQUESTS_PER_SECOND` | no | `20` | Process-wide Telegram Bot API request rate |
-| `TELEGRAM_PER_CHAT_REQUESTS_PER_SECOND` | no | `0.75` | Request rate for one user or chat |
-| `TELEGRAM_RATE_LIMIT_BURST` | no | `3` | Allowed short request burst |
-| `TELEGRAM_RATE_LIMIT_STATE_TTL_SECONDS` | no | `900` | TTL for inactive per-chat limiter buckets |
-| `TELEGRAM_MAX_RETRY_AFTER_ATTEMPTS` | no | `2` | Maximum retries after RetryAfter |
-| `GLOBAL_DOWNLOAD_CONCURRENCY` | no | `4` | Process-wide concurrent external download limit |
-| `ZIP_EXPORT_WORKERS` | no | `1` | FIFO ZIP worker count, from 1 to 2 |
-| `ZIP_EXPORT_QUEUE_SIZE` | no | `8` | Maximum waiting ZIP jobs |
-| `ZIP_EXPORT_TIMEOUT_SECONDS` | no | `600` | Whole-job ZIP export timeout |
-| `ZIP_EXPORT_MAX_FILES` | no | `120` | Maximum files per export |
-| `ZIP_EXPORT_MAX_FILE_BYTES` | no | `20971520` | Maximum actual downloaded bytes per file |
-| `ZIP_EXPORT_MAX_TOTAL_BYTES` | no | `209715200` | Maximum actual downloaded bytes per export |
-| `ZIP_EXPORT_PART_BYTES` | no | `47185920` | Maximum ZIP part size target |
-| `ZIP_EXPORT_MAX_PARTS` | no | `5` | Maximum ZIP parts per export |
-| `ZIP_EXPORT_MAX_TEMP_BYTES` | no | `100663296` | Maximum temporary disk footprint per job |
-| `ZIP_EXPORT_PROGRESS_INTERVAL_SECONDS` | no | `3` | Minimum Telegram progress update interval |
-| `DB_PATH` | no | `bot_data.db` | SQLite database path |
-| `INSTANCE_LOCK_WAIT_SECONDS` | no | `20` | Maximum process-lock wait, from 0 to 120 seconds |
-| `INSTANCE_LOCK_RETRY_INTERVAL_SECONDS` | no | `0.25` | Process-lock retry interval, from 0.05 to 5 seconds |
-| `ADMIN_USER_IDS` | no | empty | Comma-separated administrator Telegram user IDs |
-| `ALLOWED_USER_IDS` | no | empty | Comma-separated users allowed in private chats |
-| `ALLOWED_CHAT_IDS` | no | empty | Comma-separated allowed Telegram chat IDs |
-| `ALLOW_GROUP_CHATS` | no | `false` | Allow the bot in group chats |
-| `TAG_TRANSLATION_ENABLED` | no | `true` | Translate displayed tags into Russian in the background |
-
-When `ALLOWED_USER_IDS` is empty, all users may access the bot in private chats.
-Groups are disabled by default. Users in `ADMIN_USER_IDS` are always allowed.
-
-Do not commit `.env`, databases, logs, or backups. These paths are already
-excluded by [`.gitignore`](.gitignore).
-
-## Docker
-
-Create `.env`, then run:
-
-```bash
-docker compose up -d --build
-docker compose logs -f bot
-```
-
-Compose stores persistent data outside the container:
-
-- `./data` — SQLite database;
-- `./logs` — application logs.
-
-Stop the deployment with:
-
-```bash
-docker compose down
-```
-
-Do not run multiple application instances against the same SQLite database.
-
-## Windows Launcher
-
-The project includes:
-
-- [`rule34.bat`](rule34.bat) — starts the bot and restarts it after a failure or
-  `/restart` command;
-- [`start_hidden.vbs`](start_hidden.vbs) — runs the same launcher without a
-  console window;
-- [`START_HIDDEN_README.txt`](START_HIDDEN_README.txt) — a short guide to hidden
-  startup.
-
-## Bot Commands
-
-### User Commands
+## Main Commands
 
 | Command | Purpose |
 | --- | --- |
-| `/start` | Refresh the persistent keyboard and open quick start |
-| `/search <tags>` | Find one post by tags |
-| `/random` | Get a random post |
-| `/gallery <tags>` | Get up to 10 items; use `random` for a random gallery |
-| `/id <post_id>` | Find a post by ID |
-| `/tags <query>` | Find matching tag names |
-| `/blacklist` | Open the blacklist menu |
-| `/blacklist add <tags>` | Add one or more tags |
-| `/blacklist remove <tags>` | Remove one or more tags |
-| `/whyblocked <post_id or tags>` | Show blacklist matches |
-| `/favorites` | Open favorites |
-| `/collections` | Manage favorite collections |
-| `/presets` | Manage saved queries |
-| `/recommendations` | Get recommendations based on favorites |
-| `/later` | Open the “Read later” queue |
-| `/storage` | Show user storage usage |
-| `/history` | Show search history |
-| `/stats` | Show personal statistics |
-| `/subscriptions` | Manage automatic subscriptions |
-| `/settings` | Configure captions, galleries, media quality, and interface mode |
-| `/cancel` | Cancel the current multi-step input |
+| `/search <tags>` | Find a post by tags |
+| `/random` | Random post |
+| `/gallery <tags>` | Gallery; `random` selects a random gallery |
+| `/subscriptions` | Subscriptions, pauses, and digests |
+| `/favorites` | Favorites and library |
+| `/settings` | Interface, filters, and quality |
+| `/health` | Administrator: DB, tasks, disk, and a Rule34 API check |
+| `/diag`, `/diag errors` | Private administrator chat: local state and recent incidents |
 
-In simple mode, the persistent keyboard contains four actions: search, random,
-library, and all sections. Advanced mode adds quick gallery and subscription
-buttons. Saved queries, collections, recommendations, and “Read later” live in
-grouped submenus, while rare post actions are available through `••• More`.
+All commands, permissions, and menu actions: [Commands](docs/COMMANDS.md).
 
-### Administrator Commands
+## Reliability and Diagnostics
 
-| Command | Purpose |
+SQLite uses WAL; a process lock protects the database from a second instance.
+The Rule34 limiter counts physical requests and retries; HTTP 403 opens a shared circuit breaker.
+The Telegram limiter respects the full `RetryAfter` value.
+Subscriptions renew claims and check delivery deduplication across each user's subscriptions.
+
+Observability v2 correlates operations and attempts, recovery, DB phases, and writer health.
+Optional tracing to `logs/logic_trace.jsonl` is disabled by default; `/diag` also works without tracing.
+[Diagnostics and observation limits](docs/observability.md).
+
+## Documentation
+
+| Topic | Document |
 | --- | --- |
-| `/health` | Check Rule34 API, SQLite, background tasks, and free disk space |
-| `/adminstats` | Show runtime metrics and database statistics |
-| `/retry_failed` | Retry up to 20 failed subscription deliveries |
-| `/restart` | Exit with the restart code for an external launcher |
+| Environment and access | [Configuration](docs/CONFIGURATION.md) |
+| Commands, interface, and features | [Commands](docs/COMMANDS.md) |
+| Windows, Docker, backups, and recovery | [Production](docs/PRODUCTION.en.md) · [Русский](docs/PRODUCTION.md) |
+| Trace, heartbeat, `/diag`, and errors | [Observability](docs/observability.md) |
+| Components and contracts | [Architecture](docs/ARCHITECTURE.md) |
+| Checks, CI, and contributions | [Development](docs/DEVELOPMENT.md) |
 
-Administrator commands are available only to IDs in `ADMIN_USER_IDS`.
-Automatic recovery after `/restart` requires `rule34.bat`, a Docker restart
-policy, or another process manager.
+The detailed references are in Russian; the production runbook is available in both languages.
+Operational limits, GIFs, ZIPs, and digest semantics: [Production](docs/PRODUCTION.en.md#limitations).
 
-## Project Structure
+## Development
 
-```text
-app/                   application source
-  main.py, config.py    entrypoint and environment
-  telegram/             handlers, UI and delivery
-  services/             search, subscriptions and ZIP
-  integrations/         Rule34 and tag translation
-  storage/              SQLite facade and repositories
-  observability/        logic trace
-  infrastructure/       lifecycle, locking and updates
-tests/                  unit and integration tests
-scripts/                backup, diagnostics and checks
-docs/                   architecture and operation
-bot.py                  compatibility launcher
-```
-
-[Architecture and module boundaries](docs/ARCHITECTURE.md).
-
-## Data, Logs, and Backups
-
-By default, the database is stored in `bot_data.db`. The application enables
-WAL, foreign keys, and a busy timeout for safe concurrent work within one
-process.
-
-Create a consistent backup of a local database with:
-
-```bash
-python scripts/backup_sqlite.py --db bot_data.db --output-dir backups
-```
-
-For Docker:
-
-```bash
-python scripts/backup_sqlite.py --db data/bot_data.db --output-dir backups
-```
-
-Main log files are stored in `logs/`:
-
-- `info.log` — operational events and heartbeat messages;
-- `warnings.log` — warnings;
-- `errors.log` — errors and tracebacks;
-- `startup_output.log` and `startup_errors.log` — Windows launcher output
-  produced before logging is configured.
-
-The application rotates operational logs. See
-[`docs/PRODUCTION.en.md`](docs/PRODUCTION.en.md) for deployment and maintenance
-recommendations.
-
-Tag translations are cached in SQLite and populated gradually by a background
-task. For missing translations, the bot sends only tag names to the external
-Google Translate service; search queries, user IDs, and media are not shared.
-
-## Development and Verification
-
-Install and verify dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-python -m pip check
-```
-
-Check syntax and run tests:
+From the project root with dependencies installed:
 
 ```bash
 python -m compileall -q app bot.py scripts tests
@@ -427,45 +162,9 @@ python scripts/check_imports.py
 python tests/run_isolated_suite.py
 ```
 
-GitHub Actions runs the same checks on pushes and pull requests.
-
-## Limitations
-
-- The bot uses long polling and expects one active process per SQLite database.
-- Search and file availability depend on the Rule34 API and its CDN.
-- Telegram does not support GIF animations inside media groups. Regular
-  galleries use a static preview; animation mode sends GIFs individually.
-- A digest is sent after five posts accumulate or after six hours and can also
-  be requested manually from the subscription menu.
-- ZIP exports include only supported static image formats and are constrained
-  by Telegram file-size limits.
-- The project has no built-in age verification; deployment operators must
-  control access.
-
-## Contributing
-
-1. Create a separate branch.
-2. Make the changes and add tests.
-3. Run the local checks.
-4. Open a pull request describing the behavior and verification steps.
-
-Report bugs and feature requests through
-[GitHub Issues](https://github.com/EnoTiK11m/night_fun_drug_bot_tg/issues).
-
-## Diagnostics
-
-Logs are local in `logs/`. Optional decision tracing is disabled by default.
-Set `LOGIC_TRACE_ENABLED=true` and `LOGIC_TRACE_LEVEL=normal`, then restart the bot.
-Read a trace with `python scripts/read_trace.py --trace TRACE_ID --summary`.
-Secrets are redacted and user IDs hashed; queries may still appear in diagnostics.
-
-Rule34 uses a shared rolling quota of 55 HTTP attempts / 60 seconds, including retries.
-Subscriptions support a 30-second minimum; polling defaults to 5 seconds.
-See [architecture](docs/ARCHITECTURE.md) for package boundaries and runtime details.
+CI runs these checks and `python -m pip check`.
+Environment setup, isolated tests, and contribution flow: [Development](docs/DEVELOPMENT.md).
 
 ## License
 
-This project is distributed under the MIT License. See [`LICENSE`](LICENSE) for
-the full text.
-
-Author: [EnoTiK11m](https://github.com/EnoTiK11m).
+MIT — [LICENSE](LICENSE). Author: [EnoTiK11m](https://github.com/EnoTiK11m).
