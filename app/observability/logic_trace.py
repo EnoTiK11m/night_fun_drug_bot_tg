@@ -220,6 +220,10 @@ def trace_event(event, *, trace=None, level='minimal', **fields):
     if request and event == 'telegram.send.ambiguous_accepted':
         request['outcome'] = 'recovered'
     # Runtime observations also work with trace disabled. Cache cannot heal API health.
+    if event in {'telegram.cooldown.opened', 'telegram.cooldown.extended'}:
+        runtime_health.update('telegram', cooldown_remaining_seconds=fields.get('cooldown_remaining_seconds', 0))
+    elif event == 'telegram.cooldown.recovered':
+        runtime_health.update('telegram', cooldown_remaining_seconds=0)
     if event == 'rule34.request.success' and fields.get('endpoint') != 'autocomplete' and fields.get('recovery_accepted', True):
         recoveries = runtime_health.success('rule34')
     elif event == 'telegram.send.success':
@@ -228,6 +232,8 @@ def trace_event(event, *, trace=None, level='minimal', **fields):
             ctx.fields['user_impact'] = 'delivered'
     elif event == 'db.operation' and not fields.get('error_type'):
         recoveries = runtime_health.success('db', fields.get('operation'))
+    elif event == 'telegram.cooldown.recovered':
+        recoveries = runtime_health.success('telegram', categories={'telegram_retry_after'})
     else:
         recoveries = []
     if event == 'telegram.send.fallback' and ctx:
@@ -305,12 +311,15 @@ def trace_error(exc, stage, event='error'):
         request_id, attempt = request['request_id'], request['attempt']
     elif origin and origin['root_error_type'] == details.get('root_error_type') and origin['root_error_message'] == details.get('root_error_message'):
         component, operation, request_id, attempt = (origin[k] for k in ('component', 'operation', 'request_id', 'attempt'))
+        if details.get('error_category') == 'invalid_state' and origin.get('error_category'):
+            details['error_category'] = origin['error_category']
     else:
         operation, request_id, attempt = stage, None, None
     aggregation = runtime_health.error(component, operation, details, request_id, attempt)
     if ctx:
         ctx.fields['_error_origin'] = dict(component=component, operation=operation, request_id=request_id, attempt=attempt,
-            root_error_type=details.get('root_error_type'), root_error_message=details.get('root_error_message'))
+            root_error_type=details.get('root_error_type'), root_error_message=details.get('root_error_message'),
+            error_category=details.get('error_category'))
         ctx.fields.update({k: v for k, v in details.items() if k not in {'error_message', 'root_error_message'}})
         if details.get('error_category') == 'telegram_timeout_ambiguous':
             ctx.fields['user_impact'] = 'unknown_delivery'
@@ -324,7 +333,8 @@ def trace_error(exc, stage, event='error'):
     if aggregation['summary_due']:
         counters = runtime_health.snapshot()['components'].get(component, {})
         trace_event(component + '.outage.summary', **dict(counters, **details, **aggregation))
-        logger.warning('%s outage summary incident=%s failures=%s category=%s', component,
+        logger.warning('%s %s summary incident=%s failures=%s category=%s', component,
+                       'operation-local incident' if aggregation['scope'] == 'operation_local' else 'outage',
                        aggregation['incident_id'], aggregation['failures'], details.get('error_category'))
     trace_event(event, **payload)
 

@@ -94,7 +94,7 @@ def format_snapshot(snapshot, *, timezone=None, now=None):
         f"Trace ok={writer.get('trace_writer_ok',False)} queue={writer.get('queue_depth',0)} drops={writer.get('dropped_events',0)} errors={writer.get('writer_errors',0)} malformed={writer.get('malformed_events',0)} last_error={writer.get('last_write_error') or 'none'}",
         f"App active_incidents={snapshot['active_incidents']} gate={process.get('gate_registry',0)} waiters={process.get('gate_waiters',0)} stale={process.get('stale_results',0)} duplicate={process.get('duplicate_callbacks',0)}"]
     for incident in snapshot.get('incidents', []):
-        lines.append(f"{incident['incident_id']} {incident['component']}/{incident['operation']} {incident.get('error_category')} root={incident.get('root_error_type')} status={incident.get('http_status','-')} failures={incident['failures']} first_age={age(incident['started_at'],now)} last_age={age(incident['last_failure_at'],now)} state={incident.get('outcome','active')}")
+        lines.append(f"{incident['incident_id']} {incident['component']}/{incident['operation']} {incident.get('error_category')} reason={incident.get('safe_reason','-')} root={incident.get('root_error_type')} status={incident.get('http_status','-')} failures={incident['failures']} first_age={age(incident['started_at'],now)} last_age={age(incident['last_failure_at'],now)} state={incident.get('outcome','active')}")
     return sanitize('\n'.join(lines))[:3900]
 
 

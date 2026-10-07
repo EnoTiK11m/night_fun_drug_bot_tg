@@ -132,6 +132,22 @@ deadline действительно прошёл. Network health восстан�
 успешной отправке. BadRequest/Forbidden для конкретного payload не объявляются
 исправленными успешной отправкой другого payload.
 
+`last_error` — историческое наблюдение, не признак текущего degraded. Telegram
+BadRequest сохраняется в bounded aggregation как `scope/state=operation_local`:
+он виден в `/diag errors`, но не повышает `active_incidents` и не делает всю
+подсистему degraded. Успех fallback не объявляет исходный payload исправленным.
+Известные причины отображаются коротким allowlisted `reason`, без raw message/URL.
+Network/timeout incidents остаются systemic до успешного запроса; RetryAfter и
+положительный cooldown делают Telegram degraded даже при локальных успехах.
+Cooldown recovery фиксируется после окончания ожидания и реального успешного send.
+Это event-based policy, без новых TTL, probe или определения outage по возрасту success.
+
+Domain-specific Telegram exception в cause/context chain имеет приоритет над
+generic/transport classification: `TimedOut → ReadTimeout` остаётся
+`telegram_timeout_ambiguous`, а `root_error_type=ReadTimeout` сохраняется отдельно.
+Повторное наблюдение той же причины верхним flow не заменяет category на
+`invalid_state`; финальный impact сохраняет `unknown_delivery`.
+
 ## Subscriptions and media
 
 subscription.started → claim request/created/acquired → options/filter/dedup/
@@ -161,11 +177,15 @@ slow count дополняет фазовые измерения. Успешна�
 ## Runtime health, aggregation and alerts
 
 Registry: last success/error/recovery, degraded, counters; process stage/version.
-100 incident ring + максимум 100 active fingerprints; 128 recent request/attempt
+100 incident ring + максимум 100 aggregation fingerprints (systemic и local); 128 recent request/attempt
 markers на incident. Identity включает component/operation/category/root/status/
 safe root message. Повторное наблюдение той же request attempt увеличивает
 observations, но не failures. Уникальная причина создаёт отдельный incident.
 Старые incident markers могут быть вытеснены при очень длинном incident.
+`active_incidents` считает открытые systemic incidents, не operation-local
+aggregation. `/diag errors` показывает `state=operation_local` или `recovered`
+вместо misleading active для исторических локальных ошибок. Разные root causes
+сохраняют разные fingerprints, даже если короткий safe reason совпадает.
 
 Первый occurrence имеет traceback, повторы — lightweight count; summary каждые
 300s при последующей ошибке, recovery — финальные count/duration/last failure.
