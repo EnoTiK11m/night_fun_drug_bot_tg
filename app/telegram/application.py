@@ -1,8 +1,11 @@
+from app.observability.health import runtime_health
+from app.observability.logging_filters import repeated_diagnostic_filter
+from app.observability.diagnostics import stage as diagnostic_stage, cache_version, subscription_snapshot, local_snapshot, format_snapshot
 from app.telegram.handlers import callbacks
 from app.services import subscriptions
 import logging
 from app.integrations.rule34.rate_limiter import rule34_limiter
-from app.observability.logic_trace import trace_event, trace_error, traced_flow, outcome as trace_outcome, configure_trace, shutdown_trace, mask_known_secrets, safe_hash, current_trace, enabled as trace_enabled
+from app.observability.logic_trace import trace_event, trace_error, traced_flow, outcome as trace_outcome, configure_trace, shutdown_trace, mask_known_secrets, safe_hash, current_trace, enabled as trace_enabled, sanitize, flow_context, TraceContext
 import asyncio
 import time
 import random
@@ -263,6 +266,7 @@ from app.storage.database import (
     cleanup_empty_collections,
 )
 from app.integrations.rule34.client import api, APITemporaryError
+from app.integrations.rule34.outage import unavailable_text
 import app.storage.database as database_module
 from app.services.search import ProgressiveSearch, SearchAdmission, SearchBusy, SearchBudgetExceeded
 search_service = ProgressiveSearch(api)
@@ -290,6 +294,12 @@ def admitted_search(handler):
 
 
 class SearchApplication(Application):
+    async def start(self):
+        await super().start()
+        if self.updater is not None and self.updater.running:
+            diagnostic_stage('polling_ready')
+            logger.info('Telegram polling ready')
+
     async def stop(self):
         await rule34_limiter.stop()
         await search_admission.stop()
@@ -305,7 +315,7 @@ class RedactingFormatter(logging.Formatter):
 
     def format(self, record):
         message = super().format(record)
-        return mask_known_secrets(message, [(globals().get(name), placeholder) for name, placeholder in self.SECRET_PLACEHOLDERS])
+        return sanitize(mask_known_secrets(message, [(globals().get(name), placeholder) for name, placeholder in self.SECRET_PLACEHOLDERS]))
 
 
 class ExactLevelFilter(logging.Filter):
@@ -357,6 +367,7 @@ def configure_logging():
         handlers.append(console_handler)
     for handler in handlers:
         handler.setFormatter(formatter)
+        handler.addFilter(repeated_diagnostic_filter)
 
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
@@ -592,36 +603,19 @@ RESTART_EXIT_CODE = 42
 ADMIN_SHUTDOWN_NOTIFICATION_TIMEOUT_SECONDS = 3.0
 restart_requested = False
 RESTART_TEXT_COMMANDS = {"restart", "рестарт"}
-upstream_failure_streak = 0
-last_admin_alert_at = 0.0
-ADMIN_ALERT_COOLDOWN_SECONDS = 15 * 60
 
 
 async def note_upstream_failure(app, reason: str):
-    global upstream_failure_streak, last_admin_alert_at
-    upstream_failure_streak += 1
-    runtime_metrics.increment("upstream_failures")
-    now = time.monotonic()
-    if (
-        upstream_failure_streak < 5
-        or now - last_admin_alert_at < ADMIN_ALERT_COOLDOWN_SECONDS
-    ):
-        return
-    last_admin_alert_at = now
-    text = (
-        "🚨 Серия ошибок Rule34/сети: "
-        f"{upstream_failure_streak} подряд. Последняя: {reason[:300]}"
-    )
+    # API outcomes own health counters; cache delivery and suppressed flows do not reset them.
+    await api.breaker.notify()
+
+
+async def send_rule34_health_notification(app, text):
     for admin_id in ADMIN_USER_IDS:
         try:
             await send_text_to_chat(app.bot, admin_id, text=text)
         except Exception:
-            logger.exception("Failed to notify admin %s about upstream outage", admin_id)
-
-
-def reset_upstream_failure_streak():
-    global upstream_failure_streak
-    upstream_failure_streak = 0
+            logger.warning("Failed to notify admin about Rule34 health")
 
 
 async def remember_and_cache_post(post: dict):
@@ -1545,7 +1539,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await callbacks.button_handler(sys.modules[__name__], update, context)
 
 
-@traced_flow("search", user_arg="user_id")
+@traced_flow("random", user_arg="user_id")
 @admitted_search
 async def send_random_image(
     message, user_id: int, *, expected_generation: int | None = None
@@ -1591,7 +1585,7 @@ async def send_random_image(
             time.monotonic() - started_at,
         )
         await message.reply_text(
-            "⚠️ Rule34 сейчас отвечает слишком долго. Попробуйте ещё раз чуть позже.",
+            unavailable_text(trace_exc),
             reply_markup=get_main_keyboard(),
         )
         return False
@@ -1711,7 +1705,7 @@ async def send_image(
         )
         if not is_subscription:
             await message.reply_text(
-                "⚠️ Rule34 сейчас отвечает слишком долго. Попробуйте ещё раз чуть позже.",
+                unavailable_text(trace_exc),
                 reply_markup=get_main_keyboard(),
             )
         return False
@@ -2370,7 +2364,7 @@ async def send_search_gallery(
     except APITemporaryError as trace_exc:
         trace_outcome("api_error")
         trace_error(trace_exc, stage="rule34")
-        await message.reply_text("⚠️ Rule34 временно недоступен. Попробуйте позже.")
+        await message.reply_text(unavailable_text(trace_exc))
         return False
 
     candidates = filter_and_sort_posts(posts or [], settings, excluded)
@@ -3906,8 +3900,10 @@ async def whyblocked_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("✅ Среди переданных тегов совпадений с чёрным списком нет.")
 
 
+@traced_flow("admin.health", metadata=lambda b: {"user_id": b["update"].effective_user.id})
 async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS:
+        trace_outcome('ignored', reason='admin_required', user_impact='no_user_impact')
         await update.message.reply_text("❌ Недостаточно прав.")
         return
     db_stats = await get_admin_database_stats()
@@ -3943,6 +3939,7 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS:
+        trace_outcome('ignored', reason='admin_required', user_impact='no_user_impact')
         await update.message.reply_text("❌ Недостаточно прав.")
         return
     db_stats = await get_admin_database_stats()
@@ -3964,6 +3961,7 @@ async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 @traced_flow("retry", metadata=lambda b: {"user_id": b["update"].effective_user.id})
 async def retry_failed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS:
+        trace_outcome('ignored', reason='admin_required', user_impact='no_user_impact')
         await update.message.reply_text("❌ Недостаточно прав.")
         return
     claim_token, failures = await claim_delivery_failures(limit=20)
@@ -4040,6 +4038,7 @@ async def _best_effort_admin_notification(update, text):
         logger.warning("Admin notification failed or timed out type=%s", type(exc).__name__)
 
 
+@traced_flow("admin.restart", metadata=lambda b: {"user_id": b["update"].effective_user.id})
 async def request_restart(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -4049,6 +4048,7 @@ async def request_restart(
 
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
+        trace_outcome('ignored', reason='admin_required', user_impact='no_user_impact')
         await update.message.reply_text("❌ Недостаточно прав.")
         logger.warning("Unauthorized restart attempt user=%s", user_id)
         return
@@ -4061,6 +4061,7 @@ async def request_restart(
             await _best_effort_admin_notification(update, response_text)
     finally:
         logger.warning("Restart requested by admin user=%s", user_id)
+        diagnostic_stage('shutdown_requested', reason='admin_restart', expected_exit_code=RESTART_EXIT_CODE)
         context.application.stop_running()
 
 
@@ -4081,8 +4082,35 @@ def is_private_admin_command(update: Update) -> bool:
 async def _reject_non_private_admin(update: Update) -> bool:
     if is_private_admin_command(update):
         return False
+    trace_outcome('ignored', reason='private_admin_required', user_impact='no_user_impact')
     await update.message.reply_text("❌ Команда доступна только администратору в личном чате.")
     return True
+
+
+def refresh_diagnostic_runtime():
+    runtime_health.update('telegram', **telegram_rate_limiter.diagnostic_snapshot())
+    breaker_fields = {k:v for k,v in api.breaker.fields().items() if k not in {'last_success_at', 'physical_attempts', 'physical_failures', 'suppressed_requests'}}
+    runtime_health.update('rule34', **breaker_fields, last_http_status=api.breaker.last_http_status, breaker_open=api.breaker.is_open,
+        cooldown_remaining_seconds=api.breaker.remaining(), physical_attempts=api.breaker.physical_attempts,
+        physical_failures=api.breaker.physical_failures, suppressed_requests=api.breaker.suppressed_requests,
+        probes=api.breaker.probes, recoveries=api.breaker.recoveries)
+    with runtime_health.lock:
+        runtime_health.process.update(lock_held=bool(instance_lifecycle is not None and instance_lifecycle.lock.held),
+            gate_registry=user_operation_gate.registry_size, gate_waiters=user_operation_gate.waiter_count,
+            stale_results=stale_flow_results_discarded, duplicate_callbacks=duplicate_callbacks_rejected)
+
+
+async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Authorize before collecting runtime data or touching SQLite.
+    if not is_private_admin_command(update):
+        await update.message.reply_text('Команда доступна только администратору в личном чате.')
+        return
+    with flow_context('admin.diag', user_id=update.effective_user.id):
+        trace_event('admin.diag.requested', level='normal')
+        refresh_diagnostic_runtime()
+        await subscription_snapshot(DB_PATH)
+        snapshot = local_snapshot(errors='errors' in (getattr(context, 'args', None) or []))
+        await update.message.reply_text(format_snapshot(snapshot))
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4109,6 +4137,7 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@traced_flow("admin.update_check", metadata=lambda b: {"user_id": b["update"].effective_user.id})
 async def update_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _reject_non_private_admin(update):
         return
@@ -4187,10 +4216,12 @@ def build_subscription_create_error(result) -> str:
     return "❌ Не удалось создать подписку. Попробуйте позже."
 
 
+@traced_flow("admin.update", metadata=lambda b: {"user_id": b["update"].effective_user.id})
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _reject_non_private_admin(update):
         return
     if update_operation_lock.locked():
+        trace_outcome('ignored', reason='update_already_running', user_impact='no_user_impact')
         await update.message.reply_text("⏳ Обновление уже выполняется.")
         return
 
@@ -4201,6 +4232,7 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = await perform_update()
         if result.status == "dirty":
+            trace_outcome('ignored', reason='dirty_tree', user_impact='no_user_impact')
             logger.warning(
                 "Project update blocked by dirty tree admin=%s files=%s",
                 admin_id,
@@ -4218,6 +4250,8 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Уже установлена последняя версия.")
             return
         if result.status != "updated":
+            trace_outcome('failed', result_status=result.status, error_stage=result.stage,
+                          returncode=result.returncode, user_impact='no_user_impact')
             logger.warning(
                 "Project update result admin=%s stage=%s rc=%s timeout=%s",
                 admin_id,
@@ -4243,6 +4277,7 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raise
     except Exception:
         logger.exception("Project update handler failed admin=%s", admin_id)
+        trace_outcome('failed', user_impact='no_user_impact')
         await _best_effort_admin_notification(update, "❌ Не удалось завершить обновление.")
     finally:
         update_operation_lock.release()
@@ -4460,39 +4495,20 @@ async def maintenance_loop(
 
 
 async def heartbeat_loop():
-    started_at = time.monotonic()
     while True:
         try:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
             export_stats = zip_export_manager.stats() if zip_export_manager else {
                 "queued": 0, "active": 0, "tracked_users": 0,
             }
-            telegram_metrics = telegram_rate_limiter.snapshot_metrics()
-            logger.info(
-                "Heartbeat alive uptime=%ss user_states=%s recent_posts=%s export_queued=%s export_active=%s cache_cleanup_last_deleted=%s cache_cleanup_errors=%s telegram_requests_total=%s telegram_rate_limit_waits=%s telegram_retry_after_count=%s telegram_retry_attempts=%s telegram_ambiguous_timeouts=%s telegram_request_failures=%s telegram_limiter_registry_size=%s user_gate_registry_size=%s user_gate_waiters=%s user_gate_contention_total=%s stale_flow_results_discarded=%s duplicate_callbacks_rejected=%s instance_lock_held=%s instance_lock_wait_ms=%s startup_orphans_deleted=%s",
-                int(time.monotonic() - started_at),
-                len(user_states),
-                len(recent_posts),
-                export_stats["queued"],
-                export_stats["active"],
-                cache_cleanup_last_deleted,
-                cache_cleanup_errors,
-                telegram_metrics["telegram_requests_total"],
-                telegram_metrics["telegram_rate_limit_waits"],
-                telegram_metrics["telegram_retry_after_count"],
-                telegram_metrics["telegram_retry_attempts"],
-                telegram_metrics["telegram_ambiguous_timeouts"],
-                telegram_metrics["telegram_request_failures"],
-                telegram_metrics["telegram_limiter_registry_size"],
-                user_operation_gate.registry_size,
-                user_operation_gate.waiter_count,
-                user_operation_gate.metrics.contention_total,
-                stale_flow_results_discarded,
-                duplicate_callbacks_rejected,
-                int(instance_lifecycle is not None and instance_lifecycle.lock.held),
-                instance_lock_wait_ms,
-                startup_orphans_deleted,
-            )
+            await api.breaker.notify()
+            refresh_diagnostic_runtime()
+            await subscription_snapshot(DB_PATH)
+            snapshot = local_snapshot()
+            logger.info('Heartbeat %s', format_snapshot(snapshot).replace('\n', ' | '))
+            trace_event('process.heartbeat', trace=TraceContext(flow="heartbeat"),
+                        level='normal', **snapshot)
+
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -4500,9 +4516,11 @@ async def heartbeat_loop():
 
 
 async def post_init(application):
+    diagnostic_stage("telegram_bootstrap")
     global subscription_task, heartbeat_task, tag_translation_task, zip_export_manager, maintenance_task
 
     await user_operation_gate.start()
+    api.breaker.notifier = lambda text: send_rule34_health_notification(application, text)
     bot = application.bot
 
     # 💣 СНАЧАЛА ЧИСТИМ ВСЁ
@@ -4537,7 +4555,9 @@ async def post_init(application):
     await bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
 
     """Инициализация после запуска"""
+    diagnostic_stage("database_initializing")
     await init_db()
+    diagnostic_stage("database_initialized")
     await notify_update_marker(bot)
 
     if zip_export_manager is None:
@@ -4572,11 +4592,14 @@ async def post_init(application):
         )
         logger.info("Tag translation task started")
 
+    diagnostic_stage("background_tasks_started")
+
 
 async def post_shutdown(application):
     """Очистка при завершении"""
     # Останавливаем фоновую задачу
     global subscription_task, heartbeat_task, tag_translation_task, zip_export_manager, maintenance_task
+    diagnostic_stage('shutdown_draining', reason='restart' if restart_requested else 'normal_shutdown', expected_exit_code=RESTART_EXIT_CODE if restart_requested else 0)
     await rule34_limiter.stop()
     await search_admission.stop()
     await user_operation_gate.shutdown()
@@ -4622,7 +4645,9 @@ async def post_shutdown(application):
     except TimeoutError:
         logger.warning('Callback persistence drain exceeded shutdown budget')
     finally:
+        diagnostic_stage("shutdown_flush")
         await shutdown_trace()
+        diagnostic_stage("shutdown_complete")
 
 
 @traced_flow("handler_error", metadata=lambda b: {"user_id": getattr(getattr(b["update"], "effective_user", None), "id", None)})
@@ -4633,6 +4658,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(error, BadRequest) and (
         "Query is too old" in str(error) or "query id is invalid" in str(error)
     ):
+        trace_outcome("ignored", user_impact="no_user_impact")
         logger.warning("Ignoring expired callback query: %s", error)
         return
     logger.error(
@@ -4678,6 +4704,7 @@ def build_and_run_application() -> None:
     application.add_handler(CommandHandler("update_check", require_access(update_check_command)))
     application.add_handler(CommandHandler("version", require_access(version_command)))
     application.add_handler(CommandHandler("health", require_access(health_command)))
+    application.add_handler(CommandHandler("diag", diag_command))
     application.add_handler(CommandHandler("adminstats", require_access(admin_stats_command)))
     application.add_handler(CommandHandler("retry_failed", require_access(retry_failed_command)))
     application.add_handler(CommandHandler("tags", require_access(tags_command)))
@@ -4688,7 +4715,8 @@ def build_and_run_application() -> None:
     )
     application.add_error_handler(error_handler)
 
-    logger.info("Бот запущен!")
+    diagnostic_stage('application_constructed')
+    logger.info('Telegram application constructed; bootstrap pending')
     application.run_polling(allowed_updates=Update.ALL_TYPES)
     if restart_requested:
         sys.exit(RESTART_EXIT_CODE)
@@ -4702,12 +4730,15 @@ def run_with_instance_lifecycle(
     global instance_lifecycle, instance_lock_wait_ms, startup_orphans_deleted
     instance_lifecycle = lifecycle
     try:
+        diagnostic_stage("instance_lock_waiting")
         result = asyncio.run(lifecycle.start())
+        diagnostic_stage("local_startup_complete", lock_held=True)
         instance_lock_wait_ms = result.wait_ms
         startup_orphans_deleted = result.cleanup.deleted
         runner()
     finally:
         lifecycle.close()
+        diagnostic_stage("instance_lock_released", lock_held=False)
         if instance_lifecycle is lifecycle:
             instance_lifecycle = None
 
@@ -4715,6 +4746,9 @@ def run_with_instance_lifecycle(
 def main():
     """Запуск бота"""
     configure_logging()
+    diagnostic_stage("process_started", pid=os.getpid())
+    cache_version(__import__("app.config", fromlist=["PROJECT_ROOT"]).PROJECT_ROOT)
+    diagnostic_stage("configuration_loaded")
     logger.info('Rule34 limiter: %s requests / %s sec', RULE34_API_REQUESTS_PER_WINDOW, RULE34_API_WINDOW_SECONDS)
     logger.info('Subscription minimum interval: %s sec; scheduler poll: %s sec', SUBSCRIPTION_MIN_INTERVAL_SECONDS, SUBSCRIPTION_CHECK_INTERVAL_SECONDS)
     missing_config = validate_config()

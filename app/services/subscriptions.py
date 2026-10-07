@@ -8,6 +8,13 @@ _delivery_locks = {}
 CLAIM_RENEWAL_INTERVAL_SECONDS = 60.0
 
 
+async def _update_after_delivery(runtime, user_id, query, token):
+    # A cache delivery is successful, but its next API check still respects outage backoff.
+    delay = runtime.api.breaker.subscription_delay()
+    options = {'minimum_delay_seconds': delay} if delay is not None else {}
+    return await runtime.update_subscription_time(user_id, query, token, **options)
+
+
 class _SubscriptionClaimLease:
     """Keep one worker's lease alive; fail closed if renewal loses ownership."""
 
@@ -46,7 +53,7 @@ class _SubscriptionClaimLease:
             if self.stopped:
                 return
             if renewed:
-                self.trace("claim.renewed", level="verbose", result=True,
+                self.trace("claim.renewed", level="normal", result=True,
                            lease_remaining_seconds=self.runtime.SUBSCRIPTION_CLAIM_MINUTES * 60)
             else:
                 self.lost = True
@@ -146,7 +153,6 @@ async def _process_claimed_subscription(runtime, app, subscription, processing_t
         result = await runtime.get_subscription_cached_image(
             user_id, query, blacklist, excluded_post_ids, settings
         )
-        runtime.reset_upstream_failure_streak()
 
         if result:
             await runtime.remember_and_cache_post(result)
@@ -154,7 +160,7 @@ async def _process_claimed_subscription(runtime, app, subscription, processing_t
             if subscription_options.get("digest_mode") == "digest":
                 queued = await runtime.enqueue_subscription_digest(user_id, query, result)
                 await lease.stop()
-                updated = await runtime.update_subscription_time(user_id, query, processing_token)
+                updated = await _update_after_delivery(runtime, user_id, query, processing_token)
                 claim_completed = bool(updated)
                 if updated and post_id:
                     await runtime.search_service.delivered(user_id, query, result, subscription=True, user_delivery=False)
@@ -216,7 +222,7 @@ async def _process_claimed_subscription(runtime, app, subscription, processing_t
                 # Stop before our own terminal UPDATE clears the token: a
                 # concurrent renewal must not mistake completion for claim loss.
                 await lease.stop()
-                updated = await runtime.update_subscription_time(user_id, query, processing_token)
+                updated = await _update_after_delivery(runtime, user_id, query, processing_token)
                 claim_completed = bool(updated)
                 if updated and post_id:
                     await runtime.mark_post_sent(user_id, int(post_id))
@@ -339,8 +345,12 @@ async def _process_claimed_subscription(runtime, app, subscription, processing_t
             query,
             e,
         )
+        delay = runtime.api.breaker.subscription_delay()
+        defer_options = {'backoff_seconds': delay} if delay is not None else {}
+        if delay is not None:
+            runtime.trace_event('subscription.defer.outage', level='normal', backoff_seconds=delay)
         claim_completed = await runtime.defer_subscription_after_transient_failure(
-            user_id, query, processing_token
+            user_id, query, processing_token, **defer_options
         )
         return False
     except Exception as exc:
@@ -380,7 +390,7 @@ async def get_subscription_cached_image(runtime, user_id, query, blacklist, excl
             and runtime.post_matches_preferences(p, runtime.normalize_feature_settings(settings or {}))]
         if available:
             result = runtime.random.choice(available)
-            runtime.trace_event('cache.decision', level='verbose', decision='fallback', reason='api_error', candidate_count=len(available), post_id=result.get('id'))
+            runtime.trace_event('cache.decision', level='normal', decision='fallback', reason='api_error', candidate_count=len(available), post_id=result.get('id'))
             runtime.trace_event('post.selected', post_id=result.get('id'), selection_mode='cache', candidate_count=len(available))
             return result
         raise

@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+from app.observability.logic_trace import traced_request, trace_event, next_attempt
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -168,7 +169,10 @@ async def run_command(
     )
 
 
+@traced_request('updater', 'checked_command')
 async def _checked_command(stage: str, *args: str, timeout: int | None = None) -> str:
+    next_attempt()
+    trace_event('updater.command.stage', level='normal', operation=stage, timeout_seconds=timeout or GIT_UPDATE_COMMAND_TIMEOUT_SECONDS)
     try:
         result = await run_command(
             *args,

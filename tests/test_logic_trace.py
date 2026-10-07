@@ -58,7 +58,7 @@ class TraceTests(unittest.IsolatedAsyncioTestCase):
         events = self.events()
         self.assertTrue(all(e['trace_id'] == ctx.trace_id for e in events))
         self.assertTrue(all(e['user_id_hash'].startswith('u_') for e in events))
-        self.assertLessEqual(len(events[1]['ids']), 20)
+        self.assertLessEqual(len(next(event for event in events if event['event'] == 'rule34.request.failed')['ids']), 20)
 
     async def test_minimal_level_and_rotation(self):
         self.enable(level='minimal', max_bytes=500, backup_count=2)

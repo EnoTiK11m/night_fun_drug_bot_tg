@@ -4,11 +4,17 @@ import random
 import json
 import logging
 from app.services.media_preferences import post_matches_preferences, media_kind
-from app.observability.logic_trace import trace_event, trace_error, traced_flow, increment
+from app.observability.logic_trace import trace_event, trace_error, traced_flow, increment, traced_request, next_attempt
 import time
 from app.integrations.rule34.rate_limiter import rule34_limiter, QuotaQueueFull
 from functools import wraps
 from typing import Optional, Set, List, Dict
+from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
+from app.integrations.rule34.outage import (
+    APITemporaryError, Rule34Unavailable, rule34_outage,
+    forbidden_diagnostics, BODY_SAMPLE_LIMIT,
+)
 from app.config import (
     API_BASE_URL,
     AUTOCOMPLETE_URL,
@@ -35,10 +41,6 @@ INTERACTIVE_REQUEST_CONCURRENCY = 2
 BACKGROUND_REQUEST_CONCURRENCY = 1
 
 
-class APITemporaryError(Exception):
-    """Raised when the upstream API failed but the query should be retried later."""
-
-
 def interactive_deadline(handler):
     @wraps(handler)
     async def wrapped(*args, **kwargs):
@@ -59,12 +61,57 @@ class rule34API:
         while len(self.user_search_states) > 2000:
             user = min(self.user_search_states, key=lambda key: self.user_search_states[key].get('last_used', 0))
             self.user_search_states.pop(user, None)
-    def __init__(self, *, limiter=None):
+    def __init__(self, *, limiter=None, breaker=None):
         self.session: Optional[aiohttp.ClientSession] = None
         self.interactive_semaphore = asyncio.Semaphore(INTERACTIVE_REQUEST_CONCURRENCY)
         self.background_semaphore = asyncio.Semaphore(BACKGROUND_REQUEST_CONCURRENCY)
         self.limiter = rule34_limiter if limiter is None else limiter
+        self.breaker = rule34_outage if breaker is None else breaker
         self.user_search_states = {}
+
+    @asynccontextmanager
+    async def _request(self, url, params, timeout, kind, endpoint):
+        ticket = None
+        try:
+            ticket = self.breaker.admit(kind, recovery_endpoint=endpoint != 'autocomplete')
+            semaphore = self.background_semaphore if kind == 'background' else self.interactive_semaphore
+            async with self.limiter.slot(kind, semaphore, admit=lambda: self.breaker.validate(ticket, kind)):
+                next_attempt()
+                self.breaker.dispatched(ticket, kind, endpoint)
+                increment('http_requests')
+                async with self.session.get(url, params=params, timeout=timeout) as response:
+                    if response.status == 429:
+                        await self.limiter.cooldown(response.headers.get('Retry-After'), kind)
+                    if response.status != 200:
+                        trace_event('rule34.request.http_error', endpoint=endpoint, status=response.status)
+                        if response.status == 403:
+                            # Open before reading diagnostics: cancellation/read failure cannot lose the 403.
+                            self.breaker.forbidden(ticket, kind, 'http_403_unknown')
+                            diagnostic = forbidden_diagnostics(response.headers, b'', secrets=(API_KEY, API_USER_ID))
+                            try:
+                                async with asyncio.timeout(1):
+                                    body = await response.content.read(BODY_SAMPLE_LIMIT)
+                                diagnostic = forbidden_diagnostics(response.headers, body, secrets=(API_KEY, API_USER_ID))
+                            except (TimeoutError, aiohttp.ClientError):
+                                diagnostic['body_classification'] = 'unavailable'
+                            if self.breaker.is_open and self.breaker.generation == ticket.generation + 1:
+                                self.breaker.category = diagnostic['category']
+                            trace_event('rule34.http.forbidden', level='normal', endpoint=endpoint,
+                                        path=urlsplit(url).path, request_kind=kind, **diagnostic)
+                            logger.warning('Rule34 HTTP 403 endpoint=%s diagnostics=%s', endpoint, diagnostic)
+                            raise Rule34Unavailable(self.breaker.remaining())
+                        self.breaker.failure(ticket, status=response.status)
+                        raise APITemporaryError(f'Rule34 API HTTP {response.status}')
+                    yield response, ticket
+        except (TimeoutError, aiohttp.ClientError, APITemporaryError) as exc:
+            trace_error(exc, endpoint, 'rule34.attempt.failed')
+            if ticket is not None and ticket.dispatched and not ticket.completed:
+                self.breaker.failure(ticket)
+            raise
+        finally:
+            if ticket is not None:
+                self.breaker.release(ticket)
+            await self.breaker.notify()
 
     async def ensure_session(self):
         """Создать сессию если её нет"""
@@ -139,6 +186,7 @@ class rule34API:
         self.cleanup_search_states()
 
     @traced_flow("rule34", query_arg="tags", inherit=True)
+    @traced_request("rule34", "post_search")
     async def search(
         self,
         tags: str,
@@ -182,31 +230,21 @@ class rule34API:
             request_started = time.monotonic()
             trace_event("rule34.request.start", level="normal", endpoint="post_search", pid=pid, limit=limit, request_kind=request_kind, attempt=attempt)
             try:
-                semaphore = (
-                    self.background_semaphore
-                    if request_kind == "background"
-                    else self.interactive_semaphore
-                )
-                async with self.limiter.slot(request_kind, semaphore):
-                    increment("http_requests")
-                    async with self.session.get(
-                        API_BASE_URL,
-                        params=params,
-                        timeout=timeout
-                    ) as response:
-                        logger.debug("Response status: %s", response.status)
-                        if response.status == 429:
-                            await self.limiter.cooldown(response.headers.get("Retry-After"), request_kind)
-                        if response.status != 200:
-                            trace_event("rule34.request.http_error", endpoint="post_search", pid=pid, attempt=attempt, status=response.status)
-                            raise APITemporaryError(f"Rule34 API HTTP {response.status}")
-                        response_text = await response.text()
+                async with self._request(API_BASE_URL, params, timeout, request_kind, 'post_search') as (response, ticket):
+                    response_text = await response.text()
+                    try:
+                        data = json.loads(response_text)
+                    except json.JSONDecodeError as e:
+                        trace_event("rule34.request.invalid_json", endpoint="post_search", pid=pid, attempt=attempt)
+                        raise APITemporaryError("Rule34 API returned invalid JSON") from e
+                    if isinstance(data, list):
+                        self.breaker.success(ticket, request_kind)
+                    else:
+                        self.breaker.failure(ticket, status=200)
 
-                try:
-                    data = json.loads(response_text)
-                except json.JSONDecodeError as e:
-                    trace_event("rule34.request.invalid_json", endpoint="post_search", pid=pid, attempt=attempt)
-                    raise APITemporaryError("Rule34 API returned invalid JSON") from e
+                if not isinstance(data, list) and self.breaker.is_open:
+                    self.breaker.logical_failures += 1
+                    raise Rule34Unavailable(self.breaker.remaining())
 
                 logger.debug(
                     "Found %s posts on page %s",
@@ -215,7 +253,7 @@ class rule34API:
                 )
 
                 if isinstance(data, list):
-                    trace_event("rule34.request.success", level="normal", endpoint="post_search", pid=pid, limit=limit, request_kind=request_kind, attempt=attempt, status=200, result_count=len(data), duration_ms=(time.monotonic()-request_started)*1000)
+                    trace_event("rule34.request.success", level="normal", endpoint="post_search", recovery_accepted=not self.breaker.is_open, pid=pid, limit=limit, request_kind=request_kind, attempt=attempt, status=200, result_count=len(data), duration_ms=(time.monotonic()-request_started)*1000)
                     return data
 
                 if isinstance(data, dict) and data.get("success") is False:
@@ -227,8 +265,15 @@ class rule34API:
                 trace_event("rule34.request.failed", endpoint="post_search", pid=pid, attempt=attempt, reason="unexpected_response_type", status=200)
                 return None
 
+            except Rule34Unavailable as e:
+                trace_event('rule34.request.unavailable', level='normal', endpoint='post_search',
+                            attempt=attempt, request_kind=request_kind, retry_after_seconds=e.retry_after_seconds)
+                raise
             except (asyncio.TimeoutError, aiohttp.ClientError, APITemporaryError, QuotaQueueFull) as e:
                 trace_event("rule34.request.timeout" if isinstance(e, asyncio.TimeoutError) else "rule34.request.failed", endpoint="post_search", pid=pid, attempt=attempt, type=type(e).__name__, message=str(e), duration_ms=(time.monotonic()-request_started)*1000)
+                if self.breaker.is_open:
+                    self.breaker.logical_failures += 1
+                    raise Rule34Unavailable(self.breaker.remaining()) from e
                 if attempt <= API_SEARCH_RETRIES:
                     logger.warning(
                         "Rule34 API temporary error on page %s, retry %s/%s: %s",
@@ -237,11 +282,12 @@ class rule34API:
                         API_SEARCH_RETRIES,
                         e,
                     )
-                    trace_event("rule34.request.retry", level="verbose", pid=pid, attempt=attempt, wait_seconds=attempt)
+                    trace_event("rule34.request.retry", level="normal", pid=pid, attempt=attempt, wait_seconds=attempt, retry_reason="transient_failure", policy="existing_search_linear")
                     await asyncio.sleep(attempt)
                     continue
 
                 logger.warning("Rule34 API temporary error on page %s, giving up: %s", pid, e)
+                self.breaker.logical_failures += 1
                 raise APITemporaryError("Rule34 API request failed") from e
 
     @interactive_deadline
@@ -457,6 +503,7 @@ class rule34API:
         )
 
     @traced_flow("rule34", inherit=True)
+    @traced_request("rule34", "post_by_id")
     async def get_post_by_id(self, post_id: int, timeout: int = 8) -> Optional[Dict]:
         """Получить конкретный пост по ID"""
         await self.ensure_session()
@@ -465,73 +512,70 @@ class rule34API:
         params = self._build_params(id=post_id)
 
         try:
-            async with self.limiter.slot("interactive", self.interactive_semaphore):
-                increment("http_requests")
-                async with self.session.get(
-                    API_BASE_URL, params=params, timeout=timeout
-                ) as response:
-                    if response.status == 429:
-                        await self.limiter.cooldown(response.headers.get("Retry-After"))
-                    if response.status != 200:
-                        trace_event("rule34.request.http_error", endpoint="post_by_id", status=response.status)
-                    if response.status == 200:
-                        response_text = await response.text()
-                        try:
-                            data = json.loads(response_text)
-                            # API возвращает массив, даже для одного поста
-                            if isinstance(data, list) and len(data) > 0:
-                                trace_event("rule34.request.success", level="normal", endpoint="post_by_id", result_count=len(data), status=200)
-                                return data[0]
-                            trace_event("rule34.request.success" if isinstance(data, list) else "rule34.request.failed", endpoint="post_by_id", result_count=0, status=200, reason="empty" if isinstance(data, list) else "unexpected_response_type")
-                        except json.JSONDecodeError:
-                            trace_event("rule34.request.invalid_json", endpoint="post_by_id")
-                            logger.warning("JSON decode error for post %s", post_id)
-                return None
-        except (asyncio.TimeoutError, aiohttp.ClientError, QuotaQueueFull) as e:
+            async with self._request(API_BASE_URL, params, timeout, 'interactive', 'post_by_id') as (response, ticket):
+                if response.status == 200:
+                    response_text = await response.text()
+                    try:
+                        data = json.loads(response_text)
+                        if isinstance(data, list):
+                            self.breaker.success(ticket, 'interactive')
+                        else:
+                            self.breaker.failure(ticket, status=200)
+                        # API возвращает массив, даже для одного поста
+                        if isinstance(data, list) and len(data) > 0:
+                            trace_event("rule34.request.success", level="normal", endpoint="post_by_id", recovery_accepted=not self.breaker.is_open, result_count=len(data), status=200)
+                            return data[0]
+                        trace_event("rule34.request.success" if isinstance(data, list) else "rule34.request.failed", endpoint="post_by_id", recovery_accepted=not self.breaker.is_open, result_count=0, status=200, reason="empty" if isinstance(data, list) else "unexpected_response_type")
+                    except json.JSONDecodeError:
+                        self.breaker.failure(ticket, status=200)
+                        trace_event("rule34.request.invalid_json", endpoint="post_by_id")
+                        logger.warning("JSON decode error for post %s", post_id)
+            return None
+        except Rule34Unavailable:
+            return None
+        except (asyncio.TimeoutError, aiohttp.ClientError, QuotaQueueFull, APITemporaryError) as e:
+            self.breaker.logical_failures += 1
             logger.warning("Temporary API error in get_post_by_id post=%s: %s", post_id, e)
             trace_error(e, stage="post_by_id", event="rule34.request.timeout" if isinstance(e, asyncio.TimeoutError) else "rule34.request.failed")
             return None
 
     @traced_flow("rule34", query_arg="query", inherit=True)
+    @traced_request("rule34", "autocomplete")
     async def autocomplete(self, query: str) -> List[str]:
         """Автодополнение тегов"""
         await self.ensure_session()
 
         trace_event("rule34.request.start", level="normal", endpoint="autocomplete", attempt=1)
         try:
-            async with self.limiter.slot("interactive", self.interactive_semaphore):
-                increment("http_requests")
-                async with self.session.get(
-                    AUTOCOMPLETE_URL,
-                    params={"q": query},
-                    timeout=10
-                ) as response:
-                    if response.status == 429:
-                        await self.limiter.cooldown(response.headers.get("Retry-After"))
-                    if response.status != 200:
-                        trace_event("rule34.request.http_error", endpoint="autocomplete", status=response.status)
-                    if response.status == 200:
-                        response_text = await response.text()
-                        try:
-                            data = json.loads(response_text)
-                            if isinstance(data, list):
-                                results = []
-                                for item in data[:10]:
-                                    if isinstance(item, dict):
-                                        if "value" in item:
-                                            results.append(item["value"])
-                                        elif "name" in item:
-                                            results.append(item["name"])
-                                    elif isinstance(item, str):
-                                        results.append(item)
-                                trace_event("rule34.request.success", level="normal", endpoint="autocomplete", status=200, result_count=len(results))
-                                return results
-                            trace_event("rule34.request.failed", endpoint="autocomplete", status=200, reason="unexpected_response_type")
-                        except json.JSONDecodeError:
-                            trace_event("rule34.request.invalid_json", endpoint="autocomplete")
-                            pass
-                    return []
+            async with self._request(AUTOCOMPLETE_URL, {'q': query}, 10, 'interactive', 'autocomplete') as (response, ticket):
+                if response.status == 200:
+                    response_text = await response.text()
+                    try:
+                        data = json.loads(response_text)
+                        if isinstance(data, list):
+                            self.breaker.success(ticket, 'interactive', recovery_endpoint=False)
+                            results = []
+                            for item in data[:10]:
+                                if isinstance(item, dict):
+                                    if "value" in item:
+                                        results.append(item["value"])
+                                    elif "name" in item:
+                                        results.append(item["name"])
+                                elif isinstance(item, str):
+                                    results.append(item)
+                            trace_event("rule34.request.success", level="normal", endpoint="autocomplete", status=200, result_count=len(results))
+                            return results
+                        trace_event("rule34.request.failed", endpoint="autocomplete", status=200, reason="unexpected_response_type")
+                        self.breaker.failure(ticket, status=200)
+                    except json.JSONDecodeError:
+                        self.breaker.failure(ticket, status=200)
+                        trace_event("rule34.request.invalid_json", endpoint="autocomplete")
+                        pass
+                return []
+        except Rule34Unavailable:
+            return []
         except Exception as e:
+            self.breaker.logical_failures += 1
             trace_error(e, stage="autocomplete", event="rule34.request.failed")
             logger.exception("Autocomplete Error: %s", e)
             return []

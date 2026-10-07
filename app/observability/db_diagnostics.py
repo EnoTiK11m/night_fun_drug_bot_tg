@@ -9,6 +9,8 @@ import time
 import uuid
 
 from app.observability import logic_trace
+from app.observability.errors import error_details
+from app.observability.health import runtime_health
 
 _operation = ContextVar("db_operation", default="unlabelled")
 _counter_lock = threading.Lock()
@@ -42,7 +44,7 @@ def db_operation(label):
     def decorate(function):
         @wraps(function)
         async def run(*args, **kwargs):
-            with operation_scope(label(*args, **kwargs) if callable(label) else label):
+            with operation_scope(label(*args, **kwargs) if callable(label) else label), logic_trace.technical_context('db.background'):
                 return await function(*args, **kwargs)
         return run
     return decorate
@@ -90,8 +92,7 @@ class Diagnostics:
         self.clock = clock or time.monotonic
         self.operation = operation or _operation.get()
         self.connection_id = uuid.uuid4().hex[:16]
-        self.trace = logic_trace.current_trace() or logic_trace.TraceContext(
-            flow="db", trace_id=self.connection_id)
+        self.trace = logic_trace.diagnostic_trace() or logic_trace.TraceContext(flow="db")
         try:
             task = asyncio.current_task()
         except RuntimeError:
@@ -105,10 +106,9 @@ class Diagnostics:
         self.next_query = None
         self.metadata = {}
         self.error_type = None
+        self.error_details = {}
 
     def emit(self, event, level="verbose", **fields):
-        if not logic_trace.enabled(level):
-            return
         logic_trace.trace_event(event, trace=self.trace, level=level,
             connection_id=self.connection_id, operation=self.operation,
             task_id=self.task_id, thread_id=self.thread_id,
@@ -139,6 +139,8 @@ class Diagnostics:
             return await function(*args)
         except BaseException as exc:
             error = type(exc).__name__
+            self.error_details = logic_trace.sanitize(error_details(exc, 'db'))
+            logic_trace.trace_error(exc, self.operation, 'db.error')
             raise
         finally:
             count("operations", -1)
@@ -188,6 +190,8 @@ class Diagnostics:
             return function(*args)
         except BaseException as exc:
             error = type(exc).__name__
+            self.error_details = logic_trace.sanitize(error_details(exc, 'db'))
+            logic_trace.trace_error(exc, self.operation, 'db.error')
             raise
         finally:
             count("operations", -1)
@@ -195,9 +199,16 @@ class Diagnostics:
 
     def finished(self, **fields):
         total = (self.clock() - self.started) * 1000
+        runtime_health.update('db', last_operation=self.operation, last_duration_ms=total,
+                              **counter_snapshot())
+        if total > 250:
+            runtime_health.increment('db', 'slow_operations', last_slow_operation=self.operation, last_slow_duration_ms=total)
+        if total > 250 and not self.error_type:
+            summary = runtime_health.error('db', self.operation, dict(error_category='db_slow', root_error_type='unknown', root_error_message=self.operation))
+            self.emit('db.slow.summary', level='normal', **summary, error_category='db_slow', root_cause='unknown')
         self.emit("db.slow_operation" if total > 250 else "db.operation",
             level="normal" if total > 250 or self.error_type else "verbose", duration_ms=total, error_type=self.error_type,
-            total_ms=total, **self.timings, query_timings=self.queries, **self.metadata, **fields)
+            total_ms=total, **{k:v for k,v in self.error_details.items() if k != "error_type"}, **self.timings, query_timings=self.queries, **self.metadata, **fields)
         if self.timings.get("close_ms", 0) > 1000:
             self.emit("db.connection.close.slow", level="normal", total_ms=total,
                       close_ms=self.timings["close_ms"])

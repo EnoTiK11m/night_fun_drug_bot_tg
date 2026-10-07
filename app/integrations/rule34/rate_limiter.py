@@ -73,7 +73,7 @@ class Rule34Limiter:
             except TimeoutError:
                 pass
 
-    async def acquire(self, kind='interactive', semaphore=None):
+    async def acquire(self, kind='interactive', semaphore=None, *, admit=None):
         if kind not in self.queues:
             raise ValueError('Unknown request kind')
         started, waited = self.clock(), False
@@ -98,6 +98,8 @@ class Rule34Limiter:
                                 self.timestamps[0] + self.window_seconds - now if len(self.timestamps) >= self.limit else 0)
                     if self.selected() is waiter and delay <= 0 and (semaphore is None or not semaphore.locked()):
                         # No suspension between semaphore admission, timestamp and dispatch.
+                        if admit is not None:
+                            admit()
                         if semaphore is not None:
                             await semaphore.acquire()
                         self.timestamps.append(self.clock())
@@ -125,8 +127,8 @@ class Rule34Limiter:
                     self.condition.notify_all()
 
     @asynccontextmanager
-    async def slot(self, kind, semaphore=None):
-        await self.acquire(kind, semaphore)
+    async def slot(self, kind, semaphore=None, *, admit=None):
+        await self.acquire(kind, semaphore, admit=admit)
         try:
             yield
         finally:

@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import math
-from app.observability.logic_trace import trace_event, trace_error, current_trace
+from app.observability.logic_trace import trace_event, trace_error, current_trace, traced_request, next_attempt
 import time
 from collections import deque
 from contextvars import ContextVar
@@ -334,7 +334,12 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
         wait_seconds = retry_after_seconds(error)
         now = self._clock()
         until = now + wait_seconds
+        previous = self._global_cooldown_until
         self._global_cooldown_until = max(self._global_cooldown_until, until)
+        self._diagnostic_cooldown_pending = True
+        trace_event('telegram.cooldown.extended' if previous > now else 'telegram.cooldown.opened',
+                    level='normal', raw_retry_after_seconds=_raw_retry_after_seconds(error),
+                    applied_wait_seconds=wait_seconds, cooldown_remaining_seconds=max(0, self._global_cooldown_until-now))
         bucket = self._bucket(int(chat_id or 0), now)
         bucket.cooldown_until = max(bucket.cooldown_until, until)
         self._cleanup_registry(now)
@@ -361,21 +366,27 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
             queued_at = time.monotonic()
             await self.wait_for_slot(chat_id)
             attempt += 1
-            trace_event("telegram.queue.admitted", level="verbose", queue_wait_ms=(time.monotonic()-queued_at)*1000)
+            diagnostic_attempt = next_attempt()
+            trace_event("telegram.queue.admitted", level="normal", queue_wait_ms=(time.monotonic()-queued_at)*1000)
             self.metrics.telegram_requests_total += 1
             token = _limiter_active.set(True)
             try:
                 started = time.monotonic()
-                trace_event("telegram.send.start", operation=operation_name, attempt=attempt)
+                trace_event("telegram.send.start", operation=operation_name, attempt=diagnostic_attempt)
                 result = await operation()
-                trace_event("telegram.send.success", operation=operation_name, attempt=attempt, duration_ms=(time.monotonic()-started)*1000)
+                trace_event("telegram.send.success", operation=operation_name, attempt=diagnostic_attempt, duration_ms=(time.monotonic()-started)*1000)
+                if getattr(self, '_diagnostic_cooldown_pending', False) and self._clock() >= self._global_cooldown_until:
+                    self._diagnostic_cooldown_pending = False
+                    trace_event('telegram.cooldown.recovered', level='normal', outcome='recovered', operation=operation_name)
+                    logger.info('Telegram cooldown recovered after successful outgoing request operation=%s', operation_name)
                 return result
             except RetryAfter as exc:
+                trace_error(exc, stage=operation_name, event='telegram.attempt.retry_after')
                 raw_seconds = _raw_retry_after_seconds(exc)
                 self.metrics.telegram_retry_after_count += 1
                 wait_seconds = self.apply_retry_after(chat_id, raw_seconds)
                 remaining_seconds = max(0.0, self._global_cooldown_until - self._clock())
-                trace_event("telegram.send.retry_after", operation=operation_name, attempt=attempt,
+                trace_event("telegram.send.retry_after", operation=operation_name, attempt=diagnostic_attempt,
                             raw_retry_after_seconds=raw_seconds, applied_wait_seconds=wait_seconds,
                             wait_seconds=wait_seconds, cooldown_remaining_seconds=remaining_seconds)
                 logger.warning(
@@ -398,6 +409,7 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
             finally:
                 _limiter_active.reset(token)
 
+    @traced_request("telegram", "outgoing", inherit=True)
     async def execute(
         self,
         operation: Callable[[], Awaitable[Any]],
@@ -422,6 +434,8 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
                 trace_error(trace_exc, stage=operation_name, event="telegram.send.timeout")
                 ambiguous_timeout = True
                 if safe_to_retry_timeout and timeout_attempts < SAFE_TIMEOUT_RETRIES:
+                    trace_event('telegram.send.retry', operation=operation_name, reason='safe_timeout_retry',
+                                user_impact='unknown_delivery', retry_in_seconds=0)
                     timeout_attempts += 1
                     self.metrics.telegram_retry_attempts += 1
                     logger.warning(
@@ -439,6 +453,7 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
                 if ambiguous_timeout and is_ambiguous_bad_request_success(
                     exc, ambiguous_bad_request_policy
                 ):
+                    trace_event('telegram.send.ambiguous_accepted', operation=operation_name, outcome='recovered', user_impact='unknown_delivery')
                     return True
                 self.metrics.telegram_request_failures += 1
                 raise
@@ -450,6 +465,7 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
                 self.metrics.telegram_request_failures += 1
                 raise
 
+    @traced_request("telegram", "ptb_outgoing", inherit=True)
     async def process_request(
         self,
         callback,
@@ -469,6 +485,10 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
             operation_name=endpoint,
             chat_id=chat_id,
         )
+
+    def diagnostic_snapshot(self):
+        return dict(self.snapshot_metrics(), cooldown_remaining_seconds=max(0, self._global_cooldown_until-self._clock()),
+                    queue_depth=len(self._waiters))
 
     def snapshot_metrics(self) -> dict[str, int]:
         return {
@@ -490,6 +510,7 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
         now = self._clock()
         self._global_bucket = _TokenBucket(float(self.burst), now, now)
         self._global_cooldown_until = 0.0
+        self._diagnostic_cooldown_pending = False
         self._running = True
         self.metrics.reset()
 

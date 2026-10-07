@@ -2,7 +2,7 @@ import asyncio
 from dataclasses import dataclass
 import io
 import logging
-from app.observability.logic_trace import trace_event, annotate
+from app.observability.logic_trace import trace_event, annotate, traced_flow
 import ipaddress
 import os
 import socket
@@ -588,6 +588,7 @@ async def send_text_to_chat(bot, chat_id: int, *, before_send=None, **kwargs) ->
         return False
 
 
+@traced_flow("media.delivery")
 async def send_post_media(
     message,
     post: dict,
@@ -615,6 +616,7 @@ async def send_post_media(
         trace_event("media.source.attempt", level="normal", post_id=post.get("id"), url_kind=url_kind)
         if source_index:
             trace_event("telegram.send.fallback", post_id=post.get("id"), fallback_source=url_kind, reason="previous_source_rejected")
+            trace_event("media.source.fallback", source=url_kind, reason="previous_source_rejected")
         annotate(post_id=post.get("id"), media_type="video" if media_url_path_lower(media_url).endswith((".mp4", ".webm")) else "animation" if media_url_path_lower(media_url).endswith(".gif") else "photo")
         for attempt in range(1, retries + 1):
             try:
@@ -628,6 +630,7 @@ async def send_post_media(
                     post.get("id"),
                     url_kind,
                 )
+                trace_event("media.delivery.success", source=url_kind, fallback_used=bool(source_index), user_impact="delivered")
                 runtime_metrics.increment("media_direct_ok")
                 return True
             except RetryAfter:
@@ -635,6 +638,8 @@ async def send_post_media(
             except TimedOut:
                 raise
             except Exception as exc:
+                trace_event('media.source.failed', url_kind=url_kind, attempt=attempt, error_type=type(exc).__name__,
+                            error_category='telegram_url_fetch_failed' if _telegram_url_fetch_failed(exc) else 'invalid_media', outcome='failed')
                 if _is_ambiguous_network_error(exc):
                     raise
                 logger.warning(
@@ -657,6 +662,7 @@ async def send_post_media(
                                 post.get("id"),
                                 url_kind,
                             )
+                            trace_event("media.delivery.success", source="download_upload", fallback_used=True, user_impact="delivered")
                             runtime_metrics.increment("media_upload_fallback_ok")
                             return True
                     except RetryAfter:
@@ -664,6 +670,7 @@ async def send_post_media(
                     except TimedOut:
                         raise
                     except Exception as fallback_exc:
+                        trace_event("media.source.failed", source="download_upload", error_type=type(fallback_exc).__name__, error_category="fallback_failed", outcome="failed")
                         if _is_ambiguous_network_error(fallback_exc):
                             raise
                         logger.warning(
@@ -675,6 +682,7 @@ async def send_post_media(
                             fallback_exc,
                         )
                 if attempt < retries:
+                    trace_event("media.source.retry", retry_in_seconds=1, reason="existing_media_retry", attempt=attempt)
                     await asyncio.sleep(1)
 
     fallback = (
@@ -692,12 +700,15 @@ async def send_post_media(
     )
     if sent:
         logger.warning("Media fallback sent post=%s", post.get("id"))
+        annotate(fallback_used="text_link", user_impact="delivered")
+        trace_event("media.delivery.success", source="text_link", fallback_used=True, user_impact="delivered")
         runtime_metrics.increment("media_text_fallback")
     else:
         runtime_metrics.failure(f"interactive post={post.get('id')}")
     return sent
 
 
+@traced_flow("media.delivery", user_arg="chat_id")
 async def send_post_media_to_chat(
     bot,
     chat_id: int,
@@ -735,6 +746,7 @@ async def send_post_media_to_chat(
         trace_event("media.source.attempt", level="normal", post_id=post.get("id"), url_kind=url_kind)
         if source_index:
             trace_event("telegram.send.fallback", post_id=post.get("id"), fallback_source=url_kind, reason="previous_source_rejected")
+            trace_event("media.source.fallback", source=url_kind, reason="previous_source_rejected")
         annotate(post_id=post.get("id"), media_type="video" if media_url_path_lower(media_url).endswith((".mp4", ".webm")) else "animation" if media_url_path_lower(media_url).endswith(".gif") else "photo")
         for attempt in range(1, retries + 1):
             try:
@@ -750,6 +762,7 @@ async def send_post_media_to_chat(
                     post.get("id"),
                     url_kind,
                 )
+                trace_event("media.delivery.success", source=url_kind, fallback_used=bool(source_index), user_impact="delivered")
                 runtime_metrics.increment("media_direct_ok")
                 return True
             except RetryAfter:
@@ -759,6 +772,8 @@ async def send_post_media_to_chat(
             except DeliveryPreconditionFailed:
                 return False
             except Exception as exc:
+                trace_event('media.source.failed', url_kind=url_kind, attempt=attempt, error_type=type(exc).__name__,
+                            error_category='telegram_url_fetch_failed' if _telegram_url_fetch_failed(exc) else 'invalid_media', outcome='failed')
                 if _is_ambiguous_network_error(exc):
                     raise
                 logger.warning(
@@ -784,6 +799,7 @@ async def send_post_media_to_chat(
                                 post.get("id"),
                                 url_kind,
                             )
+                            trace_event("media.delivery.success", source="download_upload", fallback_used=True, user_impact="delivered")
                             runtime_metrics.increment("media_upload_fallback_ok")
                             return True
                     except RetryAfter:
@@ -793,6 +809,7 @@ async def send_post_media_to_chat(
                     except DeliveryPreconditionFailed:
                         return False
                     except Exception as fallback_exc:
+                        trace_event("media.source.failed", source="download_upload", error_type=type(fallback_exc).__name__, error_category="fallback_failed", outcome="failed")
                         if _is_ambiguous_network_error(fallback_exc):
                             raise
                         logger.warning(
@@ -805,6 +822,7 @@ async def send_post_media_to_chat(
                             fallback_exc,
                         )
                 if attempt < retries:
+                    trace_event("media.source.retry", retry_in_seconds=1, reason="existing_media_retry", attempt=attempt)
                     await asyncio.sleep(1)
 
     fallback = (
@@ -828,6 +846,8 @@ async def send_post_media_to_chat(
             chat_id,
             post.get("id"),
         )
+        annotate(fallback_used="text_link", user_impact="delivered")
+        trace_event("media.delivery.success", source="text_link", fallback_used=True, user_impact="delivered")
         runtime_metrics.increment("media_text_fallback")
     else:
         runtime_metrics.failure(f"subscription user={chat_id} post={post.get('id')}")

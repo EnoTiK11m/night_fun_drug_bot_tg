@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, Iterable
+from app.observability.diagnostics import stage as diagnostic_stage
+from app.observability.logic_trace import trace_error
 
 
 logger = logging.getLogger(__name__)
@@ -493,7 +495,9 @@ class BotInstanceLifecycle:
                 wait_seconds=self.wait_seconds,
                 retry_interval_seconds=self.retry_interval_seconds,
             )
+            diagnostic_stage('instance_lock_acquired', lock_held=True, lock_wait_ms=wait_ms)
             checks = self._startup_checks()
+            diagnostic_stage('startup_checks_complete', checks_ok=checks.ok)
             logger.info(
                 "startup_checks_result ok=%s passed=%s failed=%s",
                 int(checks.ok),
@@ -505,6 +509,7 @@ class BotInstanceLifecycle:
                     "Startup checks failed: " + ", ".join(checks.failed_names)
                 )
             cleanup = self._orphan_cleanup()
+            diagnostic_stage('startup_cleanup_complete', deleted=cleanup.deleted, errors=cleanup.errors)
             logger.info(
                 "startup_orphan_cleanup deleted=%s errors=%s skipped_reparse=%s",
                 cleanup.deleted,
@@ -517,6 +522,7 @@ class BotInstanceLifecycle:
             self.lock.release()
             raise
         except Exception as exc:
+            trace_error(exc, 'instance.startup', 'process.startup.failed')
             self.lock.release()
             raise InstanceLockLifecycleError("Instance startup failed") from exc
 

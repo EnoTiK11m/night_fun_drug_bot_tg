@@ -61,7 +61,9 @@ class DBInstrumentationTests(unittest.IsolatedAsyncioTestCase):
             pass
         e = (await self.summaries())[-1]
         self.assertEqual(e["flow"], "db")
-        self.assertEqual(e["trace_id"], e["connection_id"])
+        # v2 distinguishes the root operation from its SQLite connection.
+        self.assertNotEqual(e["trace_id"], e["connection_id"])
+        self.assertTrue(e["flow_id"])
         self.assertNotIn("user_id_hash", e)
 
     async def test_parent_correlation_preserved(self):
@@ -240,7 +242,8 @@ class DBInstrumentationTests(unittest.IsolatedAsyncioTestCase):
         trace.configure_trace(enabled=True, path=self.path, level="normal", secrets=[])
         async with database.connect_db():
             pass
-        self.assertEqual(await self.events(), [])
+        # Recovery is intentionally normal even when the successful phases are verbose.
+        self.assertEqual([e for e in await self.events() if e['event'] != 'db.recovered'], [])
 
     async def test_disabled_trace_keeps_database_behavior(self):
         await trace.shutdown_trace()

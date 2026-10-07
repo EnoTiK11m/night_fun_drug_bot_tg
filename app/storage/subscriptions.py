@@ -231,7 +231,7 @@ async def get_all_user_subscriptions(runtime, user_id):
 
 
 @db_operation("subscription.schedule.update")
-async def update_subscription_time(runtime, user_id, query, processing_token):
+async def update_subscription_time(runtime, user_id, query, processing_token, *, minimum_delay_seconds=0):
     async with runtime.connect_db() as db:
         params: tuple[runtime.Any, ...]
         token_filter = ""
@@ -240,13 +240,14 @@ async def update_subscription_time(runtime, user_id, query, processing_token):
             params = (user_id, query.strip(), processing_token)
         else:
             params = (user_id, query.strip())
+        params = (max(0, min(int(minimum_delay_seconds), 3600)),) + params
 
         cursor = await db.execute(f"""
             UPDATE subscriptions
             SET last_sent = CURRENT_TIMESTAMP,
                 no_new_posts_count = 0,
                 last_empty_at = NULL,
-                next_check_at = datetime('now', '+' || interval_seconds || ' seconds'),
+                next_check_at = datetime('now', '+' || MAX(interval_seconds, ?) || ' seconds'),
                 exhausted_notified = 0,
                 processing_until = NULL,
                 processing_token = NULL
@@ -346,6 +347,7 @@ async def pause_all_active_subscriptions(runtime, user_id, pause_minutes):
               AND is_active = 1
             """, (pause_until, pause_until, user_id))
             await db.commit()
+            runtime.trace_event('subscriptions.pause.opened', level='normal', user_hash=runtime.safe_hash(user_id, 'u_'), affected=cursor.rowcount, pause_minutes=pause_minutes)
             return cursor.rowcount
         except BaseException:
             await db.rollback()
@@ -368,6 +370,7 @@ async def resume_all_active_subscriptions(runtime, user_id):
               AND is_active = 1
             """, (user_id,))
             await db.commit()
+            runtime.trace_event('subscriptions.pause.closed', level='normal', user_hash=runtime.safe_hash(user_id, 'u_'), affected=cursor.rowcount, outcome='recovered')
             return cursor.rowcount
         except BaseException:
             await db.rollback()

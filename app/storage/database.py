@@ -436,8 +436,8 @@ async def get_all_user_subscriptions(user_id: int) -> List[Tuple[str, int, bool,
     return await subscriptions_repository.get_all_user_subscriptions(sys.modules[__name__], user_id)
 
 
-async def update_subscription_time(user_id: int, query: str, processing_token: Optional[str]=None) -> bool:
-    return await subscriptions_repository.update_subscription_time(sys.modules[__name__], user_id, query, processing_token)
+async def update_subscription_time(user_id: int, query: str, processing_token: Optional[str]=None, *, minimum_delay_seconds: int=0) -> bool:
+    return await subscriptions_repository.update_subscription_time(sys.modules[__name__], user_id, query, processing_token, minimum_delay_seconds=minimum_delay_seconds)
 
 
 async def mark_subscription_empty(user_id: int, query: str, processing_token: Optional[str]=None) -> Tuple[int, int, bool]:
