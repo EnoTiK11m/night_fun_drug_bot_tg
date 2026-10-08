@@ -255,6 +255,15 @@ Shutdown draining → flush → complete → lock released; existing order and b
 unchanged. Updater checked-command stages have request/attempt/error evidence
 without logging command args/stdout/stderr. Windows launcher использует `python -m app.main`; lifecycle-коды описаны в [Production](PRODUCTION.md#windows).
 
+`media.source.failed` сохраняет доменную категорию и тип корневого исключения:
+PTB NetworkError → ConnectError даёт `telegram_network`; внешний download connect
+даёт `connect`. Предыдущая URL-ошибка не становится причиной нового download
+только из-за неявного Python exception context. BadRequest сохраняет
+`telegram_bad_request` и allowlisted `safe_reason`; `invalid_media` используется
+для известных ошибок проверки содержимого/размера. Неизвестные ошибки остаются
+`invalid_state`. Эти промежуточные события не создают health incidents и не меняют
+решения о retry, fallback или доставке; raw exception messages в них не добавляются.
+
 ## Проверки и ограничения
 
 Regression coverage: fake HTTP/clock, retries, suppressed/real recovery/stale success,

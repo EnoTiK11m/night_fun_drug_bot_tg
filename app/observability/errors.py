@@ -4,12 +4,16 @@ import re
 import sqlite3
 
 
-def error_details(exc, component="app"):
+def error_details(exc, component="app", *, context_boundary=None):
     chain, seen = [], set()
     while exc is not None and id(exc) not in seen and len(chain) < 8:
         seen.add(id(exc))
         chain.append(exc)
-        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+        next_error = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+        # Only an implicit context can belong to a previous fallback attempt.
+        if exc.__cause__ is None and next_error is context_boundary:
+            break
+        exc = next_error
     if not chain:
         return {}
     high, root = chain[0], chain[-1]

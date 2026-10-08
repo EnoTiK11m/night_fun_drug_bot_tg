@@ -2,13 +2,15 @@
 from contextlib import ExitStack
 from datetime import UTC, datetime
 import json
+import io
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from httpx import ReadTimeout
+from httpx import ConnectError, ReadTimeout
+from aiohttp import ClientConnectorError
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
 from app.observability.errors import error_details
@@ -28,6 +30,38 @@ def ambiguous_timeout():
 
 
 class ClassificationAndHealthTests(unittest.TestCase):
+    def test_media_source_evidence_keeps_domain_and_safe_reason(self):
+        for error, category, root in (
+            (ambiguous_timeout(), 'telegram_timeout_ambiguous', 'ReadTimeout'),
+            (BadRequest('Photo_invalid_dimensions'), 'telegram_bad_request', 'BadRequest'),
+            (ConnectError('BOTSECRET https://private.test/path'), 'connect', 'ConnectError'),
+            (ReadTimeout('download timeout'), 'read_timeout', 'ReadTimeout'),
+            (ValueError('Downloaded photo is empty'), 'invalid_media', 'ValueError'),
+            (media.FileDownloadLimitExceeded('file too large'), 'invalid_media', 'FileDownloadLimitExceeded'),
+            (media.TotalDownloadLimitExceeded('batch budget exhausted'), 'invalid_state', 'TotalDownloadLimitExceeded'),
+            (RuntimeError('unexpected bug'), 'invalid_state', 'RuntimeError'),
+        ):
+            with self.subTest(category=category):
+                details = media._media_source_error_details(error)
+                self.assertEqual(details['error_category'], category)
+                self.assertEqual(details['root_error_type'], root)
+                encoded = json.dumps(details)
+                self.assertNotIn('BOTSECRET', encoded)
+                self.assertNotIn('private.test', encoded)
+        self.assertEqual(media._media_source_error_details(BadRequest('Photo_invalid_dimensions'))['safe_reason'], 'unsupported_dimensions')
+
+    def test_download_context_boundary_keeps_own_cause_and_explicit_domain(self):
+        previous = BadRequest('Failed to get http url content')
+        root = OSError('offline')
+        root.__context__ = previous
+        error = ClientConnectorError(SimpleNamespace(ssl=True, host='example.test', port=443), root)
+        error.__cause__ = root
+        details = media._media_source_error_details(error, previous_source_error=previous)
+        self.assertEqual((details['error_category'], details['root_error_type']), ('connect', 'OSError'))
+        wrapper = RuntimeError('explicit cause still belongs to this failure')
+        wrapper.__cause__ = previous
+        self.assertEqual(media._media_source_error_details(wrapper, previous_source_error=previous)['error_category'], 'telegram_bad_request')
+
     def test_domain_timeout_survives_generic_components_and_wrapper(self):
         error = ambiguous_timeout()
         wrapper = RuntimeError('outer flow')
@@ -162,6 +196,123 @@ class FlowCorrectnessTests(unittest.IsolatedAsyncioTestCase):
     async def events(self):
         await trace.shutdown_trace()
         return [json.loads(line) for line in self.path.read_text(encoding='utf-8').splitlines()]
+
+    async def run_media_sources(self, errors, *, chat=False, download=None, text=False):
+        post = dict(id=42, file_url='https://example.test/original.jpg', sample_url='https://example.test/sample.jpg')
+        direct = AsyncMock(side_effect=errors)
+        limiter = TelegramRateLimiter()
+        async def send(*args, **kwargs):
+            return await limiter.execute(direct, operation_name='send_photo', chat_id=1)
+        prefix = 'send' if chat else 'reply'
+        with patch.object(media, 'get_media_url_candidates', return_value=[('file_url', post['file_url']), ('sample_url', post['sample_url'])]), \
+             patch.object(media, prefix + '_media_url', send), \
+             patch.object(media, prefix + '_downloaded_photo', download or AsyncMock(return_value=False)), \
+             patch.object(media, 'send_text_to_chat' if chat else '_reply_text', AsyncMock(return_value=text)):
+            if chat:
+                result = await media.send_post_media_to_chat(object(), 1, post, retries=1)
+            else:
+                result = await media.send_post_media(SimpleNamespace(), post, retries=1)
+        return result, direct
+
+    async def test_media_ptb_connect_failure_has_root_and_stops_without_fallback(self):
+        error = NetworkError('httpx.ConnectError')
+        error.__cause__ = ConnectError('BOTSECRET https://private.test/path')
+        with self.assertRaises(NetworkError):
+            await self.run_media_sources([error, True])
+        events = await self.events()
+        failed = next(e for e in events if e['event']=='media.source.failed')
+        self.assertEqual((failed['error_category'], failed['root_error_type']), ('telegram_network', 'ConnectError'))
+        self.assertEqual(len([e for e in events if e['event']=='media.source.attempt']), 1)
+        self.assertTrue(self.health.snapshot()['components']['telegram']['degraded'])
+        self.assertNotIn('BOTSECRET', self.path.read_text(encoding='utf-8'))
+
+    async def test_chat_media_ptb_connect_failure_has_same_evidence(self):
+        error = NetworkError('connection failed')
+        error.__cause__ = ConnectError('offline')
+        with self.assertRaises(NetworkError):
+            await self.run_media_sources([error], chat=True)
+        failed = next(e for e in await self.events() if e['event']=='media.source.failed')
+        self.assertEqual((failed['error_category'], failed['root_error_type']), ('telegram_network', 'ConnectError'))
+
+    async def test_external_download_connect_failure_then_sample_delivered(self):
+        download = AsyncMock(side_effect=ConnectError('BOTSECRET https://private.test/path'))
+        result, direct = await self.run_media_sources([BadRequest('Failed to get http url content'), True], download=download)
+        self.assertTrue(result)
+        self.assertEqual(direct.await_count, 2)
+        download.assert_awaited_once()
+        events = await self.events()
+        failed = next(e for e in events if e['event']=='media.source.failed' and e.get('source')=='download_upload')
+        self.assertEqual((failed['error_category'], failed['root_error_type']), ('connect', 'ConnectError'))
+        self.assertNotIn('error_message', failed)
+        self.assertFalse(self.health.snapshot()['components']['telegram']['degraded'])
+        self.assertEqual(self.health.snapshot()['active_incidents'], 0)
+        self.assertEqual(next(e for e in events if e['event']=='media.delivery.finished')['user_impact'], 'delivered')
+
+    async def test_chat_external_download_connect_failure_is_not_telegram(self):
+        result, _ = await self.run_media_sources([BadRequest('Failed to get http url content'), True], chat=True,
+                                               download=AsyncMock(side_effect=ConnectionError('offline')))
+        self.assertTrue(result)
+        failed = next(e for e in await self.events() if e.get('source')=='download_upload' and e['event']=='media.source.failed')
+        self.assertEqual(failed['error_category'], 'connect')
+        self.assertFalse(self.health.snapshot()['components']['telegram']['degraded'])
+
+    async def test_original_local_validation_failure_then_sample(self):
+        result, direct = await self.run_media_sources([ValueError('Downloaded photo is empty'), True])
+        self.assertTrue(result)
+        self.assertEqual(direct.await_count, 2)
+        events = await self.events()
+        self.assertEqual(next(e for e in events if e['event']=='media.source.failed')['error_category'], 'invalid_media')
+        self.assertEqual(next(e for e in events if e['event']=='media.delivery.finished')['outcome'], 'fallback_success')
+
+    async def test_original_fetch_bad_request_then_upload_success(self):
+        download = AsyncMock(return_value=True)
+        result, direct = await self.run_media_sources([BadRequest('Failed to get http url content')], download=download)
+        self.assertTrue(result)
+        direct.assert_awaited_once()
+        download.assert_awaited_once()
+        events = await self.events()
+        failed = next(e for e in events if e['event']=='media.source.failed')
+        self.assertEqual((failed['error_category'], failed['safe_reason']), ('telegram_bad_request', 'telegram_fetch_failed'))
+        self.assertEqual(next(e for e in events if e['event']=='media.delivery.success')['source'], 'download_upload')
+
+    async def test_real_upload_fallback_and_limiter_confirm_delivery(self):
+        message = SimpleNamespace(from_user=SimpleNamespace(id=1),
+                                  reply_photo=AsyncMock(side_effect=[BadRequest('Failed to get http url content'), True]))
+        photo = io.BytesIO(b'fixture image bytes')
+        with patch.object(media, '_download_photo_file', AsyncMock(return_value=photo)), \
+             patch.object(media, 'execute_telegram_request', TelegramRateLimiter().execute):
+            self.assertTrue(await media.send_post_media(message, dict(id=42, file_url='https://example.test/photo.jpg'), retries=1))
+        self.assertEqual(message.reply_photo.await_count, 2)
+        self.assertTrue(photo.closed)
+        events = await self.events()
+        self.assertEqual(len([e for e in events if e['event']=='telegram.send.success']), 1)
+        final = next(e for e in events if e['event']=='media.delivery.finished')
+        self.assertEqual((final['outcome'], final['user_impact']), ('fallback_success', 'delivered'))
+        self.assertFalse(self.health.snapshot()['components']['telegram']['degraded'])
+
+    async def test_real_invalid_download_falls_back_without_systemic_incident(self):
+        message = SimpleNamespace(from_user=SimpleNamespace(id=1),
+                                  reply_photo=AsyncMock(side_effect=[BadRequest('Failed to get http url content'), True]))
+        post = dict(id=42, file_url='https://example.test/photo.jpg', sample_url='https://example.test/sample.jpg')
+        with patch.object(media, '_download_photo_file', AsyncMock(side_effect=ValueError('Downloaded photo is empty'))), \
+             patch.object(media, 'execute_telegram_request', TelegramRateLimiter().execute):
+            self.assertTrue(await media.send_post_media(message, post, retries=1))
+        failed = next(e for e in await self.events() if e['event']=='media.source.failed' and e.get('source')=='download_upload')
+        self.assertEqual((failed['error_category'], failed['root_error_type']), ('invalid_media', 'ValueError'))
+        self.assertEqual(message.reply_photo.await_count, 2)
+        self.assertEqual(self.health.snapshot()['active_incidents'], 0)
+        self.assertFalse(self.health.snapshot()['components']['telegram']['degraded'])
+
+    async def test_all_media_sources_fail_preserves_unsent_result(self):
+        result, direct = await self.run_media_sources([BadRequest('Photo_invalid_dimensions'), BadRequest('Photo_invalid_dimensions')])
+        self.assertFalse(result)
+        self.assertEqual(direct.await_count, 2)
+        events = await self.events()
+        self.assertFalse(any(e['event']=='media.delivery.success' for e in events))
+        self.assertEqual(len([e for e in events if e['event']=='media.source.failed']), 2)
+        final = next(e for e in events if e['event']=='media.delivery.finished')
+        self.assertEqual((final['outcome'], final['user_impact']), ('failed', 'no_delivery'))
+        self.assertFalse(self.health.snapshot()['components']['telegram']['degraded'])
 
     async def test_actual_telegram_timeout_propagates_through_media_and_search(self):
         limiter = TelegramRateLimiter()

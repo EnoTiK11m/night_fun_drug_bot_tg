@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import io
 import logging
 from app.observability.logic_trace import trace_event, annotate, traced_flow
+from app.observability.errors import error_details
 import ipaddress
 import os
 import socket
@@ -145,6 +146,36 @@ def _looks_like_supported_photo(data: bytes) -> bool:
 
 def _is_ambiguous_network_error(error: Exception) -> bool:
     return isinstance(error, NetworkError) and not isinstance(error, BadRequest)
+
+
+def _media_source_error_details(error: Exception, *, previous_source_error=None) -> dict:
+    """Keep domain/transport evidence without treating downloads as Telegram.
+
+    Source observations do not create health incidents or alter fallback policy.
+    Raw exception text is deliberately excluded from these intermediate events.
+    """
+    # A download raised inside the URL-send except block inherits that prior
+    # BadRequest as implicit context. It is a different attempt, not its cause.
+    details = error_details(error, "media", context_boundary=previous_source_error)
+    if details["error_category"] == "invalid_state":
+        if isinstance(error, FileDownloadLimitExceeded) or (
+            isinstance(error, ValueError) and str(error).startswith((
+                "Unsupported photo content-type:", "Downloaded photo is empty",
+                "Downloaded file is not a supported JPEG, PNG or WebP image",
+            ))
+        ):
+            details["error_category"] = "invalid_media"
+    # httpx ConnectError is not covered by the generic connection-name rule.
+    # Limit this adaptation to media evidence; never override PTB semantics.
+    if details["error_category"] == "invalid_state" and (
+        details["root_error_type"] == "ConnectError" or isinstance(error, aiohttp.ClientConnectorError)
+    ):
+        details.update(error_category="connect", retryable=True)
+    if details["error_category"] == "invalid_state" and details["root_error_type"] == "ReadTimeout":
+        details["error_category"] = "read_timeout"
+        details["retryable"] = True
+    return {key: value for key, value in details.items()
+            if key not in {"error_message", "root_error_message"}}
 
 
 def _photo_extension_from_header(data: bytes) -> str | None:
@@ -638,8 +669,8 @@ async def send_post_media(
             except TimedOut:
                 raise
             except Exception as exc:
-                trace_event('media.source.failed', url_kind=url_kind, attempt=attempt, error_type=type(exc).__name__,
-                            error_category='telegram_url_fetch_failed' if _telegram_url_fetch_failed(exc) else 'invalid_media', outcome='failed')
+                trace_event('media.source.failed', url_kind=url_kind, attempt=attempt,
+                            outcome='failed', **_media_source_error_details(exc))
                 if _is_ambiguous_network_error(exc):
                     raise
                 logger.warning(
@@ -670,7 +701,7 @@ async def send_post_media(
                     except TimedOut:
                         raise
                     except Exception as fallback_exc:
-                        trace_event("media.source.failed", source="download_upload", error_type=type(fallback_exc).__name__, error_category="fallback_failed", outcome="failed")
+                        trace_event("media.source.failed", source="download_upload", outcome="failed", **_media_source_error_details(fallback_exc, previous_source_error=exc))
                         if _is_ambiguous_network_error(fallback_exc):
                             raise
                         logger.warning(
@@ -772,8 +803,8 @@ async def send_post_media_to_chat(
             except DeliveryPreconditionFailed:
                 return False
             except Exception as exc:
-                trace_event('media.source.failed', url_kind=url_kind, attempt=attempt, error_type=type(exc).__name__,
-                            error_category='telegram_url_fetch_failed' if _telegram_url_fetch_failed(exc) else 'invalid_media', outcome='failed')
+                trace_event('media.source.failed', url_kind=url_kind, attempt=attempt,
+                            outcome='failed', **_media_source_error_details(exc))
                 if _is_ambiguous_network_error(exc):
                     raise
                 logger.warning(
@@ -809,7 +840,7 @@ async def send_post_media_to_chat(
                     except DeliveryPreconditionFailed:
                         return False
                     except Exception as fallback_exc:
-                        trace_event("media.source.failed", source="download_upload", error_type=type(fallback_exc).__name__, error_category="fallback_failed", outcome="failed")
+                        trace_event("media.source.failed", source="download_upload", outcome="failed", **_media_source_error_details(fallback_exc, previous_source_error=exc))
                         if _is_ambiguous_network_error(fallback_exc):
                             raise
                         logger.warning(
