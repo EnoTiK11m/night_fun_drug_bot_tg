@@ -1,0 +1,12 @@
+[Unit]
+Description=Check and safely deploy night_fun_drug_bot from GitHub
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+User=root
+Environment=GH_CONFIG_DIR=/home/codex/.config/gh
+Environment=NIGHT_BOT_PROJECT=/opt/night_fun_drug_bot
+ExecStart=/usr/bin/python3 /opt/night_fun_drug_bot/scripts/host_update.py
+TimeoutStartSec=1200
