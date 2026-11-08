@@ -56,6 +56,7 @@ class HostUpdateTests(unittest.TestCase):
                 if args[:1] == ("exec",):
                     return ""
                 if args[:1] == ("up",):
+                    self.assertEqual(args[-1], "bot")
                     switched.append(Path(kwargs["override"]).read_text(encoding="utf-8"))
                     return ""
                 raise AssertionError(args)

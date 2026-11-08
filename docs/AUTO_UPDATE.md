@@ -21,9 +21,10 @@ sudo systemctl enable --now night-fun-drug-bot-update.timer
 
 The updater clones `main` to a temporary directory, builds a candidate Docker
 image, runs compile and import checks, and creates a verified SQLite backup
-while the old bot is still running. It then replaces the Compose containers.
-If startup or the database health check fails, it recreates both services from
-their previous image IDs. It creates a GitHub Issue describing the failed stage
+while the old bot is still running. It then replaces the bot container. The
+backup service keeps its existing image and continues its daily schedule.
+If startup or the database health check fails, it recreates the bot from
+its previous image ID. It creates a GitHub Issue describing the failed stage
 and rollback result. If GitHub is unavailable, it keeps the report in
 `logs/pending_update_issue.txt` and retries the submission next time.
 

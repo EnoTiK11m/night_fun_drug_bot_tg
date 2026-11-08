@@ -143,7 +143,7 @@ def deploy() -> None:
             image_override(candidate_override, image)
             stage = "switch"
             attempted_switch = True
-            compose("up", "-d", "--no-build", "--force-recreate", "bot", "backup",
+            compose("up", "-d", "--no-build", "--force-recreate", "bot",
                     override=candidate_override, timeout=180)
             stage = "health"
             time.sleep(30)
@@ -172,7 +172,7 @@ def deploy() -> None:
                         rollback_override.write_text(
                             content.replace(f'backup:\n    image: "{old_bot}"',
                                             f'backup:\n    image: "{old_backup}"'), encoding="utf-8")
-                    compose("up", "-d", "--no-build", "--force-recreate", "bot", "backup",
+                    compose("up", "-d", "--no-build", "--force-recreate", "bot",
                             override=rollback_override, timeout=180)
                     time.sleep(10)
                     rollback_status = "previous images restarted" if healthy() else "rollback attempted; health check failed"
