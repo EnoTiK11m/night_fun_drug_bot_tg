@@ -35,7 +35,7 @@ class HostUpdateTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     host_update.deploy()
             compose.assert_not_called()
-            self.assertEqual(issues[0][1:], ("build", "old containers remained running"))
+            self.assertEqual(issues[0][1:3], ("build", "old containers remained running"))
 
     def test_failed_health_restarts_previous_images(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -67,7 +67,8 @@ class HostUpdateTests(unittest.TestCase):
                 patch.object(host_update, "container_image", side_effect=["sha256:oldbot", "sha256:oldbackup"]),
                 patch.object(host_update, "run", side_effect=command),
                 patch.object(host_update, "compose", side_effect=compose),
-                patch.object(host_update, "healthy", side_effect=[False, True]),
+                patch.object(host_update, "health_status", return_value=(False, "bot: state=false false 1")),
+                patch.object(host_update, "healthy", return_value=True),
                 patch.object(host_update.time, "sleep"),
                 patch.object(host_update, "report_failure", side_effect=lambda *x: issues.append(x)),
             ):
@@ -77,7 +78,8 @@ class HostUpdateTests(unittest.TestCase):
             self.assertIn("candidate-", switched[0])
             self.assertIn("sha256:oldbot", switched[1])
             self.assertIn("sha256:oldbackup", switched[1])
-            self.assertEqual(issues[0][1:], ("health", "previous images restarted"))
+            self.assertEqual(issues[0][1:3], ("health", "previous images restarted"))
+            self.assertIn("bot: state=", issues[0][3])
 
 
 if __name__ == "__main__":

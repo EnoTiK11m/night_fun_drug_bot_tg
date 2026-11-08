@@ -57,27 +57,34 @@ def image_override(path: Path, image: str) -> None:
     )
 
 
-def healthy() -> bool:
+def health_status() -> tuple[bool, str]:
     for service in ("bot", "backup"):
         container = compose("ps", "-q", service)
         if not container:
-            return False
-        state = run("docker", "inspect", "-f", "{{.State.Running}} {{.State.Restarting}}", container)
-        if state != "true false":
-            return False
+            return False, f"{service}: container missing"
+        state = run("docker", "inspect", "-f", "{{.State.Running}} {{.State.Restarting}} {{.State.ExitCode}}", container)
+        if not state.startswith("true false "):
+            return False, f"{service}: state={state[:80]}"
     # Confirm the new bot can read the mounted database and its schema.
-    result = compose(
-        "exec", "-T", "bot", "python", "-c",
-        "import sqlite3; from app.config import DB_PATH; c=sqlite3.connect('file:'+DB_PATH+'?mode=ro',uri=True); assert c.execute('PRAGMA integrity_check').fetchone()[0]=='ok'; c.execute('SELECT COUNT(*) FROM subscriptions').fetchone(); c.close()",
-        timeout=60,
-    )
-    return result == ""
+    try:
+        compose(
+            "exec", "-T", "bot", "python", "-c",
+            "import sqlite3; from app.config import DB_PATH; c=sqlite3.connect('file:'+DB_PATH+'?mode=ro',uri=True); assert c.execute('PRAGMA integrity_check').fetchone()[0]=='ok'; c.execute('SELECT COUNT(*) FROM subscriptions').fetchone(); c.close()",
+            timeout=60,
+        )
+    except Exception as exc:
+        return False, f"bot: database check failed ({type(exc).__name__})"
+    return True, "ok"
 
 
-def report_failure(commit: str, stage: str, rollback: str) -> None:
+def healthy() -> bool:
+    return health_status()[0]
+
+
+def report_failure(commit: str, stage: str, rollback: str, reason: str = "") -> None:
     body = (
         f"Automatic deployment of `{commit[:12]}` failed on LXC 122.\n\n"
-        f"Stage: `{stage}`\nRollback: {rollback}\n"
+        f"Stage: `{stage}`\nReason: {reason[:160] or 'unknown'}\nRollback: {rollback}\n"
         "The updater kept or restored the previous Docker image. "
         "Inspect the host journal and deployment artifacts for details.\n"
     )
@@ -140,8 +147,9 @@ def deploy() -> None:
                     override=candidate_override, timeout=180)
             stage = "health"
             time.sleep(30)
-            if not healthy():
-                raise RuntimeError("candidate containers failed health check")
+            candidate_ok, candidate_reason = health_status()
+            if not candidate_ok:
+                raise RuntimeError(candidate_reason)
             # The host timer must pick up future updater fixes as well.
             source_script = source / "scripts" / "host_update.py"
             target_script = PROJECT / "scripts" / "host_update.py"
@@ -152,7 +160,8 @@ def deploy() -> None:
             STATE.parent.mkdir(parents=True, exist_ok=True)
             STATE.write_text(json.dumps({"commit": commit, "image": image}) + "\n", encoding="utf-8")
             print(f"Deployed {commit[:12]}")
-        except Exception:
+        except Exception as exc:
+            failure_reason = str(exc)[:160]
             if attempted_switch:
                 stage_at_failure = stage
                 try:
@@ -170,7 +179,7 @@ def deploy() -> None:
                 except Exception:
                     rollback_status = "rollback command failed; manual intervention required"
                 stage = stage_at_failure
-            report_failure(commit, stage, rollback_status)
+            report_failure(commit, stage, rollback_status, failure_reason)
             raise
 
 
