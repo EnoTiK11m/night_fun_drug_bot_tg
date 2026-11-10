@@ -30,7 +30,8 @@ async def button_handler(runtime, update, context):
             await query.message.reply_text(
                 "Эта кнопка уже была обработана."
                 if already_processed
-                else "Эта кнопка устарела."
+                else "Эта кнопка устарела. Выберите действие в новом меню.",
+                reply_markup=await runtime.get_user_main_keyboard(user_id),
             )
         return
     if not await runtime.begin_one_shot_processing(user_id, raw_data):

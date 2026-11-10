@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.request
 from app.observability.logic_trace import traced_request, trace_event, next_attempt
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ from scripts.backup_sqlite import backup_database
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_MARKER_PATH = PROJECT_ROOT / "logs" / "update_restart.json"
+DEPLOYED_COMMIT_PATH = PROJECT_ROOT / "logs" / "deployed_commit.json"
 COMMAND_OUTPUT_LIMIT = 8 * 1024
 DEPENDENCY_FILES = (
     "requirements.txt",
@@ -216,6 +218,11 @@ def _status_paths(porcelain: str) -> tuple[str, ...]:
 
 
 async def get_version_info() -> VersionInfo:
+    if DEPLOYED_COMMIT_PATH.is_file():
+        commit = str(json.loads(DEPLOYED_COMMIT_PATH.read_text(encoding="utf-8"))["commit"])
+        if not COMMIT_RE.fullmatch(commit):
+            raise UpdateCommandError("version_commit")
+        return VersionInfo(commit, GIT_UPDATE_BRANCH, "развёрнуто на сервере", False)
     commit = await _checked_command("version_commit", "git", "rev-parse", "--short", "HEAD")
     branch = await _checked_command("version_branch", "git", "branch", "--show-current")
     commit_date = await _checked_command(
@@ -229,6 +236,22 @@ async def get_version_info() -> VersionInfo:
 
 async def check_for_updates() -> UpdateCheckResult:
     validate_update_target(GIT_UPDATE_REMOTE, GIT_UPDATE_BRANCH)
+    if DEPLOYED_COMMIT_PATH.is_file():
+        current = (await get_version_info()).commit
+        def remote_head() -> str:
+            request = urllib.request.Request(
+                f"https://api.github.com/repos/EnoTiK11m/night_fun_drug_bot_tg/commits/{GIT_UPDATE_BRANCH}",
+                headers={"Accept": "application/vnd.github+json", "User-Agent": "night-fun-drug-bot"},
+            )
+            with urllib.request.urlopen(request, timeout=15) as response:
+                return str(json.load(response)["sha"])
+        try:
+            remote = await asyncio.to_thread(remote_head)
+        except Exception:
+            raise UpdateCommandError("fetch") from None
+        if not COMMIT_RE.fullmatch(remote):
+            raise UpdateCommandError("remote_commit")
+        return UpdateCheckResult(current, remote, 0 if current == remote else 1)
     await _checked_command("fetch", "git", "fetch", GIT_UPDATE_REMOTE)
     current = await _checked_command("local_commit", "git", "rev-parse", "HEAD")
     remote_ref = f"{GIT_UPDATE_REMOTE}/{GIT_UPDATE_BRANCH}"

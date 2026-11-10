@@ -70,6 +70,18 @@ class FakeGit:
 
 
 class ProjectUpdateFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_docker_version_uses_deployed_commit_without_git(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            marker = Path(tempdir) / "deployed_commit.json"
+            marker.write_text('{"commit":"' + NEW_COMMIT + '"}', encoding="utf-8")
+            with (
+                patch.object(project_update, "DEPLOYED_COMMIT_PATH", marker),
+                patch.object(project_update, "run_command", AsyncMock()) as command,
+            ):
+                info = await project_update.get_version_info()
+            self.assertEqual(info.commit, NEW_COMMIT)
+            command.assert_not_awaited()
+
     async def test_non_admin_cannot_update(self):
         update = admin_update(user_id=2)
         with (
